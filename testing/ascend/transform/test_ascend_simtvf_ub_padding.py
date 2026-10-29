@@ -76,7 +76,7 @@ def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
     tvm.ir.assert_structural_equal(inferred, _infer(inferred))
 
 
-@pytest.mark.parametrize("boundary", ["layout", "conditional", "escape", "dma", "capacity"])
+@pytest.mark.parametrize("boundary", ["layout", "conditional", "escape", "capacity"])
 def test_unsupported_padding_retains_storage(boundary):
     mod, _, _ = _program(boundary=boundary)
     layouts = _storage_layouts(_infer(mod))
@@ -119,6 +119,35 @@ def test_unknown_partial_store_cost_retains_storage():
     a, b = [tirx.decl_buffer((32, 32), "float16", name=name, scope="shared.dyn", data_alignment=32) for name in "ab"]
     loop = _parallel((32,), lambda i: tirx.BufferStore(b, a[i, 0], [i, 0]))
     assert not _storage_layouts(_infer(kernel(_vf(loop, 32), buffers=[a, b])))
+
+
+@pytest.mark.parametrize("stride", [1, 16])
+def test_padding_with_full_tile_dma_input_and_output(stride):
+    mod, a, b = _program(stride=stride)
+    source, dest = [tirx.decl_buffer(a.shape, "float32", name=name) for name in ("source", "dest")]
+    body = seq(copy(source, a), _vf(nodes(mod, tirx.For)[0], 32), copy(b, dest))
+    inferred = _infer(kernel(body, buffers=[a, b], params=[source, dest]))
+    layouts = _storage_layouts(inferred)
+    assert "a" in layouts and "b" in layouts
+    with inferred["main"].attrs["target"]:
+        lowered = transform.AscendLowerTileOp()(inferred)
+    from testing.ascend._ir import calls
+
+    for name in ("tl.ascend_copy_gm_to_ubuf", "tl.ascend_copy_ubuf_to_gm"):
+        (dma,) = calls(lowered, name)
+        analyzer = tvm.arith.Analyzer()
+        assert analyzer.can_prove_equal(dma.args[3], 32)
+        assert analyzer.can_prove_equal(dma.args[4], stride * 128)
+        assert analyzer.can_prove_equal(dma.args[-2], stride * 128)
+        assert analyzer.can_prove_equal(dma.args[-1], stride * 128 + 8)
+
+
+def test_partial_dma_input_retains_unpadded_storage():
+    mod, a, b = _program()
+    source = tirx.decl_buffer((16, 32), "float32", name="source")
+    body = seq(copy(source, a, dst_shape=[16, 32]), _vf(nodes(mod, tirx.For)[0], 32))
+    inferred = _infer(kernel(body, buffers=[a, b], params=[source]))
+    assert "a" not in _storage_layouts(inferred)
 
 
 @pytest.mark.parametrize("direction", ["load", "store"])

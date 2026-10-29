@@ -1,0 +1,96 @@
+"""Direct GM/UB/SIMT pipeline: no layout replay or scheduling bypass."""
+
+import argparse
+from pathlib import Path
+
+import torch
+import torch_npu  # noqa: F401
+import tilelang
+import tilelang.ascend.language as T
+from tilelang import tvm
+from tilelang.layout import Fragment, Layout
+from tilelang.profiler import do_bench
+from tvm import tirx
+
+
+def make_kernel(mode, row_stride=1, blocks=32):
+    rows, cols, threads = 32 * row_stride, 32, 32
+    flat = mode == "ownership"
+    shape = (rows * cols,) if flat else (rows, cols)
+    pinned = Fragment((32,), forward_thread_fn=lambda i: i, forward_index_fn=lambda i: 0)
+    loop_layout = pinned if mode in ("baseline", "padding") else None
+    physical = Layout((rows, cols), lambda i, j: i * cols + j + (i // row_stride) * 2)
+
+    @T.prim_func
+    def main(A: T.Tensor((blocks * rows, cols), "float32"), C: T.Tensor((blocks * 32,), "float32")):
+        with T.Kernel(blocks) as block:
+            work = T.alloc_shared(shape, "float32")
+            result = T.alloc_shared((32,), "float32")
+            if mode == "padding":
+                T.annotate_layout({work: physical})
+            T.copy(A[block * rows : (block + 1) * rows, :], work)
+            with T.SimtVF(threads=threads):
+                for i in T.Parallel(32, loop_layout=loop_layout):
+                    if flat:
+                        result[i] = work[i * row_stride * cols] + T.float32(1)
+                    else:
+                        result[i] = work[i * row_stride, 0] + T.float32(1)
+            T.copy(result, C[block * 32 : (block + 1) * 32])
+
+    return main
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["all", "baseline", "ownership", "padding", "auto"], default="all")
+    parser.add_argument("--row-stride", type=int, choices=[1, 16], default=1)
+    parser.add_argument("--blocks", type=int, default=32)
+    parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--output", type=Path, default=Path("ub-dma-results"))
+    args = parser.parse_args()
+    if args.blocks <= 0:
+        parser.error("blocks must be positive")
+    tilelang.disable_cache()
+    rows = 32 * args.row_stride
+    a = torch.randn((args.blocks * rows, 32), device="npu", dtype=torch.float32)
+    reference = (a.reshape(args.blocks, rows, 32)[:, :: args.row_stride, 0] + 1).reshape(-1)
+    args.output.mkdir(parents=True, exist_ok=True)
+    modes = ("baseline", "ownership", "padding", "auto") if args.mode == "all" else (args.mode,)
+    for mode in modes:
+        snapshots = []
+
+        @tvm.ir.instrument.pass_instrument
+        class Capture:
+            def run_after_pass(self, mod, info):
+                if info.name == "tl.AscendLayoutInference":
+                    snapshots.append(mod)
+
+        print(f"{mode}: compiling direct kernel", flush=True)
+        with tilelang.transform.PassContext(instruments=[Capture()]):
+            kernel = tilelang.compile(make_kernel(mode, args.row_stride, args.blocks), target="ascend", out_idx=-1)
+        if len(snapshots) != 1:
+            raise RuntimeError("Expected one layout inference snapshot")
+        padded = []
+
+        def inspect(node):
+            if isinstance(node, tirx.SBlock) and "layout_map" in node.annotations:
+                for buffer, layout in node.annotations["layout_map"].items():
+                    if str(buffer.name) == "work" and not any(layout.same_as(x) for x in padded):
+                        padded.append(layout)
+
+        for func in snapshots[0].functions.values():
+            if isinstance(func, tirx.PrimFunc):
+                tirx.stmt_functor.post_order_visit(func.body, inspect)
+        if bool(padded) != (mode in ("padding", "auto")):
+            raise RuntimeError(f"{mode}: unexpected padding decision: {padded}")
+        (args.output / f"{mode}.tir").write_text(str(snapshots[0]))
+        (args.output / f"{mode}.cpp").write_text(kernel.get_kernel_source())
+        torch.testing.assert_close(kernel(a), reference)
+        print(f"{mode}: correctness passed; padding={bool(padded)}")
+        if args.bench:
+            latency = do_bench(lambda: kernel(a), backend="msprof", _n_warmup=10, _n_repeat=30)
+            print(f"{mode}: {latency * 1000:.3f} us (whole kernel, DMA included)")
+
+
+if __name__ == "__main__":
+    main()

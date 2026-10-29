@@ -10,6 +10,7 @@
 #include <tvm/ffi/reflection/registry.h>
 #include <tvm/runtime/logging.h>
 #include <tvm/tirx/op.h>
+#include <tvm/tirx/stmt_functor.h>
 
 #include "ascend/layout/ascend_layouts.h"
 #include "ascend/op/utils.h"
@@ -20,6 +21,62 @@ namespace tl {
 
 using namespace tirx;
 using namespace ffi;
+
+std::optional<AscendPeriodicPadding>
+TryExtractAscendPeriodicPadding(const Layout &layout, const Buffer &buffer) {
+  if (layout->OutputDim() != 1 || buffer->shape.size() < 2 ||
+      layout->InputDim() != buffer->shape.size() || !buffer->strides.empty() ||
+      !is_zero(buffer->elem_offset))
+    return std::nullopt;
+  int64_t total = 1;
+  for (size_t i = 0; i < buffer->shape.size(); ++i) {
+    const auto *size = buffer->shape[i].as<IntImmNode>();
+    if (!size || size->value <= 0 || size->value > (216 * 1024) / total)
+      return std::nullopt;
+    total *= size->value;
+  }
+  arith::Analyzer analyzer;
+  for (size_t i = 0; i < buffer->shape.size(); ++i)
+    if (!analyzer.CanProveEqual(layout->InputShape()[i], buffer->shape[i]))
+      return std::nullopt;
+  Var flat("padding_flat");
+  analyzer.Bind(flat, Range::FromMinExtent(0, Integer(total)));
+  Array<PrimExpr> coordinates;
+  PrimExpr remaining = flat;
+  for (size_t i = buffer->shape.size(); i-- > 0;) {
+    coordinates.insert(coordinates.begin(),
+                       floormod(remaining, buffer->shape[i]));
+    remaining = floordiv(remaining, buffer->shape[i]);
+  }
+  PrimExpr mapped = analyzer.Simplify(layout->Forward(coordinates)[0]);
+  int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
+  std::vector<int64_t> periods{columns};
+  PostOrderVisit(mapped, [&](const ObjectRef &node) {
+    if (const auto *div = node.as<FloorDivNode>()) {
+      if (const auto *denominator = div->b.as<IntImmNode>()) {
+        int64_t p = denominator->value;
+        if (p > 0 && p < total) {
+          periods.push_back(p);
+          if (p <= total / columns)
+            periods.push_back(p * columns);
+        }
+      }
+    }
+  });
+  for (int64_t period : periods) {
+    if (period <= 0 || period >= total || total % period)
+      continue;
+    PrimExpr extra = analyzer.Simplify(
+        Substitute(mapped, {{flat, Integer(period)}}) - Integer(period));
+    const auto *padding = extra.as<IntImmNode>();
+    if (!padding || padding->value <= 0 || padding->value > 216 * 1024)
+      continue;
+    PrimExpr expected = flat + floordiv(flat, Integer(period)) * extra;
+    if (analyzer.CanProveEqual(mapped, expected))
+      return AscendPeriodicPadding{period, padding->value, total};
+  }
+  return std::nullopt;
+}
 
 // Expand a 2-D base layout to the rank of \p buffer by prepending the leading
 // (batch) dimensions of the buffer shape. Local copy of the swizzle helper so

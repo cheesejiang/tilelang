@@ -27,6 +27,7 @@
 #include "arith/ir_mutator_with_analyzer.h"
 #include "arith/ir_visitor_with_analyzer.h"
 #include "ascend/costmodel/simtvf/analysis/ownership_effect.h"
+#include "ascend/op/ascend_mte_plan.h"
 #include "ascend/op/builtin.h"
 #include "ascend/op/utils.h"
 #include "ascend/transform/vf_regions.h"
@@ -736,10 +737,24 @@ public:
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
     PostOrderVisit(f->body, [&](const ObjectRef &node) {
-      if (const auto *block = node.as<SBlockNode>())
+      if (const auto *loop = node.as<ForNode>()) {
+        if (auto stages = loop->annotations.Get("num_stages")) {
+          const auto *count = stages.value().as<IntImmNode>();
+          padding_dma_versioned_ |= !count || count->value > 1;
+        }
+        padding_dma_versioned_ |=
+            loop->annotations.count("software_pipeline_stage") != 0;
+      }
+      if (const auto *block = node.as<SBlockNode>()) {
+        // Materialized ring axes turn full tiles into selected-plane regions.
+        // Do not promise a full-tile descriptor before that contract exists.
+        padding_dma_versioned_ |=
+            block->annotations.count("tl.buffer_versions_map") != 0 ||
+            block->annotations.count("tl.buffer_version_mode") != 0;
         for (const auto &buffer : block->alloc_buffers)
           if (buffer.scope() == "shared" || buffer.scope() == "shared.dyn")
             padding_allocations_.push_back(buffer);
+      }
     });
     for (const auto &param : f->params)
       if (!param.dtype().is_handle())
@@ -1448,6 +1463,7 @@ private:
   L0SFBindings l0_sf_bindings_;
   Target target_;
   std::vector<Buffer> padding_allocations_;
+  bool padding_dma_versioned_{false};
   std::unordered_set<const VarNode *> ownership_unknown_uses_;
   std::unordered_set<const VarNode *> ownership_uniform_vars_;
   std::unordered_set<int> ownership_excluded_ops_;
@@ -1958,16 +1974,19 @@ private:
     for (const auto &[root, members] : components) {
       // Eligible full-tile SIMT copies lower through ParallelOp and the same
       // physical load/store remapping as compute. Require their solved loop
-      // so the cost model includes the copy's UB traffic. DMA still requires
-      // a separate physical-stride contract and retains native storage.
+      // so the cost model includes the copy's UB traffic. DMA is admitted here
+      // but every candidate must satisfy the shared physical descriptor check.
       if (std::any_of(members.begin(), members.end(), [&](int member) {
             if (!eligible.count(member))
               return true;
             if (infer_list_[member].as<ParallelOpNode>())
               return false;
             const auto *copy = infer_list_[member].as<CopyNode>();
-            return !copy || !ownership_simt_copies_.count(member) ||
-                   !copy->par_op_.defined() ||
+            if (!copy)
+              return true;
+            if (!ownership_simt_copies_.count(member))
+              return false; // CanChangeUbOwnership already checked GM<->UB.
+            return !copy->par_op_.defined() ||
                    !copy->par_op_->GetLoopLayout().defined();
           }))
         continue;
@@ -2022,6 +2041,26 @@ private:
         LayoutMap trial = layouts;
         trial.Set(buffer, candidate);
         if (!PaddingFootprint(trial))
+          continue;
+        bool dma_legal = true;
+        for (int member : members) {
+          const auto *copy = infer_list_[member].as<CopyNode>();
+          if (!copy || ownership_simt_copies_.count(member))
+            continue;
+          bool load = copy->dst.same_as(buffer);
+          if (!load && !copy->src.same_as(buffer))
+            continue;
+          const Buffer &gm = load ? copy->src : copy->dst;
+          if (padding_dma_versioned_ || trial.count(gm) ||
+              !TryPlanPeriodicPaddingDMA(
+                  buffer, load ? copy->dst_range : copy->src_range, candidate,
+                  gm, load ? copy->src_range : copy->dst_range,
+                  analyzer_vec_[member].get())) {
+            dma_legal = false;
+            break;
+          }
+        }
+        if (!dma_legal)
           continue;
         auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
             infer_list_, members, thread_bounds_vec_, trial,

@@ -10,9 +10,22 @@
 #define TVM_TL_ASCEND_LAYOUT_ASCEND_LAYOUTS_H_
 
 #include "layout/layout.h"
+#include <optional>
 
 namespace tvm {
 namespace tl {
+
+// Recognize dense logical storage padded by a fixed number of elements after
+// every period: F(i)=i+floor(i/period)*padding. Only complete periods are
+// supported by the full-tile DMA planner.
+struct AscendPeriodicPadding {
+  int64_t period;
+  int64_t padding;
+  int64_t elements;
+};
+std::optional<AscendPeriodicPadding>
+TryExtractAscendPeriodicPadding(const Layout &layout,
+                                const tirx::Buffer &buffer);
 
 // Ascend fractal layouts for Cube operands. A logical [.., rows, cols]
 // tile maps to physical [.., cols / C0, rows / 16, 16, C0] (a grid of 16xC0

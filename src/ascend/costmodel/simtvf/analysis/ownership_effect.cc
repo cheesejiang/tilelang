@@ -429,6 +429,18 @@ std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     if (*invocations == 0)
       continue;
     const auto *loop = operators[member].as<ParallelOpNode>();
+    // A legal GM<->UB DMA preserves its execution count and is outside this
+    // SIMT-only score. Storage candidates must separately validate its physical
+    // descriptor; do not discard an otherwise measurable SIMT component.
+    if (const auto *copy = operators[member].as<CopyNode>();
+        copy && !copy->par_op_.defined()) {
+      auto ub = [](const Buffer &buffer) {
+        return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+      };
+      if ((copy->src.scope() == "global" && ub(copy->dst)) ||
+          (ub(copy->src) && copy->dst.scope() == "global"))
+        continue;
+    }
     // SIMT Copy inference already constructs and solves a ParallelOp. Reuse
     // its candidate layout so UB loads/stores at fragment boundaries are
     // priced together with computation, without a separate copy cost rule.

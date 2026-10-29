@@ -453,6 +453,37 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
 
   PrimExpr call;
   if (dma_path == DMAPath::kGMToUB || dma_path == DMAPath::kUBToGM) {
+    bool load = dma_path == DMAPath::kGMToUB;
+    const Buffer &ub = load ? op.dst : op.src;
+    const Buffer &gm = load ? op.src : op.dst;
+    if (auto layout = FindLayoutForBuffer(T.layout_map, ub)) {
+      if (auto padding = TryExtractAscendPeriodicPadding(layout.value(), ub)) {
+        auto plan = TryPlanPeriodicPaddingDMA(
+            ub, load ? dst_range : src_range, layout.value(), gm,
+            load ? src_range : dst_range, analyzer);
+        ICHECK(plan && op.data_select == 0)
+            << "Periodic UB padding DMA requires a full static UB tile and "
+               "a contiguous matching GM region, without copy tail filling";
+        PrimExpr rows = I(plan->elements / plan->period);
+        PrimExpr row_bytes = I(plan->period * ub->dtype.bytes());
+        PrimExpr ub_pitch =
+            I((plan->period + plan->padding) * ub->dtype.bytes());
+        // Keep logical access pointers: AscendLowerTileOp remaps the UB base
+        // exactly once. Descriptor pitches are already physical byte strides.
+        if (load) {
+          call = Call(DataType::Void(), ascend_copy_gm_to_ubuf(),
+                      {dst_ptr, src_ptr, sid, rows, row_bytes, zero, zero, zero,
+                       l2_cache_ctrl, row_bytes, ub_pitch});
+        } else {
+          call = Call(DataType::Void(), ascend_copy_ubuf_to_gm(),
+                      {dst_ptr, src_ptr, sid, rows, row_bytes,
+                       I(op.L2CacheCtrlOr(4)), row_bytes, ub_pitch});
+        }
+        Stmt result = Evaluate(call);
+        return analyzer->CanProve(has_data) ? result
+                                            : IfThenElse(has_data, result);
+      }
+    }
     MTECopy2D plan = PlanMTECopy(src_region, dst_region, analyzer);
 
     PrimExpr plan_row_bytes =

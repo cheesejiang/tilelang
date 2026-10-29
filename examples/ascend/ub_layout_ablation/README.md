@@ -1,5 +1,34 @@
 # UB ownership / padding 四状态对比
 
+## 直接验证 DMA + 自动 padding（优先运行）
+
+`example_dma_padding.py` 直接编译原始 DSL kernel：GM→UB、规则跨行读取、UB→GM。
+没有分析 kernel、布局重放、循环平移或运行时 guard。
+`auto` 模式在正常编译流水线中选择布局；脚本检查它确实生成了 padding，
+并验证设备输出。baseline 固定线程布局且不加 padding；ownership 用地址等价
+的一维 UB 阻止 padding 搜索；padding 显式注解物理布局并固定线程布局。
+跨行访问每线程只有一个输出，ownership 模式可能与 baseline 相同。
+
+```bash
+python examples/ascend/ub_layout_ablation/example_dma_padding.py --mode auto
+python examples/ascend/ub_layout_ablation/example_dma_padding.py --row-stride 16
+python examples/ascend/ub_layout_ablation/example_dma_padding.py --row-stride 1 --bench
+```
+
+目前新 DMA lowering 仅支持：完整静态 UB tile、同 dtype、连续且可证明不越界的
+GM 区域、完整 padding 周期，不与 `pad_value/data_select` 尾部填充组合。
+自动候选暂不覆盖带流水线/显式多版本注解的 kernel，避免后续 ring 轴物化改变此契约。
+每个周期是一个 DMA burst，GM pitch=K，UB pitch=K+p，单位换算为字节。
+UB padding 空洞不被搬运，也不被写回 GM。每行 padding 是 K=一行元素数的特例。
+部分区域/OOB、非连续 GM 或不匹配的 layout 不作为自动 padding 候选。
+它们不应靠仅更改起始指针来隐式获得支持。
+
+完整编译仍会经过 AutoSchedule/InsertSync。此前的 `IterSumExpr` 是另一项已知问题，
+本次 DMA 支持并未修复该问题；如果这里也触发，应保留这个直接例子的完整报错。
+本地没有 TVM 编译库和 NPU，尚未执行此设备验证。
+
+## 原布局重放实验
+
 本目录使用 Ascend DSL，比对三个规则访问场景的四种布局状态，不修改 compiler pass：
 
 | 模式 | 线程分配 | UB 物理布局 |
@@ -35,8 +64,9 @@ baseline 是可复现的固定分配，不声称等于所有形状下编译器�
 
 ## 为什么分分析和测量两个 kernel
 
-目前自动 padding 会排除含 GM↔UB DMA 的组件。直接把 DMA 输入输出加到
-自动布局例子里，会导致根本不触发 padding。
+最初编写本实验时，自动 padding 会排除含 GM↔UB DMA 的组件。
+当前已支持上面所述的完整周期 DMA；下面保留原布局重放实验，用于隔离
+连续访问的 ownership 和更复杂的重复访问行为，而不将它当作直接 DMA 验证。
 
 所以本例先对纯 UB 的 DSL kernel 执行布局推导所需的编译前缀，停在
 `tl.AscendLayoutInference`，读取 loop/storage layouts；随后将选出的布局
