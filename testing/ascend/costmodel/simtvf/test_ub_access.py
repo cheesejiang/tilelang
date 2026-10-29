@@ -10,6 +10,20 @@ def analyze(addresses, width=4, store=False):
     return {str(k): int(v) for k, v in result.items()}
 
 
+@pytest.mark.parametrize("width", [1, 2, 4, 8])
+@pytest.mark.parametrize("row_stride", [1, 2, 16])
+def test_periodic_row_padding(width, row_stride):
+    period = row_stride * 32
+    padding = (8 - period * width % 16) % 16
+    addresses = [lane * period * width for lane in range(32)]
+    padded = [address + lane * padding for lane, address in enumerate(addresses)]
+    before = analyze(addresses, width)
+    after = analyze(padded, width)
+    assert after["requests"] == before["requests"]
+    assert after["entries"] == (4 if width == 8 else 2)
+    assert after["entries"] < before["entries"]
+
+
 @pytest.mark.parametrize(
     "width,stride,entries,partial,requests",
     [

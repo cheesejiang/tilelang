@@ -735,6 +735,14 @@ public:
     ICHECK(target.defined())
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
+    PostOrderVisit(f->body, [&](const ObjectRef &node) {
+      if (node.as<AllocateNode>())
+        padding_unknown_allocations_ = true;
+      if (const auto *block = node.as<SBlockNode>())
+        for (const auto &buffer : block->alloc_buffers)
+          if (buffer.scope() == "shared" || buffer.scope() == "shared.dyn")
+            padding_allocations_.push_back(buffer);
+    });
     for (const auto &param : f->params)
       if (!param.dtype().is_handle())
         ownership_uniform_vars_.insert(param.get());
@@ -1441,6 +1449,8 @@ private:
   std::vector<std::unique_ptr<arith::Analyzer>> analyzer_vec_;
   L0SFBindings l0_sf_bindings_;
   Target target_;
+  std::vector<Buffer> padding_allocations_;
+  bool padding_unknown_allocations_{false};
   std::unordered_set<const VarNode *> ownership_unknown_uses_;
   std::unordered_set<const VarNode *> ownership_uniform_vars_;
   std::unordered_set<int> ownership_excluded_ops_;
@@ -1668,16 +1678,29 @@ private:
       const LayoutMap &strict_layout_map,
       const std::vector<TileOperator> &native_ops,
       const LayoutMap &native_layouts, const LayoutCostModel &cost_model) {
-    auto analyze = [&](const std::vector<TileOperator> &ops,
-                       const LayoutMap &layouts) {
-      return costmodel::simtvf::AnalyzeOwnershipEffect(
-          ops, members, thread_bounds_vec_, layouts, ownership_outer_loops_);
-    };
-    auto best_effect = analyze(native_ops, native_layouts);
+    auto analyze =
+        [&](const std::vector<TileOperator> &ops, const LayoutMap &layouts,
+            std::vector<costmodel::simtvf::SimtUbStride> *strides = nullptr) {
+          return costmodel::simtvf::AnalyzeOwnershipEffect(
+              ops, members, thread_bounds_vec_, layouts, ownership_outer_loops_,
+              strides);
+        };
+    std::vector<costmodel::simtvf::SimtUbStride> strides;
+    auto best_effect = analyze(native_ops, native_layouts, &strides);
     // Unknown costs cannot justify changing the native plan. The model owns
     // latency composition and comparison; this pass owns attempts and adoption.
     if (!best_effect)
       return std::nullopt;
+    // For regular cross-row traffic, keep the native ownership and search
+    // physical padding after all inference components have been solved.
+    for (const auto &stride : strides) {
+      if (stride.buffer->shape.size() < 2)
+        continue;
+      const auto *columns = stride.buffer->shape.back().as<IntImmNode>();
+      if (columns && columns->value > 0 && stride.elements >= columns->value &&
+          stride.elements % columns->value == 0)
+        return std::nullopt;
+    }
     std::optional<OwnershipSelection> best;
     int max_width = MaxOwnershipWidth(members, native_ops);
     for (int width = 1;; width *= 2) {
@@ -1868,6 +1891,155 @@ private:
                  << best_infer_root << " cost model " << cost_model->Name()
                  << " output: mem=" << best_cost.mem
                  << " regs=" << best_cost.regs;
+    }
+    TryImproveUbPadding(layout_map, ownership_eligible);
+  }
+
+  // Use the same SIMT UB budget as AutoSchedule (248 KiB less 32 KiB
+  // thread context). Sum every allocation, including materialized versions,
+  // rather than assuming lifetime reuse. Unknown sizes retain native storage.
+  std::optional<int64_t> PaddingFootprint(const LayoutMap &layouts) const {
+    constexpr int64_t kLimit = (248 - 32) * 1024;
+    if (padding_unknown_allocations_)
+      return std::nullopt;
+    int64_t total = 0;
+    for (const auto &buffer : padding_allocations_) {
+      if (!is_zero(buffer->elem_offset) || !buffer->strides.empty())
+        return std::nullopt;
+      int64_t bytes = buffer->dtype.bytes();
+      if (bytes <= 0)
+        return std::nullopt;
+      auto shape = layouts.count(buffer) ? layouts[buffer]->OutputShape()
+                                         : buffer->shape;
+      for (const auto &extent : shape) {
+        const auto *size = extent.as<IntImmNode>();
+        if (!size || size->value <= 0 || size->value > kLimit / bytes)
+          return std::nullopt;
+        bytes *= size->value;
+      }
+      int64_t original_bytes = buffer->dtype.bytes();
+      for (const auto &extent : buffer->shape) {
+        const auto *size = extent.as<IntImmNode>();
+        if (!size || size->value <= 0 || size->value > kLimit / original_bytes)
+          return std::nullopt;
+        original_bytes *= size->value;
+      }
+      // Existing layouts may describe a repeated sub-tile; lowering reserves
+      // its replicas as well. Never undercount the original storage footprint.
+      bytes = std::max(bytes, original_bytes);
+      // Conservatively allow allocation alignment without relying on reuse.
+      int64_t alignment = std::max(512, buffer->data_alignment);
+      total += ((bytes + alignment - 1) / alignment) * alignment;
+      if (total > kLimit)
+        return std::nullopt;
+    }
+    return total;
+  }
+
+  void TryImproveUbPadding(LayoutMap &layouts,
+                           const std::unordered_set<int> &eligible) {
+    // Score the whole shared-storage/fragment component, not just the loop
+    // that supplied a stride hint. Do not change the solved ownership here.
+    UnionFind<int> uf;
+    std::unordered_map<const VarNode *, int> first_user;
+    for (int i = 0; i < infer_list_.size(); ++i) {
+      uf.MakeSet(i);
+      PostOrderVisit(infer_list_stmt_[i], [&](const ObjectRef &node) {
+        const VarNode *data = nullptr;
+        if (const auto *load = node.as<BufferLoadNode>())
+          data = load->buffer->data.get();
+        if (const auto *store = node.as<BufferStoreNode>())
+          data = store->buffer->data.get();
+        if (data) {
+          auto [it, inserted] = first_user.emplace(data, i);
+          if (!inserted)
+            uf.Union(i, it->second);
+        }
+      });
+    }
+    std::unordered_map<int, std::vector<int>> components;
+    for (int i = 0; i < infer_list_.size(); ++i)
+      components[uf.Find(i)].push_back(i);
+    for (const auto &[root, members] : components) {
+      // Eligible full-tile SIMT copies lower through ParallelOp and the same
+      // physical load/store remapping as compute. Require their solved loop
+      // so the cost model includes the copy's UB traffic. DMA still requires
+      // a separate physical-stride contract and retains native storage.
+      if (std::any_of(members.begin(), members.end(), [&](int member) {
+            if (!eligible.count(member))
+              return true;
+            if (infer_list_[member].as<ParallelOpNode>())
+              return false;
+            const auto *copy = infer_list_[member].as<CopyNode>();
+            return !copy || !ownership_simt_copies_.count(member) ||
+                   !copy->par_op_.defined() ||
+                   !copy->par_op_->GetLoopLayout().defined();
+          }))
+        continue;
+      std::vector<costmodel::simtvf::SimtUbStride> strides;
+      auto best = costmodel::simtvf::AnalyzeOwnershipEffect(
+          infer_list_, members, thread_bounds_vec_, layouts,
+          ownership_outer_loops_, &strides);
+      if (!best)
+        continue;
+      const LayoutMap unpadded = layouts;
+      std::vector<std::pair<const BufferNode *, int64_t>> tried;
+      for (const auto &stride : strides) {
+        const Buffer &buffer = stride.buffer;
+        int64_t period = stride.elements;
+        auto key = std::make_pair(buffer.get(), period);
+        if (std::find(tried.begin(), tried.end(), key) != tried.end())
+          continue;
+        tried.push_back(key);
+        // First version: dense, allocated, unannotated multi-dimensional UB.
+        // Only whole-row strides are candidates; continuous accesses skip it.
+        if (buffer->shape.size() < 2 || unpadded.count(buffer) ||
+            !CanChangeBufferOwnership(buffer) || !buffer->strides.empty() ||
+            !is_zero(buffer->elem_offset) ||
+            std::none_of(padding_allocations_.begin(),
+                         padding_allocations_.end(),
+                         [&](const Buffer &b) { return b.same_as(buffer); }))
+          continue;
+        int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
+        if (columns <= 0 || period < columns || period % columns)
+          continue;
+        int bytes = buffer->dtype.bytes();
+        if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+          continue;
+        // Select the smallest representable p with period*B+p == 8 (mod 16).
+        int64_t padding = (8 - (period % 16) * bytes % 16 + 16) % 16;
+        if (padding == 0 || padding % bytes)
+          continue;
+        if (!PaddingFootprint(layouts))
+          continue;
+        Array<IterVar> vars;
+        PrimExpr linear = 0;
+        for (size_t dim = 0; dim < buffer->shape.size(); ++dim) {
+          Var index("ub_padding_i" + std::to_string(dim));
+          vars.push_back(IterVar(Range::FromMinExtent(0, buffer->shape[dim]),
+                                 index, IterVarType::kDataPar));
+          linear = linear * buffer->shape[dim] + index;
+        }
+        Layout candidate(vars, {linear + floordiv(linear, Integer(period)) *
+                                             Integer(padding / bytes)});
+        if (!candidate->DetectInjective()->errors.empty())
+          continue;
+        LayoutMap trial = layouts;
+        trial.Set(buffer, candidate);
+        if (!PaddingFootprint(trial))
+          continue;
+        auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
+            infer_list_, members, thread_bounds_vec_, trial,
+            ownership_outer_loops_);
+        if (effect && costmodel::simtvf::IsBetterOwnership(*effect, *best)) {
+          layouts = std::move(trial);
+          best = std::move(effect);
+          DLOG(INFO) << "[UB padding] buffer=" << buffer->name
+                     << " period=" << period << " padding_bytes=" << padding
+                     << " estimated_latency="
+                     << *best->ub_access.estimated_latency;
+        }
+      }
     }
   }
 
@@ -2188,7 +2360,7 @@ public:
 private:
   LayoutInferencer(const LayoutInferenceResult &result,
                    arith::Analyzer *analyzer)
-      : arith::IRMutatorWithAnalyzer(analyzer), result_(result) {};
+      : arith::IRMutatorWithAnalyzer(analyzer), result_(result){};
 
   using arith::IRMutatorWithAnalyzer::IRMutatorWithAnalyzer;
 

@@ -76,9 +76,11 @@ public:
   // coordinates using the same partitioning and vectorization as LowerTileOp.
   // LowerParallelLoop supplies the index expressions and tail guards; we do
   // not reconstruct the ownership mapping independently or commit this IR.
-  std::optional<std::vector<SimtUbAccess>> Collect(const ParallelOpNode *op,
-                                                   const Range &threads,
-                                                   const LayoutMap &layouts) {
+  std::optional<std::vector<SimtUbAccess>>
+  Collect(const ParallelOpNode *op, const Range &threads,
+          const LayoutMap &layouts, std::vector<SimtUbStride> *strides) {
+    layouts_ = layouts;
+    strides_ = strides;
     Var tx("ub_access_thread");
     thread_ = tx;
     const auto *extent = threads->extent.as<IntImmNode>();
@@ -113,6 +115,8 @@ private:
   PrimExpr predicate_{Bool(true)};
   bool valid_{true};
   std::vector<SimtUbAccess> accesses_;
+  LayoutMap layouts_;
+  std::vector<SimtUbStride> *strides_{nullptr};
 
   // Execution context: retain serial coordinates, one vector coordinate and
   // the enclosing branch mask for every UB load/store. These describe which
@@ -219,10 +223,20 @@ private:
       return;
     }
     PrimExpr address = 0;
-    for (size_t i = 0; i < indices.size(); ++i)
-      address = buffer->strides.empty()
-                    ? address * buffer->shape[i] + indices[i]
-                    : address + buffer->strides[i] * indices[i];
+    // LowerParallelLoop partitions/vectorizes logical indices; physical UB
+    // remapping normally happens later in AscendLowerTileOp. Apply that same
+    // storage mapping here so trial layouts are scored at their real addresses.
+    auto physical_indices = indices;
+    auto physical_shape = buffer->shape;
+    bool remapped = layouts_.count(buffer);
+    if (remapped) {
+      physical_indices = layouts_[buffer]->Forward(indices);
+      physical_shape = layouts_[buffer]->OutputShape();
+    }
+    for (size_t i = 0; i < physical_indices.size(); ++i)
+      address = remapped || buffer->strides.empty()
+                    ? address * physical_shape[i] + physical_indices[i]
+                    : address + buffer->strides[i] * physical_indices[i];
     int bytes = buffer->dtype.bytes();
     address = analyzer_.Simplify((address + buffer->elem_offset) * bytes);
     // A common 8B-aligned base translation does not change packing. Known
@@ -299,6 +313,20 @@ private:
             addresses[v][lane] = *addr;
           }
         }
+      }
+      if (strides_ && !remapped) {
+        std::optional<int64_t> delta;
+        bool regular = true;
+        for (int lane = 1; lane < geometry.warp_size; ++lane) {
+          if (!addresses[0][lane - 1] || !addresses[0][lane])
+            continue;
+          int64_t step = *addresses[0][lane] - *addresses[0][lane - 1];
+          if (delta && *delta != step)
+            regular = false;
+          delta = step;
+        }
+        if (regular && delta && *delta > bytes && *delta % bytes == 0)
+          strides_->push_back({buffer, *delta / bytes});
       }
       // Instruction organization: a repeated-address vector load collapses
       // to a scalar load; otherwise vector elements must be contiguous within
@@ -389,7 +417,8 @@ private:
 std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     const std::vector<TileOperator> &operators, const std::vector<int> &members,
     const std::vector<Range> &thread_bounds, const LayoutMap &layouts,
-    const std::vector<std::vector<For>> &outer_loops) {
+    const std::vector<std::vector<For>> &outer_loops,
+    std::vector<SimtUbStride> *strides) {
   OwnershipEffect total;
   total.ub_access.estimated_latency = 0;
   total.ub_access.service_cycles = 0;
@@ -412,8 +441,8 @@ std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     if (!extent || extent->value <= 0 ||
         extent->value > std::numeric_limits<int>::max())
       return std::nullopt;
-    auto accesses =
-        SimtUbAccessCollector().Collect(loop, thread_bounds[member], layouts);
+    auto accesses = SimtUbAccessCollector().Collect(loop, thread_bounds[member],
+                                                    layouts, strides);
     if (!accesses)
       return std::nullopt;
     for (const auto &access : *accesses) {

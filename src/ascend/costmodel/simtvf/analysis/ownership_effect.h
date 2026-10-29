@@ -43,6 +43,13 @@ struct OwnershipEffect {
   SimtUbAccessCost ub_access;
 };
 
+// Regular positive lane strides in the locally lowered, unpadded access.
+// These are candidate hints, not legality or profitability decisions.
+struct SimtUbStride {
+  tirx::Buffer buffer;
+  int64_t elements;
+};
+
 // The input is an already legal candidate; this function does not select
 // ownership, modify operators, or write annotations. Unknown access geometry
 // returns nullopt. Parallel operators and inferred SIMT copies are evaluated
@@ -52,7 +59,8 @@ struct OwnershipEffect {
 std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     const std::vector<TileOperator> &operators, const std::vector<int> &members,
     const std::vector<Range> &thread_bounds, const LayoutMap &layouts,
-    const std::vector<std::vector<tirx::For>> &outer_loops);
+    const std::vector<std::vector<tirx::For>> &outer_loops,
+    std::vector<SimtUbStride> *strides = nullptr);
 
 // Compare estimated latency only. Missing estimates and ties retain the
 // current candidate. Request geometry is handled by the UB model.
