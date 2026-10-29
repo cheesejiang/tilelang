@@ -8,6 +8,11 @@ import torch_npu  # noqa: F401
 import tilelang
 import tilelang.ascend.language as T
 from tilelang import tvm
+from tilelang.instrumentation.session import (
+    PassInstrumentationTool,
+    register_pass_instrumentation_tool,
+    unregister_pass_instrumentation_tool,
+)
 from tilelang.layout import Fragment, Layout
 from tilelang.profiler import do_bench
 from tvm import tirx
@@ -58,18 +63,34 @@ def main():
     modes = ("baseline", "ownership", "padding", "auto") if args.mode == "all" else (args.mode,)
     for mode in modes:
         snapshots = []
+        seen_passes = []
 
         @tvm.ir.instrument.pass_instrument
         class Capture:
             def run_after_pass(self, mod, info):
+                seen_passes.append(info.name)
                 if info.name == "tl.AscendLayoutInference":
                     snapshots.append(mod)
 
+        class CaptureTool(PassInstrumentationTool):
+            def create_pass_instrument(self):
+                return Capture()
+
         print(f"{mode}: compiling direct kernel", flush=True)
-        with tilelang.transform.PassContext(instruments=[Capture()]):
+        # JITKernel builds its own PassContext. Register a compile-scoped tool
+        # so callbacks are installed in that context, not just an outer one.
+        tool_name = "examples.ub_layout_ablation.dma_layout_capture"
+        register_pass_instrumentation_tool(tool_name, CaptureTool)
+        try:
             kernel = tilelang.compile(make_kernel(mode, args.row_stride, args.blocks), target="ascend", out_idx=-1)
+        finally:
+            unregister_pass_instrumentation_tool(tool_name)
         if len(snapshots) != 1:
-            raise RuntimeError("Expected one layout inference snapshot")
+            layout_passes = [name for name in seen_passes if "layout" in name.lower()]
+            raise RuntimeError(
+                f"Expected one layout inference snapshot, got {len(snapshots)}; "
+                f"observed {len(seen_passes)} pass callbacks; layout passes: {layout_passes}"
+            )
         padded = []
 
         def inspect(node):
