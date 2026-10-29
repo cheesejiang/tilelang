@@ -1911,7 +1911,8 @@ private:
   // Use the same SIMT UB budget as AutoSchedule (248 KiB less 32 KiB
   // thread context). Sum every allocation, including materialized versions,
   // rather than assuming lifetime reuse. Unknown sizes retain native storage.
-  std::optional<int64_t> PaddingFootprint(const LayoutMap &layouts) const {
+  std::optional<int64_t> PaddingFootprint(const LayoutMap &layouts,
+                                          bool aligned = true) const {
     constexpr int64_t kLimit = (248 - 32) * 1024;
     int64_t total = 0;
     for (const auto &buffer : padding_allocations_) {
@@ -1940,7 +1941,8 @@ private:
       bytes = std::max(bytes, original_bytes);
       // Conservatively allow allocation alignment without relying on reuse.
       int64_t alignment = std::max(512, buffer->data_alignment);
-      total += ((bytes + alignment - 1) / alignment) * alignment;
+      total +=
+          aligned ? ((bytes + alignment - 1) / alignment) * alignment : bytes;
       if (total > kLimit)
         return std::nullopt;
     }
@@ -2000,78 +2002,93 @@ private:
       std::vector<std::pair<const BufferNode *, int64_t>> tried;
       for (const auto &stride : strides) {
         const Buffer &buffer = stride.buffer;
-        int64_t period = stride.elements;
-        auto key = std::make_pair(buffer.get(), period);
-        if (std::find(tried.begin(), tried.end(), key) != tried.end())
-          continue;
-        tried.push_back(key);
-        // First version: dense, allocated, unannotated multi-dimensional UB.
-        // Only whole-row strides are candidates; continuous accesses skip it.
-        if (buffer->shape.size() < 2 || unpadded.count(buffer) ||
-            !CanChangeBufferOwnership(buffer) || !buffer->strides.empty() ||
-            !is_zero(buffer->elem_offset) ||
-            std::none_of(padding_allocations_.begin(),
-                         padding_allocations_.end(),
-                         [&](const Buffer &b) { return b.same_as(buffer); }))
-          continue;
-        int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
-        if (columns <= 0 || period < columns || period % columns)
-          continue;
-        int bytes = buffer->dtype.bytes();
-        if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
-          continue;
-        // Select the smallest representable p with period*B+p == 8 (mod 16).
-        int64_t padding = (8 - (period % 16) * bytes % 16 + 16) % 16;
-        if (padding == 0 || padding % bytes)
-          continue;
-        if (!PaddingFootprint(layouts))
-          continue;
-        Array<IterVar> vars;
-        PrimExpr linear = 0;
-        for (size_t dim = 0; dim < buffer->shape.size(); ++dim) {
-          Var index("ub_padding_i" + std::to_string(dim));
-          vars.push_back(IterVar(Range::FromMinExtent(0, buffer->shape[dim]),
-                                 index, IterVarType::kDataPar));
-          linear = linear * buffer->shape[dim] + index;
-        }
-        Layout candidate(vars, {linear + floordiv(linear, Integer(period)) *
-                                             Integer(padding / bytes)});
-        if (!candidate->DetectInjective()->errors.empty())
-          continue;
-        LayoutMap trial = layouts;
-        trial.Set(buffer, candidate);
-        if (!PaddingFootprint(trial))
-          continue;
-        bool dma_legal = true;
-        for (int member : members) {
-          const auto *copy = infer_list_[member].as<CopyNode>();
-          if (!copy || ownership_simt_copies_.count(member))
+        // Enumerate up to one warp of padding phases. Periods are multiples
+        // of the observed row step, including 8*s and 16*s. Score actual
+        // addresses: starting offsets and other users need not share a phase.
+        for (int64_t phases = 1; phases <= 32; ++phases) {
+          int64_t period = stride.elements * phases;
+          auto key = std::make_pair(buffer.get(), period);
+          if (std::find(tried.begin(), tried.end(), key) != tried.end())
             continue;
-          bool load = copy->dst.same_as(buffer);
-          if (!load && !copy->src.same_as(buffer))
+          tried.push_back(key);
+          // First version: dense, allocated, unannotated multi-dimensional UB.
+          // Only whole-row strides are candidates; continuous accesses skip it.
+          if (buffer->shape.size() < 2 || unpadded.count(buffer) ||
+              !CanChangeBufferOwnership(buffer) || !buffer->strides.empty() ||
+              !is_zero(buffer->elem_offset) ||
+              std::none_of(padding_allocations_.begin(),
+                           padding_allocations_.end(),
+                           [&](const Buffer &b) { return b.same_as(buffer); }))
             continue;
-          const Buffer &gm = load ? copy->src : copy->dst;
-          if (padding_dma_versioned_ || trial.count(gm) ||
-              !TryPlanPeriodicPaddingDMA(
-                  buffer, load ? copy->dst_range : copy->src_range, candidate,
-                  gm, load ? copy->src_range : copy->dst_range,
-                  analyzer_vec_[member].get())) {
-            dma_legal = false;
-            break;
+          int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
+          if (columns <= 0 || stride.elements < columns ||
+              stride.elements % columns)
+            continue;
+          int bytes = buffer->dtype.bytes();
+          if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
+            continue;
+          constexpr int64_t padding = 32;
+          int64_t elements = 1;
+          for (const auto &extent : buffer->shape)
+            elements *= extent.as<IntImmNode>()->value;
+          if (period >= elements)
+            continue; // No hole inside the allocation; retain native storage.
+          if (!PaddingFootprint(layouts))
+            continue;
+          Array<IterVar> vars;
+          PrimExpr linear = 0;
+          for (size_t dim = 0; dim < buffer->shape.size(); ++dim) {
+            Var index("ub_padding_i" + std::to_string(dim));
+            vars.push_back(IterVar(Range::FromMinExtent(0, buffer->shape[dim]),
+                                   index, IterVarType::kDataPar));
+            linear = linear * buffer->shape[dim] + index;
           }
-        }
-        if (!dma_legal)
-          continue;
-        auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
-            infer_list_, members, thread_bounds_vec_, trial,
-            ownership_outer_loops_);
-        if (effect && costmodel::simtvf::IsBetterOwnership(*effect, *best)) {
-          layouts = std::move(trial);
-          best = std::move(effect);
-          DLOG(INFO) << "[UB padding] buffer=" << buffer->name
-                     << " period=" << period << " padding_bytes=" << padding
-                     << " estimated_latency="
-                     << *best->ub_access.estimated_latency;
+          Layout candidate(vars, {linear + floordiv(linear, Integer(period)) *
+                                               Integer(padding / bytes)});
+          if (!candidate->DetectInjective()->errors.empty())
+            continue;
+          LayoutMap trial = layouts;
+          trial.Set(buffer, candidate);
+          if (!PaddingFootprint(trial))
+            continue;
+          bool dma_legal = true;
+          for (int member : members) {
+            const auto *copy = infer_list_[member].as<CopyNode>();
+            if (!copy || ownership_simt_copies_.count(member))
+              continue;
+            bool load = copy->dst.same_as(buffer);
+            if (!load && !copy->src.same_as(buffer))
+              continue;
+            const Buffer &gm = load ? copy->src : copy->dst;
+            if (padding_dma_versioned_ || trial.count(gm) ||
+                !TryPlanPeriodicPaddingDMA(
+                    buffer, load ? copy->dst_range : copy->src_range, candidate,
+                    gm, load ? copy->src_range : copy->dst_range,
+                    analyzer_vec_[member].get())) {
+              dma_legal = false;
+              break;
+            }
+          }
+          if (!dma_legal)
+            continue;
+          auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
+              infer_list_, members, thread_bounds_vec_, trial,
+              ownership_outer_loops_);
+          // Compare unrounded storage on ties: allocator rounding can hide
+          // the savings of a longer period. Native storage wins equal costs.
+          bool smaller = *PaddingFootprint(trial, false) <
+                         *PaddingFootprint(layouts, false);
+          if (effect &&
+              (costmodel::simtvf::IsBetterOwnership(*effect, *best) ||
+               (!costmodel::simtvf::IsBetterOwnership(*best, *effect) &&
+                smaller))) {
+            layouts = std::move(trial);
+            best = std::move(effect);
+            DLOG(INFO) << "[UB padding] buffer=" << buffer->name
+                       << " period=" << period << " padding_bytes=" << padding
+                       << " estimated_latency="
+                       << *best->ub_access.estimated_latency;
+          }
         }
       }
     }

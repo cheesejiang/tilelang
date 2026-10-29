@@ -48,6 +48,15 @@ def _storage_layouts(mod):
     return result
 
 
+def _period_rows(layout, rows, columns, element_bytes):
+    analyzer = tvm.arith.Analyzer()
+    offsets = [int(analyzer.simplify(layout.map_forward_index([r, 0])[0])) - r * columns for r in range(rows)]
+    period = next(r for r, offset in enumerate(offsets) if offset)
+    for r, offset in enumerate(offsets):
+        assert offset == (r // period) * (32 // element_bytes)
+    return period
+
+
 @pytest.mark.parametrize("stride", [1, 2, 16])
 @pytest.mark.parametrize("dtype,element_bytes", [("float16", 2), ("float32", 4), ("int64", 8)])
 def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
@@ -58,11 +67,13 @@ def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
     for buffer in (a, b):
         buffer_bytes = element_bytes if buffer.same_as(a) else 4
         layout = layouts[str(buffer.name)]
-        # K=stride*columns; exactly one 8B hole between adjacent lanes.
+        # Fixed 32B holes; choose the longest equally cheap regular period.
+        period = stride * (16 if buffer_bytes == 2 else 8)
+        assert _period_rows(layout, 32 * stride, 32, buffer_bytes) == period
         for row in range(32 * stride):
             for col in (0, 31):
                 address = layout.map_forward_index([row, col])[0]
-                expected = row * 32 + col + (row // stride) * (8 // buffer_bytes)
+                expected = row * 32 + col + (row // period) * (32 // buffer_bytes)
                 assert analyzer.can_prove_equal(address, expected)
     with inferred["main"].attrs["target"]:
         lowered = transform.AscendLowerTileOp()(inferred)
@@ -70,7 +81,8 @@ def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
     for name in ("a", "b"):
         assert len(physical[name].shape) == 1
         buffer_bytes = 4 if name == "b" else element_bytes
-        expected_elements = 32 * stride * 32 + 31 * (8 // buffer_bytes)
+        period = stride * (16 if buffer_bytes == 2 else 8)
+        expected_elements = 32 * stride * 32 + ((32 * stride - 1) // period) * (32 // buffer_bytes)
         assert int(physical[name].shape[0]) == expected_elements
     # The pass must not replace the committed physical layout on a rerun.
     tvm.ir.assert_structural_equal(inferred, _infer(inferred))
@@ -110,7 +122,7 @@ def test_padding_scores_every_access_to_the_buffer():
     layouts = _storage_layouts(inferred)
     assert set(layouts) == {"a", "b"}
     for layout in layouts.values():
-        assert tvm.arith.Analyzer().can_prove_equal(layout.map_forward_index([16, 0])[0], 16 * 34)
+        _period_rows(layout, 512, 32, 4)
     with inferred["main"].attrs["target"]:
         transform.AscendLowerTileOp()(inferred)
 
@@ -122,13 +134,15 @@ def test_unknown_partial_store_cost_retains_storage():
 
 
 @pytest.mark.parametrize("stride", [1, 16])
-def test_padding_with_full_tile_dma_input_and_output(stride):
+def test_fixed_32b_padding_with_dma(stride):
     mod, a, b = _program(stride=stride)
     source, dest = [tirx.decl_buffer(a.shape, "float32", name=name) for name in ("source", "dest")]
     body = seq(copy(source, a), _vf(nodes(mod, tirx.For)[0], 32), copy(b, dest))
     inferred = _infer(kernel(body, buffers=[a, b], params=[source, dest]))
     layouts = _storage_layouts(inferred)
-    assert "a" in layouts and "b" in layouts
+    assert set(layouts) == {"a", "b"}
+    for layout in layouts.values():
+        assert _period_rows(layout, 32 * stride, 32, 4) == 8 * stride
     with inferred["main"].attrs["target"]:
         lowered = transform.AscendLowerTileOp()(inferred)
     from testing.ascend._ir import calls
@@ -136,10 +150,10 @@ def test_padding_with_full_tile_dma_input_and_output(stride):
     for name in ("tl.ascend_copy_gm_to_ubuf", "tl.ascend_copy_ubuf_to_gm"):
         (dma,) = calls(lowered, name)
         analyzer = tvm.arith.Analyzer()
-        assert analyzer.can_prove_equal(dma.args[3], 32)
-        assert analyzer.can_prove_equal(dma.args[4], stride * 128)
-        assert analyzer.can_prove_equal(dma.args[-2], stride * 128)
-        assert analyzer.can_prove_equal(dma.args[-1], stride * 128 + 8)
+        assert analyzer.can_prove_equal(dma.args[3], 4)
+        assert analyzer.can_prove_equal(dma.args[4], 8 * stride * 128)
+        ub_pitch = dma.args[10] if name.endswith("gm_to_ubuf") else dma.args[7]
+        assert analyzer.can_prove_equal(ub_pitch, 8 * stride * 128 + 32)
 
 
 def test_partial_dma_input_retains_unpadded_storage():
@@ -165,8 +179,7 @@ def test_padding_through_full_tile_simt_copy(direction, stride):
     inferred = _infer(kernel(_vf(body, 32), buffers=[a, b, fragment]))
     layout = _storage_layouts(inferred)["a"]
     analyzer = tvm.arith.Analyzer()
-    for row in range(32 * stride):
-        assert analyzer.can_prove_equal(layout.map_forward_index([row, 0])[0], row * 32 + (row // stride) * 2)
+    period = _period_rows(layout, 32 * stride, 32, 4)
     with inferred["main"].attrs["target"]:
         lowered = transform.AscendLowerTileOp()(inferred)
     accesses = [*nodes(lowered, tirx.BufferLoad), *nodes(lowered, tirx.BufferStore)]
@@ -174,14 +187,14 @@ def test_padding_through_full_tile_simt_copy(direction, stride):
     # Both the compute and copy must use the padded physical buffer. No old
     # two-dimensional access may survive the copy lowering.
     assert len(ub_accesses) >= 2
-    expected_size = 32 * stride * 32 + 31 * 2
+    expected_size = 32 * stride * 32 + ((32 * stride - 1) // period) * 8
     for access in ub_accesses:
         assert len(access.indices) == 1
         assert int(access.buffer.shape[0]) == expected_size
     if direction == "store":
         # Execute the lowered loop coordinates on the host: the copy must
         # write every logical element once and never write the padding holes.
-        expected = [(row * 32 + col + (row // stride) * 2,) for row in range(32 * stride) for col in range(32)]
+        expected = [(row * 32 + col + (row // period) * 8,) for row in range(32 * stride) for col in range(32)]
         assert sorted(_executed_store_indices(lowered, "a")) == expected
 
 
@@ -201,3 +214,19 @@ def test_unsupported_simt_copy_retains_unpadded_storage(kind):
     layouts = _storage_layouts(inferred)
     assert "a" not in layouts
     assert "b" not in layouts
+
+
+@pytest.mark.parametrize("stride", [1, 2, 16])
+def test_64_byte_rows_use_longer_period(stride):
+    mod, _, _ = _program(stride=stride, columns=16)
+    layouts = _storage_layouts(_infer(mod))
+    for layout in layouts.values():
+        expected = (16 if stride == 1 else 8) * stride
+        assert _period_rows(layout, 32 * stride, 16, 4) == expected
+
+
+def test_four_groups_do_not_benefit_from_32b_padding():
+    # 160B row pitch already uses all four groups available in this residue
+    # class. Padding by 32B cannot change the lower two group bits.
+    mod, _, _ = _program(columns=40)
+    assert not _storage_layouts(_infer(mod))

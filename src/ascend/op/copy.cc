@@ -463,7 +463,9 @@ Stmt LowerDMACopy(const AscendCopyNode &op, const LowerArgs &T,
             load ? src_range : dst_range, analyzer);
         ICHECK(plan && op.data_select == 0)
             << "Periodic UB padding DMA requires a full static UB tile and "
-               "a contiguous matching GM region, without copy tail filling";
+               "a contiguous matching GM region and 32B-aligned UB base/pitch, "
+               "without copy tail filling; unaligned padding requires "
+               "repacking";
         PrimExpr rows = I(plan->elements / plan->period);
         PrimExpr row_bytes = I(plan->period * ub->dtype.bytes());
         PrimExpr ub_pitch =

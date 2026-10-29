@@ -1,16 +1,30 @@
 # UB ownership / padding 四状态对比
 
+固定每次插入 **32B**，改变插入周期。自动搜索相邻 lane 元素差的
+1～32 倍周期，仅保留完整行周期；先比较整个组件的 SIMT UB 访问成本，
+成本相同时选择未按分配对齐取整的 UB 字节数更小的方案。
+不 padding 是基线，同成本不会增加存储。多个 buffer 按顺序改进，
+这是有限候选搜索，不保证任意访问或多个 buffer 的联合全局最优。
+DMA 成本目前不计入评分，但每个候选必须通过 DMA 合法性检查。
+
+直接 DMA 示例的显式 padding 为每 `8 * row_stride` 行加 32B：
+`row_stride=1` 时每 8 行，`row_stride=16` 时每 128 行。
+32 个 lane 的规则 f32 跨行读取预计从 32 entry 降到 8 entry。
+这些预期仍需在设备上编译并验证正确性与整 kernel 性能。
+
 ## 直接验证 DMA + 自动 padding（优先运行）
 
 `example_dma_padding.py` 直接编译原始 DSL kernel：GM→UB、规则跨行读取、UB→GM。
 没有分析 kernel、布局重放、循环平移或运行时 guard。
-`auto` 模式在正常编译流水线中选择布局；脚本检查它确实生成了 padding，
-并验证设备输出。baseline 固定线程布局且不加 padding；ownership 用地址等价
+`auto` 模式在正常编译流水线中选择布局，并验证设备输出。未选择 padding 时
+明确报告 `padding NOT APPLIED`，不能把该结果当作 padding 收益验证；
+使用 `--require-auto-padding` 可将此情况作为回归失败。baseline 固定线程布局且不加 padding；ownership 用地址等价
 的一维 UB 阻止 padding 搜索；padding 显式注解物理布局并固定线程布局。
 跨行访问每线程只有一个输出，ownership 模式可能与 baseline 相同。
 
 ```bash
 python examples/ascend/ub_layout_ablation/example_dma_padding.py --mode auto
+python examples/ascend/ub_layout_ablation/example_dma_padding.py --mode auto --require-auto-padding
 python examples/ascend/ub_layout_ablation/example_dma_padding.py --row-stride 16
 python examples/ascend/ub_layout_ablation/example_dma_padding.py --row-stride 1 --bench
 ```
@@ -26,6 +40,8 @@ UB padding 空洞不被搬运，也不被写回 GM。每行 padding 是 K=一行
 完整编译仍会经过 AutoSchedule/InsertSync。此前的 `IterSumExpr` 是另一项已知问题，
 本次 DMA 支持并未修复该问题；如果这里也触发，应保留这个直接例子的完整报错。
 本地没有 TVM 编译库和 NPU，尚未执行此设备验证。
+每个模式先写入 `<mode>.tir`、`<mode>.cpp` 和 `<mode>.json`，再检查布局结果；
+JSON 包含实际 buffer 名称、逻辑/物理形状和布局。即使断言失败也保留诊断文件。
 
 ## 原布局重放实验
 
@@ -54,8 +70,8 @@ baseline 是可复现的固定分配，不声称等于所有形状下编译器�
 | case | UB 逻辑形状 | 参与递推的元素 | padding-only |
 | --- | --- | --- | --- |
 | `contiguous` | 8192 个元素 | 全部元素，128 个线程 | 无 padding；用于比较 ownership |
-| `row1` | 32×32 | 每行第 0 列，32 个线程 | 每行插入 8B |
-| `row16` | 512×32 | 每 16 行的第 0 列，32 个线程 | 每 16 行插入 8B |
+| `row1` | 32×32 | 每行第 0 列，32 个线程 | 每 8 行插入 32B |
+| `row16` | 512×32 | 每 16 行的第 0 列，32 个线程 | 每 128 行插入 32B |
 
 跨行场景 baseline 的每 lane 一个元素，初始化仍覆盖完整 UB。
 周期布局为 `F(i) = i + floor(i / K) * p`，K 是周期元素数，p 是 padding 元素数。

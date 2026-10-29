@@ -426,6 +426,12 @@ TryPlanPeriodicPaddingDMA(const Buffer &ub, const ffi::Array<Range> &ub_range,
   auto padding = TryExtractAscendPeriodicPadding(layout, ub);
   if (!padding)
     return std::nullopt;
+  // Byte-granular GM lengths/strides do not waive the UB block-address
+  // alignment requirement. In particular, a 128B+8B UB pitch faults on MTE.
+  // Such layouts require staging/repacking, not a strided DMA descriptor.
+  int64_t ub_pitch = (padding->period + padding->padding) * ub->dtype.bytes();
+  if (ub->data_alignment < 32 || ub->data_alignment % 32 || ub_pitch % 32)
+    return std::nullopt;
   for (size_t i = 0; i < ub_range.size(); ++i)
     if (!is_zero(ub_range[i]->min) ||
         !analyzer->CanProveEqual(ub_range[i]->extent, ub->shape[i]))

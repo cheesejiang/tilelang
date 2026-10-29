@@ -20,11 +20,11 @@ class Case:
 
     @property
     def period(self):
-        return self.stride
+        return 8 * self.stride
 
     @property
     def padding_elements(self):
-        return ((8 - self.stride * 4) % 16) // 4 if self.stride > 1 else 0
+        return 8 if self.stride > 1 else 0
 
 
 CASES = {

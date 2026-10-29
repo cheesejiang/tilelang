@@ -1,6 +1,8 @@
 """Direct GM/UB/SIMT pipeline: no layout replay or scheduling bypass."""
 
 import argparse
+import json
+import math
 from pathlib import Path
 
 import torch
@@ -24,7 +26,7 @@ def make_kernel(mode, row_stride=1, blocks=32):
     shape = (rows * cols,) if flat else (rows, cols)
     pinned = Fragment((32,), forward_thread_fn=lambda i: i, forward_index_fn=lambda i: 0)
     loop_layout = pinned if mode in ("baseline", "padding") else None
-    physical = Layout((rows, cols), lambda i, j: i * cols + j + (i // row_stride) * 2)
+    physical = Layout((rows, cols), lambda i, j: i * cols + j + (i // (8 * row_stride)) * 8)
 
     @T.prim_func
     def main(A: T.Tensor((blocks * rows, cols), "float32"), C: T.Tensor((blocks * 32,), "float32")):
@@ -51,6 +53,7 @@ def main():
     parser.add_argument("--row-stride", type=int, choices=[1, 16], default=1)
     parser.add_argument("--blocks", type=int, default=32)
     parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--require-auto-padding", action="store_true", help="fail if auto retains the original storage")
     parser.add_argument("--output", type=Path, default=Path("ub-dma-results"))
     args = parser.parse_args()
     if args.blocks <= 0:
@@ -92,20 +95,48 @@ def main():
                 f"observed {len(seen_passes)} pass callbacks; layout passes: {layout_passes}"
             )
         padded = []
+        layouts_seen = []
+        work_seen = []
 
         def inspect(node):
             if isinstance(node, tirx.SBlock) and "layout_map" in node.annotations:
                 for buffer, layout in node.annotations["layout_map"].items():
-                    if str(buffer.name) == "work" and not any(layout.same_as(x) for x in padded):
-                        padded.append(layout)
+                    entry = {
+                        "buffer": str(buffer.name),
+                        "scope": buffer.scope(),
+                        "logical_shape": [str(x) for x in buffer.shape],
+                        "physical_shape": [str(x) for x in layout.get_output_shape()],
+                        "layout": str(layout),
+                    }
+                    if entry not in layouts_seen:
+                        layouts_seen.append(entry)
+                    name = str(buffer.name)
+                    if buffer.scope() in ("shared", "shared.dyn") and (name == "work" or name.startswith("work_")):
+                        if name not in work_seen:
+                            work_seen.append(name)
+                        # A layout-map entry by itself need not be padding.
+                        logical = math.prod(int(x) for x in buffer.shape)
+                        physical = math.prod(int(x) for x in layout.get_output_shape())
+                        if physical > logical and not any(layout.same_as(x) for x in padded):
+                            padded.append(layout)
 
         for func in snapshots[0].functions.values():
             if isinstance(func, tirx.PrimFunc):
                 tirx.stmt_functor.post_order_visit(func.body, inspect)
-        if bool(padded) != (mode in ("padding", "auto")):
-            raise RuntimeError(f"{mode}: unexpected padding decision: {padded}")
+        # Save the evidence before checking the decision, including on failure.
         (args.output / f"{mode}.tir").write_text(str(snapshots[0]))
         (args.output / f"{mode}.cpp").write_text(kernel.get_kernel_source())
+        report = {"mode": mode, "padding_applied": bool(padded), "work_layout_entries": work_seen, "layouts": layouts_seen}
+        (args.output / f"{mode}.json").write_text(json.dumps(report, indent=2))
+        if mode == "padding" and not padded:
+            raise RuntimeError(f"Explicit padding not observed; inspect {args.output / f'{mode}.json'} and {mode}.tir")
+        if mode in ("baseline", "ownership") and padded:
+            raise RuntimeError(f"{mode}: unexpected padding; inspect {args.output / f'{mode}.json'}")
+        if mode == "auto" and not padded:
+            message = f"auto: padding NOT APPLIED (not a padding-benefit validation); inspect {args.output / 'auto.tir'} and auto.json"
+            if args.require_auto_padding:
+                raise RuntimeError(message)
+            print(message, flush=True)
         torch.testing.assert_close(kernel(a), reference)
         print(f"{mode}: correctness passed; padding={bool(padded)}")
         if args.bench:

@@ -71,7 +71,7 @@ def test_periodic_padding_dma_geometry(direction, period_rows, dtype, bytes_per_
     elements = rows * columns
     ub = tirx.decl_buffer((rows, columns), dtype, name="ub", scope="shared.dyn")
     gm = tirx.decl_buffer((elements * 2,), dtype, name="gm")
-    layout = Layout((rows, columns), lambda i, j: i * columns + j + (i // period_rows) * (8 // bytes_per_element))
+    layout = Layout((rows, columns), lambda i, j: i * columns + j + (i // period_rows) * (32 // bytes_per_element))
     gm_region = _region(gm, [elements], [elements])
     if direction == "load":
         after = _lower(gm, ub, src_region=gm_region, layouts={ub: layout})
@@ -83,10 +83,20 @@ def test_periodic_padding_dma_geometry(direction, period_rows, dtype, bytes_per_
         gm_ptr = 0
     (dma,) = calls(after, name)
     burst_bytes = period_rows * columns * bytes_per_element
-    _equal([dma.args[3], dma.args[4], dma.args[-2], dma.args[-1]], [32, burst_bytes, burst_bytes, burst_bytes + 8])
+    _equal([dma.args[3], dma.args[4], dma.args[-2], dma.args[-1]], [32, burst_bytes, burst_bytes, burst_bytes + 32])
     _equal([dma.args[gm_ptr].args[2], dma.args[1 - gm_ptr].args[2]], [elements, 0])
     physical = allocated_buffer(after, "ub")
-    _equal(physical.shape, [elements + 31 * (8 // bytes_per_element)])
+    _equal(physical.shape, [elements + 31 * (32 // bytes_per_element)])
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_periodic_padding_dma_rejects_unaligned_ub_pitch(direction):
+    ub = tirx.decl_buffer((32, 32), "float32", name="ub", scope="shared.dyn", data_alignment=32)
+    gm = tirx.decl_buffer((32, 32), "float32", name="gm")
+    layout = Layout((32, 32), lambda i, j: i * 34 + j)
+    src, dst = (gm, ub) if direction == "load" else (ub, gm)
+    with pytest.raises(tvm.error.InternalError, match="32B-aligned UB base/pitch"):
+        _lower(src, dst, layouts={ub: layout})
 
 
 def test_periodic_padding_dma_rejects_partial_ub_region():
