@@ -51,17 +51,34 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=["all", "baseline", "ownership", "padding", "auto"], default="all")
     parser.add_argument("--row-stride", type=int, choices=[1, 16], default=1)
+    parser.add_argument("--case", choices=["single", "reuse", "rotate"], default="single")
+    parser.add_argument("--columns", type=int, choices=[16, 32], default=32)
+    parser.add_argument("--iterations", type=int, default=64)
     parser.add_argument("--blocks", type=int, default=32)
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--require-auto-padding", action="store_true", help="fail if auto retains the original storage")
     parser.add_argument("--output", type=Path, default=Path("ub-dma-results"))
     args = parser.parse_args()
-    if args.blocks <= 0:
-        parser.error("blocks must be positive")
+    if args.blocks <= 0 or args.iterations <= 0:
+        parser.error("blocks and iterations must be positive")
+    if args.case == "single" and args.columns != 32:
+        parser.error("single uses 32 columns; choose reuse or rotate for 16 columns")
     tilelang.disable_cache()
     rows = 32 * args.row_stride
-    a = torch.randn((args.blocks * rows, 32), device="npu", dtype=torch.float32)
-    reference = (a.reshape(args.blocks, rows, 32)[:, :: args.row_stride, 0] + 1).reshape(-1)
+    torch.manual_seed(0)
+    host = torch.randn((args.blocks, rows, args.columns), dtype=torch.float32)
+    a = host.reshape(args.blocks * rows, args.columns).to("npu")
+    expected = host[:, :: args.row_stride, 0].clone()
+    if args.case == "single":
+        expected = expected + 1
+    else:
+        for _ in range(args.iterations):
+            expected = expected * 0.999 + 0.001
+            if args.case == "rotate":
+                expected = torch.roll(expected, shifts=-1, dims=1)
+    reference = expected.reshape(-1)
+    if args.case != "single":
+        from reuse_kernels import make_reuse_kernel
     args.output.mkdir(parents=True, exist_ok=True)
     modes = ("baseline", "ownership", "padding", "auto") if args.mode == "all" else (args.mode,)
     for mode in modes:
@@ -85,7 +102,9 @@ def main():
         tool_name = "examples.ub_layout_ablation.dma_layout_capture"
         register_pass_instrumentation_tool(tool_name, CaptureTool)
         try:
-            kernel = tilelang.compile(make_kernel(mode, args.row_stride, args.blocks), target="ascend", out_idx=-1)
+            func = (make_kernel(mode, args.row_stride, args.blocks) if args.case == "single" else
+                    make_reuse_kernel(mode, args.row_stride, args.blocks, args.columns, args.iterations, args.case == "rotate"))
+            kernel = tilelang.compile(func, target="ascend", out_idx=-1)
         finally:
             unregister_pass_instrumentation_tool(tool_name)
         if len(snapshots) != 1:
@@ -126,7 +145,8 @@ def main():
         # Save the evidence before checking the decision, including on failure.
         (args.output / f"{mode}.tir").write_text(str(snapshots[0]))
         (args.output / f"{mode}.cpp").write_text(kernel.get_kernel_source())
-        report = {"mode": mode, "padding_applied": bool(padded), "work_layout_entries": work_seen, "layouts": layouts_seen}
+        report = {"case": args.case, "columns": args.columns, "row_stride": args.row_stride,
+                  "iterations": args.iterations if args.case != "single" else 1, "blocks": args.blocks, "mode": mode, "padding_applied": bool(padded), "work_layout_entries": work_seen, "layouts": layouts_seen}
         (args.output / f"{mode}.json").write_text(json.dumps(report, indent=2))
         if mode == "padding" and not padded:
             raise RuntimeError(f"Explicit padding not observed; inspect {args.output / f'{mode}.json'} and {mode}.tir")
@@ -137,10 +157,14 @@ def main():
             if args.require_auto_padding:
                 raise RuntimeError(message)
             print(message, flush=True)
-        torch.testing.assert_close(kernel(a), reference)
+        actual = kernel(a)
+        torch.npu.synchronize()
+        torch.testing.assert_close(actual.cpu(), reference, rtol=1e-4, atol=1e-5)
         print(f"{mode}: correctness passed; padding={bool(padded)}")
         if args.bench:
             latency = do_bench(lambda: kernel(a), backend="msprof", _n_warmup=10, _n_repeat=30)
+            report["latency_us"] = latency * 1000
+            (args.output / f"{mode}.json").write_text(json.dumps(report, indent=2))
             print(f"{mode}: {latency * 1000:.3f} us (whole kernel, DMA included)")
 
 

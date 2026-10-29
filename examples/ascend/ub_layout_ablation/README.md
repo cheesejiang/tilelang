@@ -164,3 +164,42 @@ padding 增加的搬运和地址计算可能抵消 UB 冲突收益，改善不�
 
 新增这些例子时，本地没有 TileLang 编译库和 NPU 环境，尚未运行完整 lowering
 或设备测试；脚本中的正确性和布局检查需要在配置好的环境中执行。
+
+## 多轮 UB 复用例子
+
+`reuse_kernels.py` 用 Ascend DSL 定义多轮读写 kernel，仍比较 baseline、
+ownership、显式 32B padding 和 auto。每轮先从跨行 work 读入 result，
+再写回 work，最后收集输出；只在整个迭代开始/结束进行 GM 搬运。
+每轮 `x = x * 0.999 + 0.001`，使结果依赖上一轮且不会很快全部收敛为同一个值。
+CPU reference 按相同轮数计算。是否产生预期 UB 指令仍应检查生成的 C++/ISA，
+不能仅凭 DSL 认定编译器不会提升内存访问。
+
+| 场景 | 行宽 | 相邻 lane 跨行数 | 显式 padding |
+| --- | --- | --- | --- |
+| row128 | 32 个 f32 / 128B | 1 | 每 8 行加 32B |
+| row64 | 16 个 f32 / 64B | 1 | 每 16 行加 32B |
+| stride16 | 32 个 f32 / 128B | 16 | 每 128 行加 32B |
+| rotate | 32 个 f32 / 128B | 1 | 每 8 行加 32B |
+
+rotate 在写回时使用下一 lane 的 result，存在跨线程依赖，依赖编译器插入同步。
+它衡量包含同步的迭代场景，不能当作纯 UB 带宽测试。
+
+先做一个小配置的正确性验证，再扫描多轮性能：
+
+```bash
+python examples/ascend/ub_layout_ablation/example_reuse_suite.py --case row128 --iterations 16
+python examples/ascend/ub_layout_ablation/example_reuse_suite.py --case row128 --bench
+python examples/ascend/ub_layout_ablation/example_reuse_suite.py --case all --iterations 1 16 64 256 --bench
+```
+
+也可以直接运行单个配置：
+
+```bash
+python examples/ascend/ub_layout_ablation/example_dma_padding.py --case rotate --iterations 64 --bench
+python examples/ascend/ub_layout_ablation/example_dma_padding.py --case reuse --columns 16 --iterations 64 --bench
+```
+
+批量脚本将每个配置放入独立进程，结果分别保存至
+`ub-reuse-results/<case>/<iterations>/`。每种模式保留 `.cpp`、`.tir` 和 `.json`。
+时延仍是包含 DMA、同步及调用开销的整体时延，编译和正确性比较不在计时内。
+新增例子本地仅完成 Python 语法及命令行检查，尚未在 NPU 编译或执行。
