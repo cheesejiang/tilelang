@@ -736,8 +736,6 @@ public:
         << "Layout_Inference: Require the target attribute";
     target_ = target.value();
     PostOrderVisit(f->body, [&](const ObjectRef &node) {
-      if (node.as<AllocateNode>())
-        padding_unknown_allocations_ = true;
       if (const auto *block = node.as<SBlockNode>())
         for (const auto &buffer : block->alloc_buffers)
           if (buffer.scope() == "shared" || buffer.scope() == "shared.dyn")
@@ -1450,7 +1448,6 @@ private:
   L0SFBindings l0_sf_bindings_;
   Target target_;
   std::vector<Buffer> padding_allocations_;
-  bool padding_unknown_allocations_{false};
   std::unordered_set<const VarNode *> ownership_unknown_uses_;
   std::unordered_set<const VarNode *> ownership_uniform_vars_;
   std::unordered_set<int> ownership_excluded_ops_;
@@ -1900,8 +1897,6 @@ private:
   // rather than assuming lifetime reuse. Unknown sizes retain native storage.
   std::optional<int64_t> PaddingFootprint(const LayoutMap &layouts) const {
     constexpr int64_t kLimit = (248 - 32) * 1024;
-    if (padding_unknown_allocations_)
-      return std::nullopt;
     int64_t total = 0;
     for (const auto &buffer : padding_allocations_) {
       if (!is_zero(buffer->elem_offset) || !buffer->strides.empty())

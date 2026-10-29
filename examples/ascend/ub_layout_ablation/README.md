@@ -67,17 +67,21 @@ DMA 只访问 dense staging buffer，因此不依赖尚未支持的 DMA padding 
 ```bash
 # 12 个组合：3 个场景 × 4 个模式。只编译、检查布局并导出源码，不执行 NPU。
 python examples/ascend/ub_layout_ablation/example_layout_ablation.py --analyze-only
-
+```
+```bash
 # 12 个组合：在 NPU 上做数值验证，跳过性能测量。
 python examples/ascend/ub_layout_ablation/example_layout_ablation.py --no-bench
-
+```
+```bash
 # 完整正确性与性能比较。
 python examples/ascend/ub_layout_ablation/example_layout_ablation.py
-
+```
+```bash
 # 单独比较跨 16 行，增加递推次数。
 python examples/ascend/ub_layout_ablation/example_layout_ablation.py \
   --case row16 --iterations 128 --samples 5 --output /tmp/ub-row16
-
+```
+```bash
 # 单个模式。
 python examples/ascend/ub_layout_ablation/example_layout_ablation.py \
   --case row1 --mode auto --no-bench
