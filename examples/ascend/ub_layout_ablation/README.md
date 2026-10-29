@@ -203,3 +203,13 @@ python examples/ascend/ub_layout_ablation/example_dma_padding.py --case reuse --
 `ub-reuse-results/<case>/<iterations>/`。每种模式保留 `.cpp`、`.tir` 和 `.json`。
 时延仍是包含 DMA、同步及调用开销的整体时延，编译和正确性比较不在计时内。
 新增例子本地仅完成 Python 语法及命令行检查，尚未在 NPU 编译或执行。
+
+批量运行还会在输出根目录生成总表：
+
+- `summary.csv`：每行一个设置和模式，含场景、列数、跨行数、迭代次数、
+  block 数、状态、是否 padding、时延（us）及相对同配置 baseline 的加速比。
+- `summary.md`：每个配置一行，四种模式时延并排显示，结束时也打印到终端。
+
+每个配置结束后立即更新总表；后续配置失败时已完成结果仍保留，失败或尚未运行
+的模式会标记 `failed_or_not_run`。不带 `--bench` 时没有时延，只记录正确性状态。
+每次调用重建本次扫描的总表；不会将之前运行的时延混入本次结果。

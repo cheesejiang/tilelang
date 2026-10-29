@@ -160,6 +160,8 @@ def main():
         actual = kernel(a)
         torch.npu.synchronize()
         torch.testing.assert_close(actual.cpu(), reference, rtol=1e-4, atol=1e-5)
+        report["correctness_passed"] = True
+        (args.output / f"{mode}.json").write_text(json.dumps(report, indent=2))
         print(f"{mode}: correctness passed; padding={bool(padded)}")
         if args.bench:
             latency = do_bench(lambda: kernel(a), backend="msprof", _n_warmup=10, _n_repeat=30)
