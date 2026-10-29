@@ -108,20 +108,43 @@ class Plan:
 def analyze(case, mode, iterations, artifact_dir):
     import tilelang
     from tilelang import tvm
+    from tilelang.ascend import transform as ascend_transform
     from tvm import tirx
 
-    captured = []
-
-    @tvm.ir.instrument.pass_instrument
-    class Capture:
-        def run_after_pass(self, mod, info):
-            if info.name == "tl.AscendLayoutInference":
-                captured.append(mod)
-
-    with tvm.target.Target("ascend"), tilelang.transform.PassContext(instruments=[Capture()]):
-        result = tilelang.lower(analysis_kernel(case, mode, iterations), target="ascend")
-    if len(captured) != 1:
-        raise RuntimeError(f"Expected one layout inference snapshot, got {len(captured)}")
+    # Only run the Ascend pipeline prefix needed for layout inference. The
+    # analysis twin is not an executable kernel: scheduling, InsertSync and
+    # code generation are intentionally reserved for the measurement kernel.
+    target = tvm.target.Target("ascend")
+    program = analysis_kernel(case, mode, iterations).with_attr("global_symbol", "main")
+    mod = tvm.IRModule({"main": program})
+    with target:
+        mod = tirx.transform.BindTarget(target)(mod)
+        mod = tilelang.transform.MaterializeKernelLaunch(
+            lower_grid_binding=True,
+            lower_thread_binding=False,
+            default_threads=None,
+            unsupported_annotations=["cluster_dims"],
+            launch_dim_tags=["cthread"],
+        )(mod)
+        # Match AscendPassPipelineBody up to and including layout inference.
+        # These examples contain no reducers, dual copies or SIMD operations,
+        # but keep their normal prerequisite legalizers in the prefix.
+        prefix = (
+            tilelang.transform.AddWrapperForSingleBufStore,
+            tilelang.transform.LegalizeNegativeIndex,
+            tilelang.transform.InjectAssumes,
+            ascend_transform.RewriteDualCopy,
+            ascend_transform.LegalizeSimdMerging,
+            tilelang.transform.Simplify,
+            tilelang.transform.CanonicalizeLegacyReducer,
+            tilelang.transform.VerifyReducerEpoch,
+            tilelang.transform.VerifyBufferInit,
+            ascend_transform.UnrollLoopSkipVF,
+            tilelang.transform.Simplify,
+            ascend_transform.AscendLayoutInference,
+        )
+        for factory in prefix:
+            mod = factory()(mod)
     loops, storage = [], []
 
     def inspect(node):
@@ -134,7 +157,7 @@ def analyze(case, mode, iterations, artifact_dir):
                     if not any(layout.same_as(existing) for existing in storage):
                         storage.append(layout)
 
-    for func in captured[0].functions.values():
+    for func in mod.functions.values():
         if isinstance(func, tirx.PrimFunc):
             tirx.stmt_functor.post_order_visit(func.body, inspect)
     if len(loops) != 3 or len(storage) > 1:
@@ -185,8 +208,7 @@ def analyze(case, mode, iterations, artifact_dir):
         "storage_layout": str(storage[0]) if storage else "identity",
     }
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    (artifact_dir / "analysis.tir").write_text(str(captured[0]))
-    (artifact_dir / "analysis.cpp").write_text(result.kernel_source)
+    (artifact_dir / "analysis.tir").write_text(str(mod))
     (artifact_dir / "plan.json").write_text(json.dumps(metadata, indent=2))
     return Plan(loops[0], loops[1], loops[2], padding, physical, metadata)
 

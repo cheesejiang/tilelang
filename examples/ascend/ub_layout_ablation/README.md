@@ -38,8 +38,8 @@ baseline 是可复现的固定分配，不声称等于所有形状下编译器�
 目前自动 padding 会排除含 GM↔UB DMA 的组件。直接把 DMA 输入输出加到
 自动布局例子里，会导致根本不触发 padding。
 
-所以本例先 lowering 一个纯 UB 的 DSL kernel，捕获
-`tl.AscendLayoutInference` 后的 loop/storage layouts；随后将选出的布局
+所以本例先对纯 UB 的 DSL kernel 执行布局推导所需的编译前缀，停在
+`tl.AscendLayoutInference`，读取 loop/storage layouts；随后将选出的布局
 显式重放到**相同结构**的测量 kernel：
 
 ```
@@ -65,7 +65,7 @@ DMA 只访问 dense staging buffer，因此不依赖尚未支持的 DMA padding 
 从仓库根目录执行：
 
 ```bash
-# 12 个组合：3 个场景 × 4 个模式。只编译、检查布局并导出源码，不执行 NPU。
+# 12 个组合：3 个场景 × 4 个模式。只推导、检查和导出布局 IR，不执行 NPU。
 python examples/ascend/ub_layout_ablation/example_layout_ablation.py --analyze-only
 ```
 ```bash
@@ -96,7 +96,6 @@ CANN，或在纯分析进程启动前关闭设备扩展自动加载。
 默认输出目录 `ub-layout-results/<case>/<mode>/`：
 
 - `analysis.tir`：分析 kernel 在布局推导后的 IR。
-- `analysis.cpp`：分析 kernel 的生成源码。
 - `plan.json`：线程布局、物理布局、padding 周期、UB 字节数。
 - `measurement.cpp`：实际被测 kernel 的生成源码，设备模式下导出。
 - 根目录 `results.json`：正确性、各轮时延、中位时延、波动及 baseline/mode 比值。
@@ -112,6 +111,10 @@ padding 增加的搬运和地址计算可能抵消 UB 冲突收益，改善不�
 如果差值接近测量波动，应视为尚不能确认收益。
 递推循环也可能被后端优化；做归因前检查生成源码，必要时检查 ISA/profiler，
 确认目标访存没有被 hoist、合并或消除。
+
+分析模式不会执行 AutoSchedule、InsertSync 或生成 C++ 源码。
+它通过只能说明布局推导及检查通过，不能代表完整编译或设备执行通过。
+使用旧输出目录时，之前留下的 `analysis.cpp` 不属于当前运行生成的结果。
 
 新增这些例子时，本地没有 TileLang 编译库和 NPU 环境，尚未运行完整 lowering
 或设备测试；脚本中的正确性和布局检查需要在配置好的环境中执行。
