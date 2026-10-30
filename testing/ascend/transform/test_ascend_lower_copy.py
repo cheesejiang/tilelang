@@ -6,6 +6,7 @@ import pytest
 from tilelang import tvm
 from tilelang.ascend import language as T, transform
 from tilelang.layout import (
+    Layout,
     make_ascend_nz_layout,
     make_ascend_l0c_layout,
     make_ascend_major_k_layout,
@@ -60,6 +61,50 @@ def _equal(actual, expected):
     analyzer = tvm.arith.Analyzer()
     for a, b in zip(actual, expected):
         assert analyzer.can_prove_equal(a, b), (a, b)
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+@pytest.mark.parametrize("period_rows", [1, 16])
+@pytest.mark.parametrize("dtype,bytes_per_element", [("float16", 2), ("float32", 4), ("int64", 8)])
+def test_periodic_padding_dma_geometry(direction, period_rows, dtype, bytes_per_element):
+    rows, columns = 32 * period_rows, 32
+    elements = rows * columns
+    ub = tirx.decl_buffer((rows, columns), dtype, name="ub", scope="shared.dyn")
+    gm = tirx.decl_buffer((elements * 2,), dtype, name="gm")
+    layout = Layout((rows, columns), lambda i, j: i * columns + j + (i // period_rows) * (32 // bytes_per_element))
+    gm_region = _region(gm, [elements], [elements])
+    if direction == "load":
+        after = _lower(gm, ub, src_region=gm_region, layouts={ub: layout})
+        name = "tl.ascend_copy_gm_to_ubuf"
+        gm_ptr = 1
+    else:
+        after = _lower(ub, gm, dst_region=gm_region, layouts={ub: layout})
+        name = "tl.ascend_copy_ubuf_to_gm"
+        gm_ptr = 0
+    (dma,) = calls(after, name)
+    burst_bytes = period_rows * columns * bytes_per_element
+    _equal([dma.args[3], dma.args[4], dma.args[-2], dma.args[-1]], [32, burst_bytes, burst_bytes, burst_bytes + 32])
+    _equal([dma.args[gm_ptr].args[2], dma.args[1 - gm_ptr].args[2]], [elements, 0])
+    physical = allocated_buffer(after, "ub")
+    _equal(physical.shape, [elements + 31 * (32 // bytes_per_element)])
+
+
+@pytest.mark.parametrize("direction", ["load", "store"])
+def test_periodic_padding_dma_rejects_unaligned_ub_pitch(direction):
+    ub = tirx.decl_buffer((32, 32), "float32", name="ub", scope="shared.dyn", data_alignment=32)
+    gm = tirx.decl_buffer((32, 32), "float32", name="gm")
+    layout = Layout((32, 32), lambda i, j: i * 34 + j)
+    src, dst = (gm, ub) if direction == "load" else (ub, gm)
+    with pytest.raises(tvm.error.InternalError, match="32B-aligned UB base/pitch"):
+        _lower(src, dst, layouts={ub: layout})
+
+
+def test_periodic_padding_dma_rejects_partial_ub_region():
+    ub = tirx.decl_buffer((32, 32), "float32", name="ub", scope="shared.dyn")
+    gm = tirx.decl_buffer((16, 32), "float32", name="gm")
+    layout = Layout((32, 32), lambda i, j: i * 34 + j)
+    with pytest.raises(tvm.error.InternalError, match="full static UB tile"):
+        _lower(gm, ub, dst_region=_region(ub, [16, 32]), layouts={ub: layout})
 
 
 @pytest.mark.parametrize("scope", ["shared.l0a", "shared.l0b"])

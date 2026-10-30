@@ -10,6 +10,7 @@
 #ifndef TVM_TL_ASCEND_OP_ASCEND_MTE_PLAN_H_
 #define TVM_TL_ASCEND_OP_ASCEND_MTE_PLAN_H_
 
+#include "ascend/layout/ascend_layouts.h"
 #include "support/check.h"
 
 #include <tvm/arith/analyzer.h>
@@ -329,9 +330,9 @@ inline MTECopy2D PlanMTECopy(const StridedLayout &src_raw,
   ICHECK(!src.modes.empty() && !dst.modes.empty())
       << "PlanMTECopy: empty coalesced layout.";
   ICHECK(src.modes.size() <= 2 && dst.modes.size() <= 2)
-      << "PlanMTECopy: >2D strided copy not yet supported. " << "src has "
-      << src.modes.size() << " modes, " << "dst has " << dst.modes.size()
-      << " modes after coalesce.";
+      << "PlanMTECopy: >2D strided copy not yet supported. "
+      << "src has " << src.modes.size() << " modes, "
+      << "dst has " << dst.modes.size() << " modes after coalesce.";
   ICHECK(analyzer->CanProveEqual(src.modes[0].stride, I(1)) &&
          analyzer->CanProveEqual(dst.modes[0].stride, I(1)))
       << "PlanMTECopy: innermost MTE modes must be contiguous, got src stride "
@@ -406,6 +407,49 @@ inline MTECopy2D PlanMTECopy(const StridedLayout &src_raw,
       n_rows,           row_elems,  src_stride_elems,
       dst_stride_elems, src.offset, dst.offset,
   };
+}
+
+// Shared by inference legality and lowering: never adopt a storage layout
+// that the DMA backend cannot express. The GM region may start at a uniform
+// tile offset, but must be contiguous and match the complete logical UB tile.
+inline std::optional<AscendPeriodicPadding>
+TryPlanPeriodicPaddingDMA(const Buffer &ub, const ffi::Array<Range> &ub_range,
+                          const Layout &layout, const Buffer &gm,
+                          const ffi::Array<Range> &gm_range,
+                          arith::Analyzer *analyzer) {
+  if ((ub.scope() != "shared" && ub.scope() != "shared.dyn") ||
+      gm.scope() != "global" || ub->dtype != gm->dtype ||
+      ub->dtype.lanes() != 1 || ub->dtype.bits() < 8 ||
+      ub_range.size() != ub->shape.size() ||
+      gm_range.size() != gm->shape.size())
+    return std::nullopt;
+  auto padding = TryExtractAscendPeriodicPadding(layout, ub);
+  if (!padding)
+    return std::nullopt;
+  // Byte-granular GM lengths/strides do not waive the UB block-address
+  // alignment requirement. In particular, a 128B+8B UB pitch faults on MTE.
+  // Such layouts require staging/repacking, not a strided DMA descriptor.
+  int64_t ub_pitch = (padding->period + padding->padding) * ub->dtype.bytes();
+  if (ub->data_alignment < 32 || ub->data_alignment % 32 || ub_pitch % 32)
+    return std::nullopt;
+  for (size_t i = 0; i < ub_range.size(); ++i)
+    if (!is_zero(ub_range[i]->min) ||
+        !analyzer->CanProveEqual(ub_range[i]->extent, ub->shape[i]))
+      return std::nullopt;
+  for (size_t i = 0; i < gm_range.size(); ++i)
+    if (!analyzer->CanProve(gm_range[i]->min >= 0) ||
+        !analyzer->CanProve(gm_range[i]->extent > 0) ||
+        !analyzer->CanProve(gm_range[i]->min + gm_range[i]->extent <=
+                            gm->shape[i]))
+      return std::nullopt;
+  auto region = StridedLayout::FromBufferRange(gm, gm_range, gm->dtype.bits())
+                    .Coalesce(analyzer);
+  if (region.modes.size() != 1 ||
+      !analyzer->CanProveEqual(region.modes[0].stride, 1) ||
+      !analyzer->CanProveEqual(region.modes[0].size,
+                               Integer(padding->elements)))
+    return std::nullopt;
+  return padding;
 }
 
 } // namespace tl
