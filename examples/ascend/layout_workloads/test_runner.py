@@ -35,6 +35,9 @@ class ReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             def worker(cmd, check):
                 mode = cmd[cmd.index("--mode") + 1]
+                self.assertTrue((Path(folder) / "summary.md").exists())
+                if mode == "ownership":
+                    self.assertIn("baseline", (Path(folder) / "summary.md").read_text())
                 directory = Path(folder) / "vecadd"
                 directory.mkdir(exist_ok=True)
                 size = 4192 if mode == "auto" else 4096
@@ -73,6 +76,22 @@ class ReportTests(unittest.TestCase):
                     run_workloads.main()
             self.assertEqual(visited, ["baseline", "ownership", "padding", "auto"])
             self.assertTrue((Path(folder) / "summary.md").exists())
+
+    def test_summarize_existing_json_without_running_kernels(self):
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder) / "attention_update"
+            directory.mkdir()
+            archived = json.dumps({"status": "measured", "columns": 128, "rows": 64, "threads": 64,
+                                   "blocks": 8, "iterations": 7, "latency_us": 3.5})
+            (directory / "auto.json").write_text(archived)
+            argv = ["run_workloads.py", "--summarize-only", "--output", folder]
+            with patch("sys.argv", argv), patch("run_workloads.subprocess.run") as worker, redirect_stdout(io.StringIO()):
+                run_workloads.main()
+            worker.assert_not_called()
+            with (Path(folder) / "summary.csv").open() as handle:
+                (row,) = list(csv.DictReader(handle))
+            self.assertEqual((row["columns"], row["blocks"], row["iterations"]), ("128", "8", "7"))
+            self.assertEqual((directory / "auto.json").read_text(), archived)
 
 
 class ReferenceTests(unittest.TestCase):

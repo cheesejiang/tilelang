@@ -134,6 +134,34 @@ def run_worker(args):
         raise
 
 
+def summarize_reports(args, cases, reports_by_case):
+    records, candidates = [], []
+    for case, reports in reports_by_case.items():
+        baseline = reports.get("baseline", {})
+        for mode, report in reports.items():
+            # Rebuilding a table must use the archived configuration, not
+            # today's CLI defaults. Do not compare incompatible old runs.
+            compatible = all(report.get(k) == baseline.get(k) for k in
+                             ("rows", "columns", "threads", "blocks", "iterations"))
+            base = baseline if compatible else {}
+            latency = report.get("latency_us", "")
+            base_latency = base.get("latency_us")
+            config = {"case": case, "columns": report.get("columns", args.columns), "row_stride": 1,
+                      "iterations": report.get("iterations", args.updates if cases[case].category == "cross_reused" else 1),
+                      "blocks": report.get("blocks", args.blocks), "mode": mode}
+            candidates.extend({**config, **row} for row in candidate_rows(report.get("layout_diagnostics", [])))
+            final = final_ir_fields(report, base)
+            path = args.output / case / f"{mode}.json"
+            if not args.summarize_only and path.exists():
+                report.update(final)
+                path.write_text(json.dumps(report, indent=2))
+            records.append({**config, **summary_fields(report.get("layout_diagnostics", [])), **final,
+                            "status": report.get("status", "failed"), "padding_applied": report.get("padding_applied", ""),
+                            "latency_us": latency, "speedup_vs_baseline": base_latency / latency if base_latency and latency else "",
+                            "report_path": str(path)})
+    save_summary(args.output, records, candidates)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=["all", *CASES], default="all")
@@ -146,9 +174,11 @@ def main():
     parser.add_argument("--rounds", type=int, default=3, help="independent benchmark batches; report their median")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--summarize-only", action="store_true", help="rebuild tables from existing JSON without compiling or running kernels")
     parser.add_argument("--output", type=Path, default=Path("layout-workload-results"))
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    args.output = args.output.expanduser().resolve()
     try:
         validate(args.rows, args.columns, args.threads, args.blocks, args.updates)
         if args.rounds <= 0:
@@ -156,48 +186,43 @@ def main():
     except ValueError as error:
         parser.error(str(error))
     if args.worker:
+        if args.summarize_only:
+            parser.error("--worker cannot be combined with --summarize-only")
         if args.case == "all" or args.mode == "all":
             parser.error("worker requires one case and mode")
         run_worker(args)
         return
     cases = CASES if args.case == "all" else {args.case: CASES[args.case]}
     modes = MODES if args.mode == "all" else (args.mode,)
-    records, candidates = [], []
+    reports_by_case = {}
     failures = 0
+    print(f"Summary path: {args.output / 'summary.md'}", flush=True)
+    if not args.summarize_only:
+        save_summary(args.output, [], [])
     for case, spec in cases.items():
-        reports = {}
+        reports = reports_by_case.setdefault(case, {})
         for mode in modes:
             directory = args.output / case
             directory.mkdir(parents=True, exist_ok=True)
             path = directory / f"{mode}.json"
-            path.unlink(missing_ok=True)
-            cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", "--case", case, "--mode", mode,
-                   "--rows", str(args.rows), "--columns", str(args.columns), "--threads", str(args.threads),
-                   "--blocks", str(args.blocks), "--updates", str(args.updates), "--rounds", str(args.rounds),
-                   "--seed", str(args.seed), "--output", str(args.output)]
-            if args.bench:
-                cmd.append("--bench")
-            result = subprocess.run(cmd, check=False)
-            failures += int(result.returncode != 0)
+            if args.summarize_only:
+                if not path.exists():
+                    continue
+            else:
+                path.unlink(missing_ok=True)
+                cmd = [sys.executable, str(Path(__file__).resolve()), "--worker", "--case", case, "--mode", mode,
+                       "--rows", str(args.rows), "--columns", str(args.columns), "--threads", str(args.threads),
+                       "--blocks", str(args.blocks), "--updates", str(args.updates), "--rounds", str(args.rounds),
+                       "--seed", str(args.seed), "--output", str(args.output)]
+                if args.bench:
+                    cmd.append("--bench")
+                result = subprocess.run(cmd, check=False)
+                failures += int(result.returncode != 0)
             reports[mode] = json.loads(path.read_text()) if path.exists() else {"status": "failed"}
-        baseline = reports.get("baseline", {})
-        for mode, report in reports.items():
-            latency = report.get("latency_us", "")
-            base_latency = baseline.get("latency_us")
-            config = {"case": case, "columns": args.columns, "row_stride": 1,
-                      "iterations": args.updates if spec.category == "cross_reused" else 1,
-                      "blocks": args.blocks, "mode": mode}
-            rows = list(candidate_rows(report.get("layout_diagnostics", [])))
-            candidates.extend({**config, **row} for row in rows)
-            final = final_ir_fields(report, baseline)
-            report.update(final)
-            if (args.output / case / f"{mode}.json").exists():
-                (args.output / case / f"{mode}.json").write_text(json.dumps(report, indent=2))
-            records.append({**config, **summary_fields(report.get("layout_diagnostics", [])), **final,
-                            "status": report.get("status", "failed"), "padding_applied": report.get("padding_applied", ""),
-                            "latency_us": latency, "speedup_vs_baseline": base_latency / latency if base_latency and latency else "",
-                            "report_path": str(args.output / case / f"{mode}.json")})
-        save_summary(args.output, records, candidates)
+            summarize_reports(args, cases, reports_by_case)
+            print(f"Saved {args.output / 'summary.md'} ({case}/{mode})", flush=True)
+    if not any(reports_by_case.values()):
+        parser.error(f"No per-mode JSON files found under {args.output}")
     (args.output / "cases.json").write_text(json.dumps({name: asdict(case) for name, case in cases.items()}, indent=2))
     print((args.output / "summary.md").read_text())
     if failures:

@@ -112,6 +112,16 @@ ownership 理解，不能由这一列推断。
 时延包含 DMA、同步和 kernel 调用路径的影响，编译和 CPU 正确性验证不计时；
 当前调用仍由 kernel 包装器分配输出，不能当成纯 UB 指令时延。
 
+启动时打印 `summary.md` 的绝对路径，默认输出目录相对于**启动命令时的工作目录**，
+并非相对于脚本所在位置。总表启动时创建，每完成一个 mode 就更新，不需要等四种
+模式或全部 case 结束。若已有各模式的 JSON，但没有总表，可直接补生成而不跑设备：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py --summarize-only --output /绝对路径/layout-workload-results
+```
+
+补生成使用 JSON 中记录的配置，不覆盖原始 JSON，也不重新编译或计时。
+
 先确认精度、最终布局和成本是否真的改变，再比较时延。相同时延或无优化选择
 都是有效结果，不把“预期收益”当成通过条件。
 本地缺少 TVM/CANN/NPU，未验证新 DSL kernel 的编译、设备精度或性能。
