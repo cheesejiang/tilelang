@@ -1,0 +1,18 @@
+"""CPU equations; work with either PyTorch tensors or NumPy arrays."""
+
+
+def reference(case, a, incoming, stats):
+    if case == "gemm_scale":
+        return a * 1.25
+    if case == "attention_finalize":
+        return a / stats[:, -1, :, None]
+    if case == "vecadd":
+        return a + incoming[:, 0]
+    if case == "gemm_bias":
+        return a + incoming[:, 0, 0:1, :]
+    if case not in ("attention_update", "attention_update_finalize"):
+        raise ValueError(f"Unknown workload: {case}")
+    result = a * 1.0
+    for kv in range(incoming.shape[1]):
+        result = result * stats[:, kv, :, None] + incoming[:, kv]
+    return result / stats[:, -1, :, None] if case == "attention_update_finalize" else result
