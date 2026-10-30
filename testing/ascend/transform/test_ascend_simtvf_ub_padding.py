@@ -242,7 +242,8 @@ def test_layout_diagnostics_are_opt_in_and_preserve_decisions():
     records = list(diagnosed["main"].attrs["tl.ascend_layout_diagnostics"])
     final = next(r for r in records if str(r["stage"]) == "final")
     assert int(final["ub_extra_storage_bytes"]) == 2 * 96
-    assert int(final["ub_extra_allocation_bytes"]) == 2 * 512
+    assert int(final["estimated_ub_extra_allocation_bytes"]) == 2 * 96
+    assert str(final["allocation_estimate_method"]) == "sum_round_up_32B_without_alias_reuse"
     # Final collection runs after extracting the loop annotations: that step
     # must leave infer_list_ intact for the cost model.
     assert int(final["cost_known"]) == 1
@@ -257,3 +258,20 @@ def test_layout_diagnostics_are_opt_in_and_preserve_decisions():
     assert all("Layout" in str(b["layout"]) for b in final["buffers"])
     assert all(int(b["padding_bytes"]) == 32 for b in final["buffers"])
     assert any(str(r["stage"]) == "padding_candidate" for r in records)
+
+
+def test_padding_capacity_does_not_charge_512b_per_buffer():
+    mod, a, b = _program()
+    # Two 4096B buffers become 4192B each. Leave exactly that much room
+    # under the pass budget; artificial 512B rounding would reject padding.
+    budget = 216 * 1024
+    reserved = tirx.decl_buffer(((budget - 2 * 4192) // 4,), "float32",
+                               name="reserved", scope="shared.dyn", data_alignment=32)
+    combined = kernel(_vf(nodes(mod, tirx.For)[0], 32), buffers=[a, b, reserved])
+    with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(combined)
+    assert set(_storage_layouts(inferred)) == {"a", "b"}
+    final = next(r for r in inferred["main"].attrs["tl.ascend_layout_diagnostics"]
+                 if str(r["stage"]) == "final")
+    assert int(final["estimated_ub_allocation_bytes"]) == budget
+    assert int(final["estimated_ub_extra_allocation_bytes"]) == 192

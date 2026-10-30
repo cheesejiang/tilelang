@@ -563,6 +563,8 @@ public:
     record.Set("dma_cost", String("not_modeled"));
     record.Set("address_compute_cost", String("not_modeled"));
     record.Set("synchronization_cost", String("not_modeled"));
+    record.Set("allocation_estimate_method",
+               String("sum_round_up_32B_without_alias_reuse"));
     if (buffer.defined()) {
       record.Set("buffer", buffer->name);
       record.Set("period_elements", Integer(period));
@@ -576,15 +578,16 @@ public:
     for (bool aligned : {false, true}) {
       auto size = PaddingFootprint(layouts, aligned);
       auto native = PaddingFootprint(LayoutMap(), aligned);
-      String key = aligned ? "ub_allocation_bytes" : "ub_storage_bytes";
+      String key =
+          aligned ? "estimated_ub_allocation_bytes" : "ub_storage_bytes";
       if (size)
         record.Set(key, Integer(*size));
       if (native)
-        record.Set(aligned ? "ub_native_allocation_bytes"
+        record.Set(aligned ? "estimated_ub_native_allocation_bytes"
                            : "ub_native_storage_bytes",
                    Integer(*native));
       if (size && native)
-        record.Set(aligned ? "ub_extra_allocation_bytes"
+        record.Set(aligned ? "estimated_ub_extra_allocation_bytes"
                            : "ub_extra_storage_bytes",
                    Integer(*size - *native));
     }
@@ -2067,8 +2070,13 @@ private:
       // Existing layouts may describe a repeated sub-tile; lowering reserves
       // its replicas as well. Never undercount the original storage footprint.
       bytes = std::max(bytes, original_bytes);
-      // Conservatively allow allocation alignment without relying on reuse.
-      int64_t alignment = std::max(512, buffer->data_alignment);
+      // The standard Ascend pipeline calls MergeUBAllocations(align_bytes=32).
+      // Ordinary UB (shared/shared.dyn) has no stronger scope alignment in
+      // merge_ub_common.h. That planner aligns allocation starts and the arena
+      // end, and may reuse alias-compatible buffers. Sum rounded sizes here
+      // as a conservative no-reuse estimate, not the final arena footprint.
+      // buffer->data_alignment is not used by that allocation planner.
+      constexpr int64_t alignment = 32;
       total +=
           aligned ? ((bytes + alignment - 1) / alignment) * alignment : bytes;
       if (total > kLimit)

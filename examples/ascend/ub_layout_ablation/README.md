@@ -241,9 +241,17 @@ with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
 DMA、地址计算和同步成本标记为 `not_modeled`。
 
 `ub_storage_bytes` 是所有已收集 UB 分配的保守物理字节数；
-`ub_allocation_bytes` 是沿用 pass 的分配对齐取整后的总量。
-各自的 `ub_extra_*` 是相对原始存储的增加量，不假设 buffer 生命周期复用。
-它们是本 pass 的分配估计，不是最终设备编译器给出的实际 UB 峰值。
+`estimated_ub_allocation_bytes` 是逐 buffer 按 32B 取整后累加的保守估计，
+对应 `estimated_ub_native_allocation_bytes` 和 `estimated_ub_extra_allocation_bytes`。
+普通 UB 的标准分配流程来自 `tilelang/ascend/pipeline.py`：
+`MergeUBAllocations(align_bytes=32)`。`merge_ub_common.h` 对普通 shared/shared.dyn
+没有额外 scope 对齐要求；512B 要求属于 L1/L0A/L0B 等其他存储，不能套到 UB。
+实际分配器会对起始偏移和 arena 末尾对齐，并按别名契约复用空间。
+前期容量检查无法得到完整的后续复用计划，因此按不复用的保守方式估计。
+这些值不是最终合并后 arena 的大小，也不是设备实测占用。
+例如 4096B 增加 96B 后为 4192B，已是 32B 的倍数，估计增量也为 96B。
+旧报告的 `ub_*allocation_bytes` 使用未经核实的至少 512B 取整规则；
+新报告使用 `estimated_ub_*allocation_bytes`，需要重新编译并运行才能更新旧结果。
 `buffers` 记录逻辑/物理 shape、地址映射、每个 buffer 的字节数及可识别的周期。
 显式布局和 auto 使用相同的最终报告结构。
 
@@ -252,3 +260,27 @@ DMA、地址计算和同步成本标记为 `not_modeled`。
 `candidates.csv` 汇总每个物理候选的成本和搜索状态：
 `accepted_at_step` 表示当时被接受，`selected_final` 才表示最终仍采用该方案。
 完整阶段和各 buffer 的映射始终保留在每个模式的 JSON 中。
+
+## 最终 IR 中的 UB 地址空间
+
+四种模式均在完整编译的 `tl.MergeUBAllocations` 之后采集分配结果。
+MD 在估计值后增加两列，CSV 使用对应字段：
+
+| 列 | CSV 字段 | 含义 |
+| --- | --- | --- |
+| final IR UB allocation (B) | final_ir_ub_allocation_bytes | 分配器输出的 UB 地址空间大小，不再次对齐或取整 |
+| final IR extra vs baseline (B) | final_ir_ub_extra_vs_baseline_bytes | 与同一配置 baseline 的最终 IR 分配量之差 |
+
+JSON 的 `final_ir_ub` 保留每个函数和各 UB 分配的名称、shape、字节数及
+相对该 buffer 基址的半开区间 `[0, bytes)`。合并后 arena 已包含该分配器的
+对齐、空隙及别名复用效果；不从布局 pass 的估计值反推。
+仅统计普通 UB（`shared`、`shared.dyn`），不包含 L1/L0 等其他存储作用域。
+一个函数有多个 UB 分配时累加；多个函数分别列出，总表取函数分配量的最大值，
+不把不同 entry 的分配量相加，也不乘以 grid 的 block 数。
+
+每种模式还保存 `<mode>.allocated.tir`，可直接核对合并后的 UB buffer。
+缺少 pass 快照、存在动态分配大小、或单跑一个非 baseline 模式时无法计算基线增量，
+相应值显示 `unknown`；CSV 的 `final_ir_ub_status` 记录采集状态。
+这些是 TileLang 分配后的 IR 数据，不是 Bisheng 资源报告或设备运行时测量。
+
+使用原命令重新运行即可生成新列，旧 JSON 不会自动补充数据。

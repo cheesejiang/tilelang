@@ -18,7 +18,7 @@ from tilelang.instrumentation.session import (
 from tilelang.layout import Fragment, Layout
 from tilelang.profiler import do_bench
 from tvm import tirx
-from layout_diagnostics import plain, summary_fields
+from layout_diagnostics import collect_final_ub_allocations, final_ir_fields, plain, summary_fields
 
 
 def make_kernel(mode, row_stride=1, blocks=32):
@@ -82,8 +82,10 @@ def main():
         from reuse_kernels import make_reuse_kernel
     args.output.mkdir(parents=True, exist_ok=True)
     modes = ("baseline", "ownership", "padding", "auto") if args.mode == "all" else (args.mode,)
+    baseline_report = None
     for mode in modes:
         snapshots = []
+        allocation_snapshots = []
         seen_passes = []
 
         @tvm.ir.instrument.pass_instrument
@@ -92,6 +94,8 @@ def main():
                 seen_passes.append(info.name)
                 if info.name == "tl.AscendLayoutInference":
                     snapshots.append(mod)
+                if info.name == "tl.MergeUBAllocations":
+                    allocation_snapshots.append(mod)
 
         class CaptureTool(PassInstrumentationTool):
             def create_pass_instrument(self):
@@ -157,6 +161,16 @@ def main():
                   "iterations": args.iterations if args.case != "single" else 1, "blocks": args.blocks, "mode": mode, "padding_applied": bool(padded), "work_layout_entries": work_seen, "layouts": layouts_seen}
         report["layout_diagnostics"] = diagnostics
         report.update(summary_fields(diagnostics))
+        if allocation_snapshots:
+            allocated = allocation_snapshots[-1]
+            (args.output / f"{mode}.allocated.tir").write_text(str(allocated))
+            report["final_ir_ub"] = collect_final_ub_allocations(allocated)
+        else:
+            report["final_ir_ub"] = {"status": "missing_snapshot", "ub_allocation_bytes": None,
+                                     "functions": [], "source": "tl.MergeUBAllocations"}
+        if mode == "baseline":
+            baseline_report = report
+        report.update(final_ir_fields(report, baseline_report))
         (args.output / f"{mode}.json").write_text(json.dumps(report, indent=2))
         if mode == "padding" and not padded:
             raise RuntimeError(f"Explicit padding not observed; inspect {args.output / f'{mode}.json'} and {mode}.tir")
