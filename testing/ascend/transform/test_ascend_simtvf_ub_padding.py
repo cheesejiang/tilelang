@@ -245,5 +245,8 @@ def test_layout_diagnostics_are_opt_in_and_preserve_decisions():
     assert int(final["ub_extra_allocation_bytes"]) == 2 * 512
     assert int(final["entries"]) > 0
     assert str(final["dma_cost"]) == "not_modeled"
+    assert str(final["cost_scope"]) == "function_simt_ub_only"
+    assert {str(b["buffer"]) for b in final["buffers"]} == {"a", "b"}
+    assert all("Layout" in str(b["layout"]) for b in final["buffers"])
     assert all(int(b["padding_bytes"]) == 32 for b in final["buffers"])
     assert any(str(r["stage"]) == "padding_candidate" for r in records)

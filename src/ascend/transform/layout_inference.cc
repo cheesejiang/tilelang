@@ -547,7 +547,7 @@ public:
   };
 
   bool diagnostics_enabled = false;
-  Array<Map<String, ObjectRef>> diagnostics;
+  Array<Map<String, ffi::Any>> diagnostics;
 
   void RecordLayoutDiagnostic(
       const char *stage, int component, const LayoutMap &layouts,
@@ -556,7 +556,7 @@ public:
       const char *status = "evaluated") {
     if (!diagnostics_enabled)
       return;
-    Map<String, ObjectRef> record;
+    Map<String, ffi::Any> record;
     record.Set("stage", String(stage));
     record.Set("component", Integer(component));
     record.Set("status", String(status));
@@ -588,11 +588,11 @@ public:
                            : "ub_extra_storage_bytes",
                    Integer(*size - *native));
     }
-    Array<Map<String, ObjectRef>> buffers;
+    Array<Map<String, ffi::Any>> buffers;
     for (const auto &b : padding_allocations_) {
       if (!layouts.count(b))
         continue;
-      Map<String, ObjectRef> item;
+      Map<String, ffi::Any> item;
       item.Set("buffer", b->name);
       item.Set("layout", String(layouts[b]->DebugOutput()));
       item.Set("logical_shape", b->shape);
