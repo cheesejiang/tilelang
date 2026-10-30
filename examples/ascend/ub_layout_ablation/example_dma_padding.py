@@ -18,6 +18,7 @@ from tilelang.instrumentation.session import (
 from tilelang.layout import Fragment, Layout
 from tilelang.profiler import do_bench
 from tvm import tirx
+from layout_diagnostics import plain, summary_fields
 
 
 def make_kernel(mode, row_stride=1, blocks=32):
@@ -104,7 +105,8 @@ def main():
         try:
             func = (make_kernel(mode, args.row_stride, args.blocks) if args.case == "single" else
                     make_reuse_kernel(mode, args.row_stride, args.blocks, args.columns, args.iterations, args.case == "rotate"))
-            kernel = tilelang.compile(func, target="ascend", out_idx=-1)
+            kernel = tilelang.compile(func, target="ascend", out_idx=-1,
+                                      pass_configs={"tl.ascend_layout_diagnostics": True})
         finally:
             unregister_pass_instrumentation_tool(tool_name)
         if len(snapshots) != 1:
@@ -145,8 +147,16 @@ def main():
         # Save the evidence before checking the decision, including on failure.
         (args.output / f"{mode}.tir").write_text(str(snapshots[0]))
         (args.output / f"{mode}.cpp").write_text(kernel.get_kernel_source())
+        diagnostics = []
+        for func in snapshots[0].functions.values():
+            if isinstance(func, tirx.PrimFunc) and func.attrs is not None and "tl.ascend_layout_diagnostics" in func.attrs:
+                diagnostics.extend(plain(func.attrs["tl.ascend_layout_diagnostics"]))
+        if not diagnostics:
+            raise RuntimeError("Layout diagnostics missing; rebuild the TileLang library")
         report = {"case": args.case, "columns": args.columns, "row_stride": args.row_stride,
                   "iterations": args.iterations if args.case != "single" else 1, "blocks": args.blocks, "mode": mode, "padding_applied": bool(padded), "work_layout_entries": work_seen, "layouts": layouts_seen}
+        report["layout_diagnostics"] = diagnostics
+        report.update(summary_fields(diagnostics))
         (args.output / f"{mode}.json").write_text(json.dumps(report, indent=2))
         if mode == "padding" and not padded:
             raise RuntimeError(f"Explicit padding not observed; inspect {args.output / f'{mode}.json'} and {mode}.tir")

@@ -54,6 +54,8 @@ namespace tvm {
 namespace tl {
 namespace ascend {
 
+TVM_REGISTER_PASS_CONFIG_OPTION("tl.ascend_layout_diagnostics", Bool);
+
 using namespace tirx;
 using namespace ffi;
 
@@ -544,6 +546,109 @@ public:
     }
   };
 
+  bool diagnostics_enabled = false;
+  Array<Map<String, ObjectRef>> diagnostics;
+
+  void RecordLayoutDiagnostic(
+      const char *stage, int component, const LayoutMap &layouts,
+      const std::optional<costmodel::simtvf::OwnershipEffect> &effect,
+      const Buffer &buffer = Buffer(), int64_t period = 0,
+      const char *status = "evaluated") {
+    if (!diagnostics_enabled)
+      return;
+    Map<String, ObjectRef> record;
+    record.Set("stage", String(stage));
+    record.Set("component", Integer(component));
+    record.Set("status", String(status));
+    record.Set("dma_cost", String("not_modeled"));
+    record.Set("address_compute_cost", String("not_modeled"));
+    record.Set("synchronization_cost", String("not_modeled"));
+    if (buffer.defined()) {
+      record.Set("buffer", buffer->name);
+      record.Set("period_elements", Integer(period));
+      if (period > 0) {
+        record.Set(
+            "period_rows",
+            Integer(period / buffer->shape.back().as<IntImmNode>()->value));
+        record.Set("padding_bytes", Integer(32));
+      }
+    }
+    for (bool aligned : {false, true}) {
+      auto size = PaddingFootprint(layouts, aligned);
+      auto native = PaddingFootprint(LayoutMap(), aligned);
+      String key = aligned ? "ub_allocation_bytes" : "ub_storage_bytes";
+      if (size)
+        record.Set(key, Integer(*size));
+      if (native)
+        record.Set(aligned ? "ub_native_allocation_bytes"
+                           : "ub_native_storage_bytes",
+                   Integer(*native));
+      if (size && native)
+        record.Set(aligned ? "ub_extra_allocation_bytes"
+                           : "ub_extra_storage_bytes",
+                   Integer(*size - *native));
+    }
+    Array<Map<String, ObjectRef>> buffers;
+    for (const auto &b : padding_allocations_) {
+      if (!layouts.count(b))
+        continue;
+      Map<String, ObjectRef> item;
+      item.Set("buffer", b->name);
+      item.Set("layout", String(layouts[b]->DebugOutput()));
+      item.Set("logical_shape", b->shape);
+      item.Set("physical_shape", layouts[b]->OutputShape());
+      auto byte_size =
+          [&](const Array<PrimExpr> &shape) -> std::optional<int64_t> {
+        int64_t size = b->dtype.bytes();
+        for (const auto &extent : shape) {
+          const auto *n = extent.as<IntImmNode>();
+          if (!n || n->value <= 0 || size <= 0 ||
+              n->value > std::numeric_limits<int64_t>::max() / size)
+            return std::nullopt;
+          size *= n->value;
+        }
+        return size;
+      };
+      auto original = byte_size(b->shape);
+      auto physical = byte_size(layouts[b]->OutputShape());
+      if (original && physical) {
+        int64_t bytes = std::max(*original, *physical);
+        item.Set("native_bytes", Integer(*original));
+        item.Set("physical_bytes", Integer(bytes));
+        item.Set("extra_bytes", Integer(bytes - *original));
+      }
+
+      if (auto pad = TryExtractAscendPeriodicPadding(layouts[b], b)) {
+        item.Set("period_elements", Integer(pad->period));
+        item.Set(
+            "period_rows",
+            Integer(pad->period / b->shape.back().as<IntImmNode>()->value));
+        item.Set("padding_bytes", Integer(pad->padding * b->dtype.bytes()));
+      }
+      buffers.push_back(item);
+    }
+    record.Set("buffers", buffers);
+    record.Set("cost_scope",
+               String(component == -1 ? "function_simt_ub_only"
+                                      : "component_simt_ub_only"));
+    record.Set("cost_known",
+               Integer(effect && effect->ub_access.estimated_latency ? 1 : 0));
+    if (effect) {
+      const auto &cost = effect->ub_access;
+      record.Set("instructions", Integer(cost.instructions));
+      record.Set("requests", Integer(cost.requests));
+      record.Set("entries", Integer(cost.entries));
+      record.Set("partial", Integer(cost.partial));
+      if (cost.estimated_latency)
+        record.Set("estimated_latency_cycles",
+                   FloatImm(DataType::Float(64), *cost.estimated_latency));
+      if (cost.service_cycles)
+        record.Set("service_cycles",
+                   FloatImm(DataType::Float(64), *cost.service_cycles));
+    }
+    diagnostics.push_back(record);
+  }
+
   LayoutInferenceResult Run() {
     // Basic consistency check: infer_list_ and thread_index_vec_ should have
     // the same size
@@ -718,6 +823,22 @@ public:
       }
     }
 
+    if (diagnostics_enabled) {
+      std::vector<int> all;
+      for (int i = 0; i < infer_list_.size(); ++i)
+        all.push_back(i);
+      LayoutMap native = layout_map;
+      for (const auto &buffer : padding_allocations_)
+        native.erase(buffer);
+      RecordLayoutDiagnostic("final_ownership_unpadded", -1, native,
+                             costmodel::simtvf::AnalyzeOwnershipEffect(
+                                 infer_list_, all, thread_bounds_vec_, native,
+                                 ownership_outer_loops_));
+      RecordLayoutDiagnostic("final", -1, layout_map,
+                             costmodel::simtvf::AnalyzeOwnershipEffect(
+                                 infer_list_, all, thread_bounds_vec_,
+                                 layout_map, ownership_outer_loops_));
+    }
     return {layout_map, for_map, predicate_map, padding_guard_map};
   }
 
@@ -1700,6 +1821,8 @@ private:
         };
     std::vector<costmodel::simtvf::SimtUbStride> strides;
     auto best_effect = analyze(native_ops, native_layouts, &strides);
+    RecordLayoutDiagnostic("ownership_before", members.front(), native_layouts,
+                           best_effect);
     // Unknown costs cannot justify changing the native plan. The model owns
     // latency composition and comparison; this pass owns attempts and adoption.
     if (!best_effect)
@@ -1736,6 +1859,9 @@ private:
       if (width == max_width)
         break;
     }
+    RecordLayoutDiagnostic("ownership_after", members.front(),
+                           best ? best->outcome.layout_map : native_layouts,
+                           best_effect);
     DLOG(INFO) << "[UB ownership] estimated_latency="
                << *best_effect->ub_access.estimated_latency
                << " requests=" << best_effect->ub_access.requests
@@ -1996,6 +2122,7 @@ private:
       auto best = costmodel::simtvf::AnalyzeOwnershipEffect(
           infer_list_, members, thread_bounds_vec_, layouts,
           ownership_outer_loops_, &strides);
+      RecordLayoutDiagnostic("padding_before", root, layouts, best);
       if (!best)
         continue;
       const LayoutMap unpadded = layouts;
@@ -2045,12 +2172,20 @@ private:
           }
           Layout candidate(vars, {linear + floordiv(linear, Integer(period)) *
                                                Integer(padding / bytes)});
-          if (!candidate->DetectInjective()->errors.empty())
+          if (!candidate->DetectInjective()->errors.empty()) {
+            RecordLayoutDiagnostic("padding_candidate", root, layouts,
+                                   std::nullopt, buffer, period,
+                                   "rejected_noninjective");
             continue;
+          }
           LayoutMap trial = layouts;
           trial.Set(buffer, candidate);
-          if (!PaddingFootprint(trial))
+          if (!PaddingFootprint(trial)) {
+            RecordLayoutDiagnostic("padding_candidate", root, trial,
+                                   std::nullopt, buffer, period,
+                                   "rejected_capacity_or_unknown_allocation");
             continue;
+          }
           bool dma_legal = true;
           for (int member : members) {
             const auto *copy = infer_list_[member].as<CopyNode>();
@@ -2069,8 +2204,12 @@ private:
               break;
             }
           }
-          if (!dma_legal)
+          if (!dma_legal) {
+            RecordLayoutDiagnostic("padding_candidate", root, trial,
+                                   std::nullopt, buffer, period,
+                                   "rejected_dma");
             continue;
+          }
           auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
               infer_list_, members, thread_bounds_vec_, trial,
               ownership_outer_loops_);
@@ -2078,10 +2217,15 @@ private:
           // the savings of a longer period. Native storage wins equal costs.
           bool smaller = *PaddingFootprint(trial, false) <
                          *PaddingFootprint(layouts, false);
-          if (effect &&
+          bool accepted =
+              effect &&
               (costmodel::simtvf::IsBetterOwnership(*effect, *best) ||
                (!costmodel::simtvf::IsBetterOwnership(*best, *effect) &&
-                smaller))) {
+                smaller));
+          RecordLayoutDiagnostic(
+              "padding_candidate", root, trial, effect, buffer, period,
+              accepted ? "accepted_at_step" : "not_better_or_unknown_cost");
+          if (accepted) {
             layouts = std::move(trial);
             best = std::move(effect);
             DLOG(INFO) << "[UB padding] buffer=" << buffer->name
@@ -2091,6 +2235,7 @@ private:
           }
         }
       }
+      RecordLayoutDiagnostic("padding_after", root, layouts, best);
     }
   }
 
@@ -2401,10 +2546,17 @@ public:
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = ParallelLoopFuserSkipSimdVF::Fuse(f->body);
     BufferUseDefCollector collector;
+    collector.diagnostics_enabled =
+        tvm::transform::PassContext::Current()
+            ->GetConfig<Bool>("tl.ascend_layout_diagnostics", Bool(false))
+            .value();
     collector.Collect(f);
     auto result = collector.Run();
     LayoutInferencer substituter(result, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
+    if (collector.diagnostics_enabled)
+      f = WithAttr(std::move(f), "tl.ascend_layout_diagnostics",
+                   collector.diagnostics);
     return f;
   }
 

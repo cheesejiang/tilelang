@@ -230,3 +230,20 @@ def test_four_groups_do_not_benefit_from_32b_padding():
     # class. Padding by 32B cannot change the lower two group bits.
     mod, _, _ = _program(columns=40)
     assert not _storage_layouts(_infer(mod))
+
+
+def test_layout_diagnostics_are_opt_in_and_preserve_decisions():
+    mod, _, _ = _program()
+    native = _infer(mod)
+    assert "tl.ascend_layout_diagnostics" not in native["main"].attrs
+    with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+        diagnosed = _infer(mod)
+    tvm.ir.assert_structural_equal(native["main"].body, diagnosed["main"].body)
+    records = list(diagnosed["main"].attrs["tl.ascend_layout_diagnostics"])
+    final = next(r for r in records if str(r["stage"]) == "final")
+    assert int(final["ub_extra_storage_bytes"]) == 2 * 96
+    assert int(final["ub_extra_allocation_bytes"]) == 2 * 512
+    assert int(final["entries"]) > 0
+    assert str(final["dma_cost"]) == "not_modeled"
+    assert all(int(b["padding_bytes"]) == 32 for b in final["buffers"])
+    assert any(str(r["stage"]) == "padding_candidate" for r in records)

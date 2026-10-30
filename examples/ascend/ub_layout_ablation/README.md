@@ -213,3 +213,42 @@ python examples/ascend/ub_layout_ablation/example_dma_padding.py --case reuse --
 每个配置结束后立即更新总表；后续配置失败时已完成结果仍保留，失败或尚未运行
 的模式会标记 `failed_or_not_run`。不带 `--bench` 时没有时延，只记录正确性状态。
 每次调用重建本次扫描的总表；不会将之前运行的时延混入本次结果。
+
+## Pass 诊断与成本总表
+
+示例现在自动启用 `tl.ascend_layout_diagnostics`，**需要重新编译 C++ 库**。
+该 PassContext 开关默认关闭，开启时在 PrimFunc 的同名属性中保存诊断记录；
+不改变候选生成、比较或布局选择规则。也可以独立使用：
+
+```python
+with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+    inferred = transform.AscendLayoutInference()(mod)
+```
+
+每个模式的 JSON 增加 `layout_diagnostics`：
+
+- `ownership_before/ownership_after`：ownership 搜索发生时的阶段记录。
+  未进入搜索的路径不生成这两个阶段。
+- `padding_before/padding_candidate/padding_after`：组件成本与已构造的物理候选，
+  包括容量/分配信息未知、DMA、不单射等拒绝原因；前置资格检查排除的情况没有候选记录。
+- `final_ownership_unpadded/final`：对整个函数所有参与推导的算子评价，
+  前者固定最终 ownership、假设移除 UB 存储布局，后者使用真实最终布局。
+  它们不等同于原始 ownership 和优化后 ownership 的比较。
+
+每条记录尽可能包含 `estimated_latency_cycles`、`service_cycles`、
+`instructions`、`requests`、`entries`、`partial`；未知指标留空，不能当成 0。
+这些是每个 block 的 SIMT UB 模型指标，不能直接与整 kernel 的 us 作比例比较。
+DMA、地址计算和同步成本标记为 `not_modeled`。
+
+`ub_storage_bytes` 是所有已收集 UB 分配的保守物理字节数；
+`ub_allocation_bytes` 是沿用 pass 的分配对齐取整后的总量。
+各自的 `ub_extra_*` 是相对原始存储的增加量，不假设 buffer 生命周期复用。
+它们是本 pass 的分配估计，不是最终设备编译器给出的实际 UB 峰值。
+`buffers` 记录逻辑/物理 shape、地址映射、每个 buffer 的字节数及可识别的周期。
+显式布局和 auto 使用相同的最终报告结构。
+
+`summary.csv` 增加上述最终指标、未 padding 指标、padding 方案及 JSON 路径；
+`summary.md` 增加每模式的方案/占用/成本明细表。
+`candidates.csv` 汇总每个物理候选的成本和搜索状态：
+`accepted_at_step` 表示当时被接受，`selected_final` 才表示最终仍采用该方案。
+完整阶段和各 buffer 的映射始终保留在每个模式的 JSON 中。
