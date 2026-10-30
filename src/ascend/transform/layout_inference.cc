@@ -798,7 +798,9 @@ public:
     ICHECK(infer_list_.size() == thread_index_vec_.size())
         << "infer_list_ and thread_index_vec_ size mismatch";
     for (int i = 0; i < infer_list_.size(); i++) {
-      TileOperator base_infer = std::move(infer_list_[i]);
+      // Final diagnostics below still need the solved operators. Reading the
+      // loop annotations must not consume entries in infer_list_.
+      const TileOperator &base_infer = infer_list_[i];
       auto thread_index = thread_index_vec_[i];
 
       // Check if base_infer is valid

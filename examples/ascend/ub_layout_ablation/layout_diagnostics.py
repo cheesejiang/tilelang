@@ -29,10 +29,10 @@ def summary_fields(records):
     for buffer in final.get("buffers", []):
         if "padding_bytes" in buffer:
             schemes.append(f"{buffer['buffer']}: every {buffer['period_rows']} rows +{buffer['padding_bytes']}B")
-    result = {key: final.get(key, "") for key in (*COST_FIELDS, *STORAGE_FIELDS)}
+    result = {key: final.get(key, "unknown") for key in (*COST_FIELDS, *STORAGE_FIELDS)}
     result["padding_scheme"] = "; ".join(schemes) or "none_or_unrecognized"
     for key in COST_FIELDS:
-        result[f"unpadded_{key}"] = native.get(key, "")
+        result[f"unpadded_{key}"] = native.get(key, "unknown")
     result["unmodeled_costs"] = "DMA; address computation; synchronization"
     return result
 

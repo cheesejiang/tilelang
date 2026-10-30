@@ -243,6 +243,13 @@ def test_layout_diagnostics_are_opt_in_and_preserve_decisions():
     final = next(r for r in records if str(r["stage"]) == "final")
     assert int(final["ub_extra_storage_bytes"]) == 2 * 96
     assert int(final["ub_extra_allocation_bytes"]) == 2 * 512
+    # Final collection runs after extracting the loop annotations: that step
+    # must leave infer_list_ intact for the cost model.
+    assert int(final["cost_known"]) == 1
+    assert float(final["estimated_latency_cycles"]) > 0
+    assert float(final["service_cycles"]) > 0
+    assert int(final["instructions"]) > 0
+    assert int(final["requests"]) > 0
     assert int(final["entries"]) > 0
     assert str(final["dma_cost"]) == "not_modeled"
     assert str(final["cost_scope"]) == "function_simt_ub_only"
