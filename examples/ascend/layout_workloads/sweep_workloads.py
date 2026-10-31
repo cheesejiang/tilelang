@@ -46,6 +46,9 @@ def configurations(args):
     result = list(dict.fromkeys(result))
     for config in result:
         validate(config.rows, config.columns, config.threads, config.blocks, args.updates)
+        selected = CASES if getattr(args, "case", "all") == "all" else (args.case,)
+        for case in selected:
+            validate(config.rows, config.columns, config.threads, config.blocks, args.updates, case=case)
     return result
 
 

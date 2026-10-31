@@ -9,7 +9,7 @@ import statistics
 import subprocess
 import sys
 
-from catalog import CASES, MODES, FLASH_KV_WIDTH, iteration_count, mode_configs, validate
+from catalog import CASES, MODES, FLASH_CASES, FLASH_KV_WIDTH, FLASH_QK_HEAD_DIM, iteration_count, mode_configs, validate
 
 # Reuse the existing report formats, final-allocation reader and summary writer.
 SUPPORT = Path(__file__).resolve().parents[1] / "ub_layout_ablation"
@@ -53,10 +53,16 @@ def run_worker(args):
     try:
         tilelang.disable_cache()
         torch.manual_seed(args.seed)
-        a = torch.randn(args.blocks, args.rows, args.columns)
         tiles = iteration_count(args.case, args.columns, args.updates)
-        width = FLASH_KV_WIDTH if args.case == "flash_decode_column_store" else args.columns
-        b = torch.randn(args.blocks, tiles, args.rows, width)
+        if args.case == "flash_decode_qk_column_store":
+            # Quantize before computing the CPU reference; otherwise input
+            # rounding would be mistaken for a kernel correctness failure.
+            a = (torch.randn(args.blocks, args.rows, FLASH_QK_HEAD_DIM) * 0.25).to(torch.bfloat16)
+            b = (torch.randn(args.blocks, tiles, FLASH_KV_WIDTH, FLASH_QK_HEAD_DIM) * 0.25).to(torch.bfloat16)
+        else:
+            a = torch.randn(args.blocks, args.rows, args.columns)
+            width = FLASH_KV_WIDTH if args.case in FLASH_CASES else args.columns
+            b = torch.randn(args.blocks, tiles, args.rows, width)
         stats = torch.rand(args.blocks, tiles + 1, args.rows)
         stats[:, :-1, :] = stats[:, :-1, :] * 0.4 + 0.5
         stats[:, -1, :] = stats[:, -1, :] + 1
@@ -67,9 +73,12 @@ def run_worker(args):
             report["reduction_in_timed_kernel"] = False
         elif args.case == "kda_reduce_column_store":
             report["reduction_in_timed_kernel"] = True
-        elif args.case == "flash_decode_column_store":
+        elif args.case in FLASH_CASES:
             report.update(reduction_in_timed_kernel=True, kv_tile_width=FLASH_KV_WIDTH,
                           kv_output_tiles=tiles, result_ownership="native_reducer_placement_unpinned")
+            if args.case == "flash_decode_qk_column_store":
+                report.update(logits_producer="Cube_BF16_QK_FP32_accumulation", head_dim=FLASH_QK_HEAD_DIM,
+                              mixed_active_aiv=1, input_dtype="bfloat16", output_dtype="float32")
         expected = reference(args.case, a, b, stats)
         inputs = [x.to("npu") for x in (a, b, stats)]
         snapshots = {}
@@ -94,7 +103,12 @@ def run_worker(args):
                                         pass_configs=report["pass_configs"])
         finally:
             unregister_pass_instrumentation_tool(name)
-        (directory / f"{args.mode}.cpp").write_text(compiled.get_kernel_source())
+        kernel_source = compiled.get_kernel_source()
+        (directory / f"{args.mode}.cpp").write_text(kernel_source)
+        if args.case == "flash_decode_qk_column_store":
+            report["cube_gemm_in_source"] = "asc_mmad(" in kernel_source
+            if not report["cube_gemm_in_source"]:
+                raise RuntimeError("QK producer did not emit the expected Cube GEMM")
         records = []
         loops = []
         inferred = snapshots.get("tl.AscendLayoutInference")
@@ -115,8 +129,11 @@ def run_worker(args):
         if not records:
             raise RuntimeError("Missing layout diagnostics; rebuild the TileLang library")
         report["layout_diagnostics"] = records
+        if args.case == "flash_decode_qk_column_store" and not any(
+                r.get("padding_analysis_version", 0) >= 3 for r in records):
+            raise RuntimeError("QK stage requires padding analysis version >=3; rebuild the TileLang library")
         report["loop_layouts"] = loops
-        if args.case == "flash_decode_column_store":
+        if args.case in FLASH_CASES:
             from column_store_audit import collect_column_store_audit
             lowered = snapshots.get("tl.AscendLowerTileOp")
             report["column_store_audit"] = collect_column_store_audit(lowered, "scores_out")
@@ -207,10 +224,10 @@ def main():
     parser.add_argument("--case", choices=["all", *CASES], default="all")
     parser.add_argument("--mode", choices=["all", *MODES], default="all")
     parser.add_argument("--rows", type=int, default=32)
-    parser.add_argument("--columns", type=int, default=32, help="tile columns; for flash_decode_column_store, number of different KV output tiles")
+    parser.add_argument("--columns", type=int, default=32, help="tile columns; for flash_decode_* cases, number of different KV output tiles")
     parser.add_argument("--threads", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=32)
-    parser.add_argument("--updates", type=int, default=4, help="different incoming tiles for attention_update cases; flash_decode_column_store uses --columns instead")
+    parser.add_argument("--updates", type=int, default=4, help="different incoming tiles for attention_update cases; flash_decode_* cases use --columns instead")
     parser.add_argument("--rounds", type=int, default=3, help="independent benchmark batches; report their median")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bench", action="store_true")
@@ -221,6 +238,9 @@ def main():
     args.output = args.output.expanduser().resolve()
     try:
         validate(args.rows, args.columns, args.threads, args.blocks, args.updates)
+        selected_cases = CASES if args.case == "all" else (args.case,)
+        for case in selected_cases:
+            validate(args.rows, args.columns, args.threads, args.blocks, args.updates, case=case)
         if args.rounds <= 0:
             raise ValueError("rounds must be positive")
     except ValueError as error:

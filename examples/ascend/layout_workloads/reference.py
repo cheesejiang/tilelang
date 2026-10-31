@@ -2,6 +2,14 @@
 
 
 def reference(case, a, incoming, stats):
+    if case == "flash_decode_qk_column_store":
+        # Quantized BF16 Q/K are converted back to FP32 before the reference
+        # dot product, matching the device's FP32 accumulation input values.
+        q = a.float() if hasattr(a, "float") else a.astype("float32")
+        k = incoming.float() if hasattr(incoming, "float") else incoming.astype("float32")
+        logits = q[:, None] @ k.swapaxes(-1, -2)
+        maxima = logits.amax(dim=-1) if hasattr(logits, "amax") else logits.max(axis=-1)
+        return maxima.swapaxes(1, 2)
     if case == "flash_decode_column_store":
         maxima = incoming.amax(dim=-1) if hasattr(incoming, "amax") else incoming.max(axis=-1)
         return maxima.swapaxes(1, 2)

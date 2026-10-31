@@ -33,7 +33,7 @@ def test_column_store_audit_does_not_guess_unknown_predicate():
 
 
 @pytest.mark.parametrize("extent", [1, 2])
-@pytest.mark.parametrize("axis", ["threadIdx.y", "threadIdx.z"])
+@pytest.mark.parametrize("axis", ["threadIdx.y", "threadIdx.z", "cthread"])
 def test_column_store_audit_accepts_only_singleton_secondary_axes(axis, extent):
     tx = tirx.IterVar(tvm.ir.Range(0, 32), tirx.Var("tx", "int32"), tirx.IterVar.ThreadIndex, "threadIdx.x")
     secondary = tirx.IterVar(tvm.ir.Range(0, extent), tirx.Var("secondary", "int32"), tirx.IterVar.ThreadIndex, axis)

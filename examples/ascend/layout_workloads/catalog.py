@@ -33,6 +33,9 @@ CASES = {
     "flash_decode_column_store": Case("reduced_columns", "examples/flash_decoding/example_gqa_decode_varlen_logits.py",
                                       "flashattn",
                                       "Port per-KV-tile row max and S_shared[:,k] writeback to Ascend SIMT; use different input logits for every tile; omit QK/PV, online rescaling, FP16 conversion and variable lengths; do not pin result ownership."),
+    "flash_decode_qk_column_store": Case("reduced_columns", "examples/flash_decoding/example_gqa_decode_varlen_logits.py",
+                                         "flashattn",
+                                         "Produce QK logits with Ascend Cube BF16 GEMM and L0C->UB, then native SIMT max reduction and per-tile column stores; reuse Q across different K tiles; single active AIV, no pipeline, PV or online softmax."),
 }
 
 MODES = ("baseline", "ownership", "padding", "auto")
@@ -40,10 +43,12 @@ MODES = ("baseline", "ownership", "padding", "auto")
 # Number of logits per head in each incoming tile. Independent of the number
 # of output columns / KV tiles, so changing columns does not change reduction.
 FLASH_KV_WIDTH = 32
+FLASH_QK_HEAD_DIM = 64
+FLASH_CASES = ("flash_decode_column_store", "flash_decode_qk_column_store")
 
 
 def iteration_count(case, columns, updates):
-    if case == "flash_decode_column_store":
+    if case in FLASH_CASES:
         return columns
     return updates if CASES[case].category == "cross_reused" else 1
 
@@ -56,13 +61,15 @@ def mode_configs(mode):
             "tl.ascend_enable_ub_padding": mode in ("padding", "auto")}
 
 
-def validate(rows, columns, threads, blocks, updates):
+def validate(rows, columns, threads, blocks, updates, case=None):
     if min(rows, columns, threads, blocks, updates) <= 0:
         raise ValueError("all dimensions, blocks and updates must be positive")
     if threads % 32 or rows % threads:
         raise ValueError("threads must be a multiple of 32, and rows must be divisible by threads")
     if rows % 8:
         raise ValueError("rows must be a multiple of 8")
+    if case == "flash_decode_qk_column_store" and rows > 256:
+        raise ValueError("the QK stage extract supports at most 256 rows per Cube tile")
     # Work and incoming coexist; leave room for row statistics and allocator state.
     if (2 * rows * columns + 2 * rows + columns) * 4 > 208 * 1024:
         raise ValueError("tile exceeds the conservative example UB budget; reduce rows/columns")

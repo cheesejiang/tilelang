@@ -58,7 +58,7 @@ def collect_column_store_audit(mod, buffer_name, max_steps=65536):
                 elif tag == "threadIdx.x":
                     for t in range(value(stmt.value, bindings)):
                         walk(stmt.body, {**bindings, stmt.node.var: t}, serial, t)
-                elif tag in ("threadIdx.y", "threadIdx.z") and value(stmt.value, bindings) == 1:
+                elif tag in ("threadIdx.y", "threadIdx.z", "cthread") and value(stmt.value, bindings) == 1:
                     walk(stmt.body, {**bindings, stmt.node.var: 0}, serial, thread)
                 else:
                     raise ValueError(f"unsupported thread axis: {tag}")
@@ -77,7 +77,7 @@ def collect_column_store_audit(mod, buffer_name, max_steps=65536):
                     for i in range(start, start + count):
                         walk(stmt.body, {**bindings, stmt.loop_var: i}, serial, i - start)
                     return
-                if tag in ("threadIdx.y", "threadIdx.z") and count == 1:
+                if tag in ("threadIdx.y", "threadIdx.z", "cthread") and count == 1:
                     walk(stmt.body, {**bindings, stmt.loop_var: start}, serial, thread)
                     return
                 raise ValueError(f"unsupported thread axis: {tag}")

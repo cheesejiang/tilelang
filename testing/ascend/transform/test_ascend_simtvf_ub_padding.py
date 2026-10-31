@@ -280,7 +280,7 @@ def test_padding_collective_results_with_nonadjacent_active_lanes():
     # would leave almost all pairs in the same group.
     assert _period_rows(layout, 32, 32, 4) == 1
     records = list(inferred["main"].attrs["tl.ascend_layout_diagnostics"])
-    assert all(int(r["padding_analysis_version"]) == 2 for r in records)
+    assert all(int(r["padding_analysis_version"]) == 3 for r in records)
     assert any(str(r["stage"]) == "padding_stride_hint" and str(r["buffer"]) == "work" for r in records)
     before = next(r for r in records if str(r["stage"]) == "padding_before")
     after = next(r for r in records if str(r["stage"]) == "padding_after")
@@ -300,6 +300,29 @@ def test_padding_reports_buffer_rejection_before_candidate_generation():
     assert any(str(r["stage"]) == "padding_buffer_rejected"
                and str(r["status"]) == "buffer_rank_less_than_two"
                and str(r["buffer"]) == "source" for r in records)
+
+
+@pytest.mark.parametrize("boundary_name", ["a", "b"])
+def test_padding_keeps_non_gm_dma_storage_unchanged(boundary_name):
+    program, a, b = _program()
+    boundary = a if boundary_name == "a" else b
+    other = b if boundary_name == "a" else a
+    l1 = tirx.decl_buffer((32, 32), "float32", name="l1", scope="shared.l1", data_alignment=32)
+    body = seq(_vf(nodes(program, tirx.For)[0], 32), copy(boundary, l1))
+    program = kernel(body, buffers=[a, b, l1])
+    with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(program)
+    layouts = _storage_layouts(inferred)
+    assert str(other.name) in layouts
+    assert _period_rows(layouts[str(other.name)], 32, 32, 4) == 8
+    if boundary_name in layouts:
+        # A pre-existing identity layout is allowed; physical expansion is not.
+        import math
+        assert math.prod(int(x) for x in layouts[boundary_name].get_output_shape()) == 1024
+    records = inferred["main"].attrs["tl.ascend_layout_diagnostics"]
+    assert any(str(r["stage"]) == "padding_buffer_rejected"
+               and str(r["status"]) == "unmodeled_operator_accesses_storage"
+               and str(r["buffer"]) == boundary_name for r in records)
 
 
 @pytest.mark.parametrize("reduce_from_output", [False, True])

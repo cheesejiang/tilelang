@@ -3,12 +3,14 @@
 import tilelang.ascend.language as T
 
 if __package__:
-    from .catalog import FLASH_KV_WIDTH
+    from .catalog import FLASH_KV_WIDTH, FLASH_QK_HEAD_DIM
 else:
-    from catalog import FLASH_KV_WIDTH
+    from catalog import FLASH_KV_WIDTH, FLASH_QK_HEAD_DIM
 
 
 def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4):
+    if case == "flash_decode_qk_column_store":
+        return _make_flash_decode_qk_column_kernel(rows, columns, threads, blocks)
     if case == "flash_decode_column_store":
         return _make_flash_decode_column_kernel(rows, columns, threads, blocks)
     if case in ("kda_column_store", "kda_reduce_column_store"):
@@ -94,6 +96,49 @@ def _make_flash_decode_column_kernel(rows, columns, threads, blocks):
             scores_out = T.alloc_shared((rows, columns), "float32")
             for k in T.serial(columns):
                 T.copy(B[block, k, :, :], logits)
+                with T.SimtVF(threads=threads):
+                    maxima = T.alloc_reducer((rows,), "float32", op="max")
+                    T.reducer_init(maxima)
+                    for h, n in T.Parallel(rows, width):
+                        T.reducer_update(maxima[h], logits[h, n])
+                    result = T.alloc_fragment((rows,), "float32")
+                    T.finalize_reducer(maxima, result)
+                    T.copy(result, scores_out[:, k])
+            T.copy(scores_out, C[block, :, :])
+
+    return main
+
+
+def _make_flash_decode_qk_column_kernel(rows, columns, threads, blocks):
+    """Real Cube QK production followed by the same max/column-store stage.
+
+    Single-version buffers and one active AIV per mixed group make ownership,
+    synchronization and output coverage explicit. Q is reused across K tiles.
+    """
+    width, head_dim = FLASH_KV_WIDTH, FLASH_QK_HEAD_DIM
+
+    @T.prim_func
+    def main(
+        Q: T.Tensor((blocks, rows, head_dim), "bfloat16"),
+        K: T.Tensor((blocks, columns, width, head_dim), "bfloat16"),
+        Stats: T.Tensor((blocks, columns + 1, rows), "float32"),
+        C: T.Tensor((blocks, rows, columns), "float32"),
+    ):
+        with T.MixedKernel(blocks, sids=1) as (block, sid):
+            q_l1 = T.alloc_l1((rows, head_dim), "bfloat16")
+            k_l1 = T.alloc_l1((width, head_dim), "bfloat16")
+            q_l0 = T.alloc_l0a((rows, head_dim), "bfloat16")
+            k_l0 = T.alloc_l0b((width, head_dim), "bfloat16")
+            qk_l0c = T.alloc_l0c((rows, width), "float32")
+            logits = T.alloc_shared((rows, width), "float32")
+            scores_out = T.alloc_shared((rows, columns), "float32")
+            T.copy(Q[block, :, :], q_l1)
+            T.copy(q_l1, q_l0)
+            for k in T.serial(columns):
+                T.copy(K[block, k, :, :], k_l1)
+                T.copy(k_l1, k_l0)
+                T.gemm(q_l0, k_l0, qk_l0c, transpose_B=True, clear_accum=True)
+                T.copy(qk_l0c, logits)
                 with T.SimtVF(threads=threads):
                     maxima = T.alloc_reducer((rows,), "float32", op="max")
                     T.reducer_init(maxima)

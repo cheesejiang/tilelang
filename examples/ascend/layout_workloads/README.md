@@ -1,6 +1,6 @@
 # 真实计算阶段的四模式布局实验
 
-本目录从已有 kernel 提取九个计算阶段，比较 baseline、ownership、padding、auto。
+本目录从已有 kernel 提取十个计算阶段，比较 baseline、ownership、padding、auto。
 **同一个 case 的四组输入 IR 完全相同，只改变 pass 的两个独立优化开关。**
 baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选择，不通过实测时延搜索。
 复用 `../ub_layout_ablation/` 的诊断转换、最终 UB 分配读取、CSV/Markdown 总表。
@@ -32,6 +32,7 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | 稀疏单列写回 | kda_column_store | [KDA / tilelang_chunk_kda_fwd_intra_token_parallel](../../kda/chunk_intra_token_parallel.py) | 只执行 `O[r,0] = reduced[r]`；归约结果预先计算 |
 | 归约后单列写回 | kda_reduce_column_store | [KDA / tilelang_chunk_kda_fwd_intra_token_parallel](../../kda/chunk_intra_token_parallel.py) | kernel 内计算 `sum_d(A[r,d]*B[r,d])`，再写 `O[r,0]` |
 | 归约后逐列写回 | flash_decode_column_store | [Flash Decoding / flashattn](../../flash_decoding/example_gqa_decode_varlen_logits.py) | 每轮读取不同 logits，计算 `max_n(logits[k,h,n])` 并写 `S[h,k]` |
+| 实际 QK 后逐列写回 | flash_decode_qk_column_store | [Flash Decoding / flashattn](../../flash_decoding/example_gqa_decode_varlen_logits.py)、[Ascend QK 数据流](../flash_attention/core.py) | Cube 计算 `Q @ K[k].T`，L0C→UB，SIMT 求行最大值，写 `S[h,k]` |
 
 ## Flash Decoding 列写回验证
 
@@ -84,11 +85,11 @@ python examples/ascend/layout_workloads/run_workloads.py \
 MD 的 `Lowered column-store audit` 表给出活跃 lane 范围、同 group 不同行的最大数、
 存在这类冲突的 batch 数。只检查标量 TIR store，不声称它就是设备最终 ISA；
 遇到未解析 predicate、向量化或分析预算上限时显示 unknown，不据此宣称存在冲突。
-单例 `threadIdx.y/z`（extent=1）会绑定为 0；非单例二维/三维线程轴仍显示 unknown。
+单例 `threadIdx.y/z` 和 mixed `cthread`（extent=1）会绑定为 0；非单例辅助线程轴仍显示 unknown。
 候选 stride 从实际连续的活跃地址提取，允许 lane 编号不相邻（如 0、16）；
 最终仍使用原始 mask 评分。稀疏活跃请求的最佳周期可能比满 32-lane 请求更短，
 不能固定套用“每 8 行”规则。
-诊断版本 2 的记录包含 `padding_analysis_version=2`，用于确认实际加载的 C++ 库。
+诊断版本 3 的记录包含 `padding_analysis_version=3`，用于确认实际加载的 C++ 库。
 无候选时查看 `padding_skipped`、`padding_stride_hint`、`padding_buffer_rejected`：
 它们分别说明没有规则 stride/成本未知、已提取到 stride，以及 buffer 前置拒绝原因。
 不能仅凭 `padding_before/after` 相同就断言候选已经比较过。
@@ -103,14 +104,78 @@ MD 的 `Lowered column-store audit` 表给出活跃 lane 范围、同 group 不�
 中标注 `padding_scored_ops_only_invariant_ops_excluded`。它不包含归约成本，
 不能当作整核耗时，排除项也不是零成本。完整原始诊断仍保留在 JSON。
 
+## 第二步：接入真实 QK 生产阶段
+
+`flash_decode_qk_column_store` 不再从 GM 读取预计算 logits，而采用已有 Ascend
+GEMM/attention 样例的 L1→L0A/L0B→Cube GEMM→L0C→UB 路径：
+
+```text
+Q（GM）→ L1 → L0A ─────────────┐  只搬一次，跨 KV tile 复用
+                              ├→ Cube QK → L0C → logits UB
+每个不同 K tile（GM）→ L1 → L0B ┘                       ↓
+                                                 SIMT max 归约
+                                                       ↓
+                                                scores_out[:,k]
+                                                       ↓
+                                                   DMA → GM
+```
+
+Q/K 使用 BF16，Cube 累加和输出为 FP32。CPU 参考先使用已经 BF16 舍入的输入，
+转换回 FP32 计算 `max_n(sum_d(Q[h,d]*K[k,n,d]))`；验证全部 head、全部 tile。
+每轮 clear GEMM accumulator，归约结果只用于本轮列，不是重复计算同一输入。
+
+本阶段固定 head_dim=64、每个 KV tile 32 个 token。`rows` 是 head 数（最多 256），
+`columns` 是不同 KV tile 数，`--updates` 不使用。输入形状为：
+
+| 参数 | 形状 | dtype |
+| --- | --- | --- |
+| Q（通用接口第一个输入） | `[blocks, rows, 64]` | BF16 |
+| K（通用接口第二个输入） | `[blocks, columns, 32, 64]` | BF16 |
+| Stats（保留接口，未使用） | `[blocks, columns+1, rows]` | FP32 |
+| C | `[blocks, rows, columns]` | FP32 |
+
+使用 `MixedKernel(..., sids=1)`，每个 mixed group 只启用一个 AIV，避免两个 AIV
+重复写同一份输出。单缓冲、串行 KV 循环，依赖已有自动调度生成 Cube/Vector
+生产消费和复用同步；不增加手工 barrier、不固定 reducer/fragment 所有权。
+不包含 PV、在线 softmax、归一化、动态长度或流水线，仍是阶段实验而非完整 attention。
+这一步验证真实 QK 生产链，**不保证更快，也不消除 GM 搬运**：Q/K 仍需读取，
+同时引入实际 Cube 计算和跨核同步开销。
+
+版本 3 的 padding 检查允许 GM↔L1、L1↔L0、L0C→UB 等操作作为不变操作留在组件，
+但其直接访问的 storage 仍不能被 padding；只有独立 `scores_out` 可参与搜索。
+GM↔UB 的候选布局仍必须经过原有 DMA 描述检查。ownership 的准入规则保持。
+模型不包含 Cube、矩阵搬运、归约和跨核同步成本，查看 cost_scope，不能拿局部 cycles
+预测整核速度。UB 总表也不包含 L1/L0 分配。
+
+先同步并重新编译 C++，再跑四模式精度和诊断：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py \
+  --case flash_decode_qk_column_store --rows 32 --columns 32 --threads 32 \
+  --blocks 32 --output flash-qk-column-results
+```
+
+通过后加入 `--bench`，使用独立目录保存性能结果：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py \
+  --case flash_decode_qk_column_store --rows 32 --columns 32 --threads 32 \
+  --blocks 32 --bench --output flash-qk-column-bench
+```
+
+对比本 case 的四模式，再与旧 `flash_decode_column_store` 的结果并列观察。
+二者工作量、数据类型、生产链不同，不应把二者时延之差当成纯 DMA 成本。
+同样检查 `summary.md`、逐模式 `column_store_audit`、候选拒绝原因与最终 IR UB。
+
 ## 通用实验边界
 
 **这是源 kernel 的阶段提取实验，不是原始端到端 kernel 的原样测试。**
-vecadd 来源本来是 Ascend SIMT；GEMM/attention 来源是 SIMD，KDA 来源是 CUDA，均为阶段移植。
+vecadd 来源本来是 Ascend SIMT；GEMM/attention epilogue 来源是 SIMD，KDA 和 Flash Decoding 来源是 CUDA，均为阶段移植。
 跨行组用 `(column, row)` 逻辑循环，实际线程分配由基础推导和优化共同决定，
 应查看 `loop_layouts`；不能宣称原始 SIMD kernel 存在同样的 lane 冲突。
 保留源阶段的算术，但移除 Cube GEMM、NZ/BF16 打包、多版本和流水线等外围部分。
-原注意力阶段的 alpha、l 作为输入给出，不在本实验重算 QK、PV、softmax 或 reduction。
+attention_update/finalize 阶段的 alpha、l 作为输入给出，不在这些 case 重算 QK、PV 或 softmax。
+新增 QK case 在设备上计算 QK，两个 Flash Decoding case 都在设备上执行 max reduction。
 每个 KV tile 使用独立的 alpha 和 incoming；因提取阶段的上游不在本实验内，
 这些输入通过 GM 搬入，时延包含这些搬运，与原完整 attention 的内部交接不同。
 两种多次使用案例属于同一个注意力输出路径的两个阶段组合，并非两种独立算子家族。
@@ -264,7 +329,7 @@ python examples/ascend/layout_workloads/sweep_workloads.py \
 | `--dry-run` | 关闭 | 只打印并保存扫描计划 |
 | `--summarize-only` | 关闭 | 只读取各配置已有 JSON，重建跨配置总表 |
 
-默认两组共 11 个配置，全部八个 case、四模式共 352 次 case/mode 运行。
+默认两组共 11 个配置，全部十个 case、四模式共 440 次 case/mode 运行。
 所有 shape 都在启动前按预算及线程数约束检查；超出限制会报错，不会自动改变
 threads 或跳过形状，以免引入额外变量。
 

@@ -566,7 +566,7 @@ public:
     record.Set("status", String(status));
     // Bump when padding eligibility/hint diagnostics change. A source grep
     // cannot establish which shared library the board process actually loaded.
-    record.Set("padding_analysis_version", Integer(2));
+    record.Set("padding_analysis_version", Integer(3));
     record.Set("ownership_enabled", Integer(enable_ub_ownership ? 1 : 0));
     record.Set("padding_enabled", Integer(enable_ub_padding ? 1 : 0));
     record.Set("dma_cost", String("not_modeled"));
@@ -2164,14 +2164,28 @@ private:
     return touches;
   }
 
+  bool IsPaddingGmUbCopy(int member) const {
+    const auto *copy = infer_list_[member].as<CopyNode>();
+    if (!copy || ownership_simt_copies_.count(member))
+      return false;
+    auto ub = [](const Buffer &buffer) {
+      return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+    };
+    return (copy->src.scope() == "global" && ub(copy->dst)) ||
+           (ub(copy->src) && copy->dst.scope() == "global");
+  }
+
   bool CanChangeUbPadding(const std::vector<int> &members) {
     for (int member : members) {
       if (ownership_excluded_ops_.count(member))
         return false;
       const auto *copy = infer_list_[member].as<CopyNode>();
       if (copy && !ownership_simt_copies_.count(member)) {
-        // Preserve all existing DMA direction, argument and escape checks.
-        if (!CanChangeUbOwnership({member}, false))
+        // GM<->UB may touch the candidate and needs the existing argument
+        // checks plus per-candidate descriptor validation. Other directions,
+        // e.g. L0C->UB, are permitted only as unchanged operations: the later
+        // storage-isolation check rejects any candidate that they touch.
+        if (IsPaddingGmUbCopy(member) && !CanChangeUbOwnership({member}, false))
           return false;
         continue;
       }
@@ -2305,9 +2319,7 @@ private:
         // their UB/scratch lowering is not modeled by this comparison.
         bool invariant = true;
         for (int member : members) {
-          if (IsPaddingScoredOp(member) ||
-              (infer_list_[member].as<CopyNode>() &&
-               !ownership_simt_copies_.count(member)))
+          if (IsPaddingScoredOp(member) || IsPaddingGmUbCopy(member))
             continue;
           invariant &= !PaddingOpTouches(member, buffer);
         }
@@ -2400,7 +2412,7 @@ private:
           bool dma_legal = true;
           for (int member : members) {
             const auto *copy = infer_list_[member].as<CopyNode>();
-            if (!copy || ownership_simt_copies_.count(member))
+            if (!IsPaddingGmUbCopy(member))
               continue;
             bool load = copy->dst.same_as(buffer);
             if (!load && !copy->src.same_as(buffer))

@@ -31,6 +31,11 @@ Sparse MLA、K-pool、TopK 和 mHC 的相关实现，以及当前 Ascend 布局�
 新增回归覆盖部分列 copy 的每列实际写入、线程布局不变、1024 相位预算，
 以及 reducer 访问/不访问输出 storage 的两种情况；需要编译后运行 TVM 测试。
 
+诊断/检查版本 3 进一步允许非 GM↔UB 搬运作为不变项留在组件，例如 QK 的
+L0C→logits UB。候选不能触及这些搬运使用的 storage；并不支持 padding 任意
+矩阵搬运目标。`flash_decode_qk_column_store` 将真实 Cube BF16 QK 生产接入列写回，
+单缓冲、单 AIV，具体参数/命令见 README；仍未实现完整 attention 或证明性能收益。
+
 目前仍没有确认一个原样可运行、受当前 pass 支持、并已证明 padding 优于
 ownership 的真实完整 Ascend kernel。新找到的结构候选不等于已发现收益。
 

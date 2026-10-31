@@ -24,7 +24,7 @@ class ReportTests(unittest.TestCase):
             self.assertEqual((config["tl.ascend_enable_ub_ownership"], config["tl.ascend_enable_ub_padding"]), flags)
 
     def test_source_provenance(self):
-        self.assertEqual(sorted(Counter(c.category for c in CASES.values()).values()), [1, 2, 2, 2, 2])
+        self.assertEqual(sorted(Counter(c.category for c in CASES.values()).values()), [2, 2, 2, 2, 2])
         root = Path(__file__).resolve().parents[3]
         for case in CASES.values():
             tree = ast.parse((root / case.source).read_text())
@@ -34,6 +34,7 @@ class ReportTests(unittest.TestCase):
 
     def test_flash_iterations_and_partial_cost_scope(self):
         self.assertEqual(iteration_count("flash_decode_column_store", 64, 4), 64)
+        self.assertEqual(iteration_count("flash_decode_qk_column_store", 64, 4), 64)
         self.assertEqual(iteration_count("attention_update", 64, 4), 4)
         from layout_diagnostics import summary_fields
         records = [{"stage": "final", "cost_known": 0, "ub_extra_storage_bytes": 96},
@@ -52,6 +53,8 @@ class ReportTests(unittest.TestCase):
         for dimensions in [(32, 0, 32, 32, 4), (16, 32, 32, 32, 4), (32, 32, 16, 32, 4), (32, 32, 32, 0, 4)]:
             with self.assertRaises(ValueError):
                 validate(*dimensions)
+        with self.assertRaisesRegex(ValueError, "256 rows"):
+            validate(512, 32, 32, 1, 4, case="flash_decode_qk_column_store")
 
     def test_suite_collects_all_modes_and_final_allocations(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -158,6 +161,12 @@ class ReferenceTests(unittest.TestCase):
         stats = np.array([[[0.5, 0.75, 0.9], [0.6, 0.8, 0.7], [1, 2, 3]]], dtype=np.float32)
         for case in CASES:
             actual = reference(case, a, b, stats)
+            if case == "flash_decode_qk_column_store":
+                expected = np.array([[[max(sum(float(a[0, r, d]) * float(b[0, k, n, d])
+                                               for d in range(4)) for n in range(3))
+                                       for k in range(2)] for r in range(3)]], dtype=np.float32)
+                np.testing.assert_allclose(actual, expected, rtol=1e-6, atol=1e-5)
+                continue
             if case == "flash_decode_column_store":
                 self.assertEqual(actual.shape, (1, 3, 2))
                 for r in range(3):

@@ -13,3 +13,12 @@ def test_modes_have_identical_input_ir(case):
         with tvm.transform.PassContext(config=mode_configs(mode)):
             candidate = make_kernel(case)
         tvm.ir.assert_structural_equal(native, candidate)
+
+
+@pytest.mark.parametrize("mode", ["baseline", "auto"])
+def test_flash_decode_qk_producer_reaches_cube_and_simt_lowering(mode):
+    import tilelang
+    with tvm.transform.PassContext(config=mode_configs(mode)):
+        lowered = tilelang.lower(make_kernel("flash_decode_qk_column_store", blocks=1), target="ascend")
+    assert "asc_mmad(" in lowered.kernel_source
+    assert "__simt_vf__" in lowered.kernel_source
