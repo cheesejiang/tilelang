@@ -564,6 +564,9 @@ public:
     record.Set("stage", String(stage));
     record.Set("component", Integer(component));
     record.Set("status", String(status));
+    // Bump when padding eligibility/hint diagnostics change. A source grep
+    // cannot establish which shared library the board process actually loaded.
+    record.Set("padding_analysis_version", Integer(2));
     record.Set("ownership_enabled", Integer(enable_ub_ownership ? 1 : 0));
     record.Set("padding_enabled", Integer(enable_ub_padding ? 1 : 0));
     record.Set("dma_cost", String("not_modeled"));
@@ -2277,12 +2280,26 @@ private:
           infer_list_, scored, thread_bounds_vec_, layouts,
           ownership_outer_loops_, &strides, true);
       RecordLayoutDiagnostic("padding_before", root, layouts, best);
-      if (!best)
+      if (!best) {
+        RecordLayoutDiagnostic("padding_skipped", root, layouts, best, Buffer(),
+                               0, "unknown_baseline_cost");
         continue;
+      }
+      if (strides.empty())
+        RecordLayoutDiagnostic("padding_skipped", root, layouts, best, Buffer(),
+                               0, "no_regular_active_lane_stride");
       const LayoutMap unpadded = layouts;
       std::vector<std::pair<const BufferNode *, int64_t>> tried;
+      std::vector<std::pair<const BufferNode *, int64_t>> seen_hints;
       for (const auto &stride : strides) {
         const Buffer &buffer = stride.buffer;
+        auto hint = std::make_pair(buffer.get(), stride.elements);
+        if (std::find(seen_hints.begin(), seen_hints.end(), hint) !=
+            seen_hints.end())
+          continue;
+        seen_hints.push_back(hint);
+        RecordLayoutDiagnostic("padding_stride_hint", root, layouts, best,
+                               buffer, 0, "regular_active_lane_stride_found");
         // Omitted reduction/initialization/opaque operations are a common,
         // unchanged term, not a zero-cost estimate. Never pad their storage:
         // their UB/scratch lowering is not modeled by this comparison.
@@ -2294,8 +2311,44 @@ private:
             continue;
           invariant &= !PaddingOpTouches(member, buffer);
         }
-        if (!invariant)
+        if (!invariant) {
+          RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
+                                 buffer, 0,
+                                 "unmodeled_operator_accesses_storage");
           continue;
+        }
+        const char *rejection = nullptr;
+        if (buffer->shape.size() < 2)
+          rejection = "buffer_rank_less_than_two";
+        else if (unpadded.count(buffer))
+          rejection = "existing_physical_layout";
+        else if (!CanChangeBufferOwnership(buffer))
+          rejection = "unsupported_metadata_alias_annotation_or_unknown_use";
+        else if (!buffer->strides.empty() || !is_zero(buffer->elem_offset))
+          rejection = "non_dense_or_nonzero_offset";
+        else if (std::none_of(
+                     padding_allocations_.begin(), padding_allocations_.end(),
+                     [&](const Buffer &b) { return b.same_as(buffer); }))
+          rejection = "buffer_not_in_padding_allocations";
+        if (rejection) {
+          RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
+                                 buffer, 0, rejection);
+          continue;
+        }
+        int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
+        if (columns <= 0 || stride.elements < columns ||
+            stride.elements % columns) {
+          RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
+                                 buffer, 0,
+                                 "stride_is_not_positive_whole_rows");
+          continue;
+        }
+        int bytes = buffer->dtype.bytes();
+        if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) {
+          RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
+                                 buffer, 0, "unsupported_element_width");
+          continue;
+        }
         // Enumerate up to one warp of padding phases. Periods are multiples
         // of the observed row step, including 8*s and 16*s. Score actual
         // addresses: starting offsets and other users need not share a phase.
@@ -2305,30 +2358,21 @@ private:
           if (std::find(tried.begin(), tried.end(), key) != tried.end())
             continue;
           tried.push_back(key);
-          // First version: dense, allocated, unannotated multi-dimensional UB.
-          // Only whole-row strides are candidates; continuous accesses skip it.
-          if (buffer->shape.size() < 2 || unpadded.count(buffer) ||
-              !CanChangeBufferOwnership(buffer) || !buffer->strides.empty() ||
-              !is_zero(buffer->elem_offset) ||
-              std::none_of(padding_allocations_.begin(),
-                           padding_allocations_.end(),
-                           [&](const Buffer &b) { return b.same_as(buffer); }))
-            continue;
-          int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
-          if (columns <= 0 || stride.elements < columns ||
-              stride.elements % columns)
-            continue;
-          int bytes = buffer->dtype.bytes();
-          if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8)
-            continue;
           constexpr int64_t padding = 32;
           int64_t elements = 1;
           for (const auto &extent : buffer->shape)
             elements *= extent.as<IntImmNode>()->value;
-          if (period >= elements)
-            continue; // No hole inside the allocation; retain native storage.
-          if (!PaddingFootprint(layouts))
+          if (period >= elements) {
+            RecordLayoutDiagnostic("padding_candidate", root, layouts, best,
+                                   buffer, period, "rejected_no_internal_hole");
             continue;
+          }
+          if (!PaddingFootprint(layouts)) {
+            RecordLayoutDiagnostic(
+                "padding_candidate", root, layouts, std::nullopt, buffer,
+                period, "rejected_unknown_or_excess_baseline_capacity");
+            continue;
+          }
           Array<IterVar> vars;
           PrimExpr linear = 0;
           for (size_t dim = 0; dim < buffer->shape.size(); ++dim) {

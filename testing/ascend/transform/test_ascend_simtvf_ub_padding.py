@@ -280,11 +280,26 @@ def test_padding_collective_results_with_nonadjacent_active_lanes():
     # would leave almost all pairs in the same group.
     assert _period_rows(layout, 32, 32, 4) == 1
     records = list(inferred["main"].attrs["tl.ascend_layout_diagnostics"])
+    assert all(int(r["padding_analysis_version"]) == 2 for r in records)
+    assert any(str(r["stage"]) == "padding_stride_hint" and str(r["buffer"]) == "work" for r in records)
     before = next(r for r in records if str(r["stage"]) == "padding_before")
     after = next(r for r in records if str(r["stage"]) == "padding_after")
     assert int(before["requests"]) == int(after["requests"]) == 32 * 16
     assert int(before["entries"]) == 32 * 32
     assert int(after["entries"]) == 32 * 16
+
+
+def test_padding_reports_buffer_rejection_before_candidate_generation():
+    source = tirx.decl_buffer((1024,), "float32", name="source", scope="shared.dyn", data_alignment=32)
+    dest = tirx.decl_buffer((32,), "float32", name="dest", scope="shared.dyn", data_alignment=32)
+    loop = _parallel((32,), lambda i: tirx.BufferStore(dest, source[i * 32], [i]))
+    program = kernel(_vf(loop, 32), buffers=[source, dest])
+    with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(program)
+    records = inferred["main"].attrs["tl.ascend_layout_diagnostics"]
+    assert any(str(r["stage"]) == "padding_buffer_rejected"
+               and str(r["status"]) == "buffer_rank_less_than_two"
+               and str(r["buffer"]) == "source" for r in records)
 
 
 @pytest.mark.parametrize("reduce_from_output", [False, True])

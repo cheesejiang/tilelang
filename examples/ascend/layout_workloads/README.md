@@ -88,6 +88,10 @@ MD 的 `Lowered column-store audit` 表给出活跃 lane 范围、同 group 不�
 候选 stride 从实际连续的活跃地址提取，允许 lane 编号不相邻（如 0、16）；
 最终仍使用原始 mask 评分。稀疏活跃请求的最佳周期可能比满 32-lane 请求更短，
 不能固定套用“每 8 行”规则。
+诊断版本 2 的记录包含 `padding_analysis_version=2`，用于确认实际加载的 C++ 库。
+无候选时查看 `padding_skipped`、`padding_stride_hint`、`padding_buffer_rejected`：
+它们分别说明没有规则 stride/成本未知、已提取到 stride，以及 buffer 前置拒绝原因。
+不能仅凭 `padding_before/after` 相同就断言候选已经比较过。
 
 **先看 baseline 的实际活跃 lane。** 如果每个 warp store batch 只有一个 lane，
 就没有本实验假设的多 lane 列冲突。即使多 lane 有冲突，模型 entry 改善也不保证
