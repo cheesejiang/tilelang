@@ -30,3 +30,15 @@ def test_column_store_audit_does_not_guess_unknown_predicate():
     store = tirx.BufferStore(buffer, tirx.FloatImm("float32", 1), [tx.var * 32])
     mod = kernel(_vf(tirx.IfThenElse(flag > 0, store, None), tx=tx, threads=32), buffers=[buffer], params=[flag])
     assert collect_column_store_audit(mod, "scores_out")["status"] == "unknown"
+
+
+@pytest.mark.parametrize("extent", [1, 2])
+@pytest.mark.parametrize("axis", ["threadIdx.y", "threadIdx.z"])
+def test_column_store_audit_accepts_only_singleton_secondary_axes(axis, extent):
+    tx = tirx.IterVar(tvm.ir.Range(0, 32), tirx.Var("tx", "int32"), tirx.IterVar.ThreadIndex, "threadIdx.x")
+    secondary = tirx.IterVar(tvm.ir.Range(0, extent), tirx.Var("secondary", "int32"), tirx.IterVar.ThreadIndex, axis)
+    buffer = tirx.decl_buffer((1024,), "float32", name="scores_out", scope="shared.dyn", data_alignment=32)
+    store = tirx.BufferStore(buffer, tirx.FloatImm("float32", 1), [tx.var * 32])
+    body = tirx.AttrStmt(secondary, "thread_extent", extent, _vf(store, tx=tx, threads=32))
+    report = collect_column_store_audit(kernel(body, buffers=[buffer]), "scores_out")
+    assert report["status"] == ("known" if extent == 1 else "unknown")

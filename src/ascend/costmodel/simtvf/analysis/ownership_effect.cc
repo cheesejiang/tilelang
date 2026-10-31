@@ -318,14 +318,23 @@ private:
       }
       if (strides_ && !remapped) {
         std::optional<int64_t> delta;
+        std::optional<int64_t> previous;
         bool regular = true;
-        for (int lane = 1; lane < geometry.warp_size; ++lane) {
-          if (!addresses[0][lane - 1] || !addresses[0][lane])
+        // Collective-result stores often execute only at replica-zero lanes,
+        // e.g. lanes 0 and 16. Candidate hints follow consecutive ACTIVE
+        // addresses, not adjacent numeric lane IDs. This does not merge or
+        // reassign lanes: every candidate is still scored with the exact mask.
+        for (int lane = 0; lane < geometry.warp_size; ++lane) {
+          if (!addresses[0][lane])
             continue;
-          int64_t step = *addresses[0][lane] - *addresses[0][lane - 1];
-          if (delta && *delta != step)
-            regular = false;
-          delta = step;
+          int64_t address = *addresses[0][lane];
+          if (previous) {
+            int64_t step = address - *previous;
+            if (delta && *delta != step)
+              regular = false;
+            delta = step;
+          }
+          previous = address;
         }
         if (regular && delta && *delta > bytes && *delta % bytes == 0)
           strides_->push_back({buffer, *delta / bytes});

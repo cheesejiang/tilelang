@@ -223,7 +223,7 @@ def test_unsupported_simt_copy_retains_unpadded_storage(kind):
     assert "b" not in layouts
 
 
-def _column_copy_program(iterations=32):
+def _column_copy_program(iterations=32, sparse_replicas=False):
     work = tirx.decl_buffer((32, 32), "float32", name="work", scope="shared.dyn")
     values = tirx.decl_buffer((32, 1), "float32", name="values", scope="local.fragment")
     k = tirx.Var("column", "int32")
@@ -231,9 +231,12 @@ def _column_copy_program(iterations=32):
     body = _vf(tirx.For(k, 0, iterations, tirx.ForKind.SERIAL, transfer), 32)
     # This is the immutable placement supplied by a preceding collective:
     # one result per lane, not a freely repartitionable whole matrix.
-    placement = tilelang.layout.Fragment(
+    placement = (tilelang.layout.Fragment(
+        (32, 1), forward_thread_fn=lambda r, c, rep: (r % 2) * 16 + rep,
+        forward_index_fn=lambda r, c: r // 2, replicate=16,
+    ) if sparse_replicas else tilelang.layout.Fragment(
         (32, 1), forward_thread_fn=lambda r, c: r, forward_index_fn=lambda r, c: 0
-    )
+    ))
     return kernel(body, buffers=[work, values], annotations={"layout_map": {values.data: placement}})
 
 
@@ -264,6 +267,24 @@ def test_partial_copy_phase_budget_retains_native_storage():
     # The scorer must not extrapolate column-zero cost when it cannot cover
     # every invocation within its bounded phase enumeration budget.
     assert "work" not in _storage_layouts(_infer(_column_copy_program(1025)))
+
+
+def test_padding_collective_results_with_nonadjacent_active_lanes():
+    # Replica-zero stores are at lanes 0 and 16, with consecutive row results.
+    # A hint collector that only inspects lane n/n+1 misses every row stride.
+    with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(_column_copy_program(sparse_replicas=True))
+    layout = _storage_layouts(inferred)["work"]
+    # Unlike a full 32-lane request, each request contains only TWO rows.
+    # Every-row padding separates those two groups; every-eight-row padding
+    # would leave almost all pairs in the same group.
+    assert _period_rows(layout, 32, 32, 4) == 1
+    records = list(inferred["main"].attrs["tl.ascend_layout_diagnostics"])
+    before = next(r for r in records if str(r["stage"]) == "padding_before")
+    after = next(r for r in records if str(r["stage"]) == "padding_after")
+    assert int(before["requests"]) == int(after["requests"]) == 32 * 16
+    assert int(before["entries"]) == 32 * 32
+    assert int(after["entries"]) == 32 * 16
 
 
 @pytest.mark.parametrize("reduce_from_output", [False, True])

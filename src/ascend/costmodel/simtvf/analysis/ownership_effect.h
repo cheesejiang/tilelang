@@ -43,8 +43,10 @@ struct OwnershipEffect {
   SimtUbAccessCost ub_access;
 };
 
-// Regular positive lane strides in the locally lowered, unpadded access.
-// These are candidate hints, not legality or profitability decisions.
+// Regular positive strides between consecutive active lanes' addresses in the
+// locally lowered, unpadded access. Active lane IDs need not be adjacent (for
+// example replica-zero lanes 0 and 16 after a collective). These are candidate
+// hints, not legality or profitability decisions; score with the original mask.
 struct SimtUbStride {
   tirx::Buffer buffer;
   int64_t elements;
