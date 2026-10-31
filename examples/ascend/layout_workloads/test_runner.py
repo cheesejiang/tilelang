@@ -34,7 +34,9 @@ class ReportTests(unittest.TestCase):
 
     def test_invalid_dimensions(self):
         validate(32, 32, 32, 32, 4)
-        for dimensions in [(32, 17, 32, 32, 4), (16, 32, 32, 32, 4), (32, 32, 16, 32, 4), (32, 32, 32, 0, 4)]:
+        for columns in (16, 17, 34, 40):
+            validate(32, columns, 32, 32, 4)
+        for dimensions in [(32, 0, 32, 32, 4), (16, 32, 32, 32, 4), (32, 32, 16, 32, 4), (32, 32, 32, 0, 4)]:
             with self.assertRaises(ValueError):
                 validate(*dimensions)
 

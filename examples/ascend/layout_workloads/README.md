@@ -11,6 +11,7 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | 文件 | 作用 |
 | --- | --- |
 | [run_workloads.py](run_workloads.py) | 四模式编译、精度验证、计时、采集诊断、保存总表 |
+| [sweep_workloads.py](sweep_workloads.py) | 固定 blocks 扫描 shape、固定 shape 扫描 blocks，生成跨配置总表 |
 | [kernels.py](kernels.py) | 定义 kernel；工厂不接受 mode 参数，避免模式改变输入 IR |
 | [catalog.py](catalog.py) | 六个场景的来源、分类、参数约束和 mode→pass 开关映射 |
 | [reference.py](reference.py) | CPU 参考公式 |
@@ -115,12 +116,116 @@ python examples/ascend/layout_workloads/run_workloads.py --rows 128 --threads 12
 | --output | layout-workload-results | 报告根目录 |
 | --summarize-only | 关闭 | 只读取已有 JSON 重建总表，不编译、不执行、不计时 |
 
-threads 是 32 的倍数且必须整除 rows；rows 还必须是 8 的倍数，columns 是 32 的倍数。
-这些是本组规则 tile 的实验限制，不代表硬件只能处理这些形状。
+threads 是 32 的倍数且必须整除 rows；rows 还必须是 8 的倍数，columns 为正整数。
+为比较不同的行跨度，脚本不再将 columns 限制为 32 的倍数，例如允许 16、34、40。
+这不保证所有形状都有优化收益；DMA/布局合法性仍由编译器检查，新列宽需要设备验证。
 脚本还限制 tile 尺寸，给统计量/分配预留空间。主机输入统一为 A、incoming、Stats，
 未使用的输入不在设备上搬运；CPU 参考计算保存在 `reference.py`。
 增大 blocks 会增加总工作量，不是把固定数据量分给更多 block。比较模式时应保持
 blocks 一致；报告的 UB 分配量是每次 block 执行所需的地址空间，不乘以 blocks。
+
+## 批量扫描 shape 和 blocks
+
+使用 `sweep_workloads.py`，每个配置仍调用原四模式实验，不改变 kernel 或 pass。
+两个扫描维度分开控制，不做 shape×blocks 的全组合：
+
+| 扫描 | 改变的参数 | 保持固定 |
+| --- | --- | --- |
+| `--sweep shapes` | `--shapes` 指定的 rows、columns | `--blocks`、`--threads`、updates、seed |
+| `--sweep blocks` | `--block-counts` 指定的 blocks | `--rows`、`--columns`、`--threads`、updates、seed |
+| `--sweep both` | 依次做上述两组扫描 | 各组分别控制，不互相混合 |
+
+建议先只选 `gemm_scale` 验证流程，再扩展到全部 case。先预览配置和预计运行次数，
+此命令只保存计划，不导入 NPU 运行环境，也不编译或执行 kernel：
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep both --case gemm_scale --dry-run --output layout-scan-preview
+```
+
+**第一组：固定 32 blocks 和 32 threads，扫描矩阵 shape。**
+16、32、34、40 列对应不同的行跨度，可以观察模型 entry、实际布局和时延变化：
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep shapes --case gemm_scale \
+  --shapes 32x16 32x32 32x34 32x40 64x32 128x32 \
+  --blocks 32 --threads 32 --bench --output layout-shape-scan
+```
+
+如果希望元素总数相同、只改变行列比例，可另做一组：
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep shapes --case gemm_scale --shapes 32x128 64x64 128x32 \
+  --blocks 32 --threads 32 --bench --output layout-shape-equal-area
+```
+
+**第二组：固定每 block 的 32×32 tile 和 32 threads，扫描 blocks。**
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep blocks --case gemm_scale --rows 32 --columns 32 --threads 32 \
+  --block-counts 1 8 16 32 64 --bench --output layout-block-scan
+```
+
+改成 `--case all` 扫描六个 case；指定 `--mode ownership` 等可只跑一种模式，
+但没有同配置 baseline 时相对加速比和 UB 增量会是未知。
+不带 `--bench` 也会精度验证、采集布局及模型成本，只是不测时延。
+
+| 扫描参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `--sweep` | both | shapes、blocks 或两组扫描 |
+| `--shapes` | 32x16 32x32 32x34 32x40 64x32 128x32 | shape 扫描的显式列表，不是行列笛卡尔积 |
+| `--blocks` | 32 | shape 扫描的固定 block 数 |
+| `--rows / --columns` | 32 / 32 | block 扫描的固定 tile shape |
+| `--block-counts` | 1 8 16 32 64 | block 扫描列表 |
+| `--threads` | 32 | 全程固定；必须整除所有待测 rows |
+| `--case / --mode` | all / all | 与单配置入口相同 |
+| `--updates / --rounds / --seed` | 4 / 3 / 0 | 与单配置入口相同 |
+| `--output` | layout-workload-sweeps | 跨配置报告根目录 |
+| `--dry-run` | 关闭 | 只打印并保存扫描计划 |
+| `--summarize-only` | 关闭 | 只读取各配置已有 JSON，重建跨配置总表 |
+
+默认两组共 11 个配置，全部六个 case、四模式共 264 次 case/mode 运行。
+所有 shape 都在启动前按预算及线程数约束检查；超出限制会报错，不会自动改变
+threads 或跳过形状，以免引入额外变量。
+
+扫描结果分别保存，彼此不覆盖：
+
+```text
+<scan-output>/
+  scan_plan.json
+  summary.md / summary.csv / candidates.csv     # 跨配置总表
+  shapes/r32_c34_t32_b32/
+    summary.md / summary.csv / candidates.csv   # 原四模式总表
+    <case>/<mode>.json、.input.tir、.cpp、.tir、.allocated.tir
+  blocks/r32_c32_t32_b1/
+    ...
+```
+
+根目录总表启动时创建，每完成一个配置更新；子目录仍每完成一个 mode 更新。
+失败配置的已有结果保留，并继续其他配置，最后返回非零退出码。
+根表明确区分 scan、rows、columns、threads、blocks，不会合并不同 shape 的记录。
+除原有模型/分配指标，还记录 `output_elements = blocks×rows×columns` 和
+`output_melems_per_s = output_elements / latency_us`，单位 Melem/s。
+这是输出元素吞吐量，不是内存带宽，也未将 KV updates 换算成操作数。
+
+比较 block 数时，总数据量同时变化，应结合吞吐量，不能只比较绝对时延。
+同配置四模式加速比才用于评价优化收益；UB 分配和模型成本是每 block 的指标。
+完整矩阵的连续元素可能让 ownership 消除跨行问题；本扫描不会凭空增加稀疏
+“每行仅取第 0 列”的场景，该场景需要单独的 kernel 实验。
+
+补生成扫描总表时，使用与原运行相同的扫描列表和固定参数。例如：
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep blocks --case gemm_scale --rows 32 --columns 32 --threads 32 \
+  --block-counts 1 8 16 32 64 --summarize-only --output layout-block-scan
+```
+
+补生成直接读取每个配置的原始 JSON，不调用设备，也不重跑子配置。
+`scan_plan.json` 记录原扫描计划；当前入口要求显式传入相同扫描参数，不自动恢复计划。
 
 ## 结果
 

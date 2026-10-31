@@ -42,8 +42,8 @@ def validate(rows, columns, threads, blocks, updates):
         raise ValueError("all dimensions, blocks and updates must be positive")
     if threads % 32 or rows % threads:
         raise ValueError("threads must be a multiple of 32, and rows must be divisible by threads")
-    if columns % 32 or rows % 8:
-        raise ValueError("columns must be a multiple of 32 and rows a multiple of 8")
+    if rows % 8:
+        raise ValueError("rows must be a multiple of 8")
     # Work and incoming coexist; leave room for row statistics and allocator state.
     if (2 * rows * columns + 2 * rows + columns) * 4 > 208 * 1024:
         raise ValueError("tile exceeds the conservative example UB budget; reduce rows/columns")
