@@ -9,7 +9,7 @@ import statistics
 import subprocess
 import sys
 
-from catalog import CASES, MODES, validate
+from catalog import CASES, MODES, mode_configs, validate
 
 # Reuse the existing report formats, final-allocation reader and summary writer.
 SUPPORT = Path(__file__).resolve().parents[1] / "ub_layout_ablation"
@@ -41,8 +41,9 @@ def run_worker(args):
               "status": "compiling", "padding_applied": False}
     source_path = Path(__file__).resolve().parents[3] / source.source
     report["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
-    report["baseline_partition"] = ("column-major lane=r%threads" if source.category != "continuous_ownership" else
-                                    "contiguous float2: lane=(i//2)%threads")
+    report["experiment_protocol"] = "identical-ir-pass-switches-v1"
+    report["pass_configs"] = mode_configs(args.mode)
+    report["baseline_partition"] = "common native layout inference; no mode-specific annotations"
     report["scope"] = "SIMT stage extract, not an end-to-end benchmark of the source kernel"
 
     def save():
@@ -75,9 +76,11 @@ def run_worker(args):
         name = "examples.layout_workloads.capture"
         register_pass_instrumentation_tool(name, CaptureTool)
         try:
-            func = make_kernel(args.case, args.mode, args.rows, args.columns, args.threads, args.blocks, tiles)
+            func = make_kernel(args.case, args.rows, args.columns, args.threads, args.blocks, tiles)
+            report["input_ir_structural_hash"] = str(tvm.ir.structural_hash(func, map_free_vars=True))
+            (directory / f"{args.mode}.input.tir").write_text(str(func))
             compiled = tilelang.compile(func, target="ascend", out_idx=-1,
-                                        pass_configs={"tl.ascend_layout_diagnostics": True})
+                                        pass_configs=report["pass_configs"])
         finally:
             unregister_pass_instrumentation_tool(name)
         (directory / f"{args.mode}.cpp").write_text(compiled.get_kernel_source())
@@ -104,8 +107,7 @@ def run_worker(args):
         report["loop_layouts"] = loops
         report.update(summary_fields(records))
         report["padding_applied"] = any("padding_bytes" in b for r in records if r.get("stage") == "final" for b in r.get("buffers", []))
-        report["padding_policy"] = ("explicit_32B_periodic" if source.category != "continuous_ownership" else
-                                    "no_padding_candidate_for_contiguous_access") if args.mode == "padding" else args.mode
+        report["padding_policy"] = "rule_based_search" if report["pass_configs"]["tl.ascend_enable_ub_padding"] else "disabled"
         allocated = snapshots.get("tl.MergeUBAllocations")
         if allocated is not None:
             report["final_ir_ub"] = collect_final_ub_allocations(allocated)
@@ -113,8 +115,8 @@ def run_worker(args):
         report.update(final_ir_fields(report))
         report["status"] = "compiled"
         save()
-        if args.mode == "padding" and source.category != "continuous_ownership" and not report["padding_applied"]:
-            raise RuntimeError("Explicit padded layout was not found in final diagnostics")
+        if not report["pass_configs"]["tl.ascend_enable_ub_padding"] and report["padding_applied"]:
+            raise RuntimeError("Padding was applied despite its optimization switch being disabled")
         actual = compiled(*inputs)
         torch.npu.synchronize()
         torch.testing.assert_close(actual.cpu(), expected, rtol=1e-4, atol=1e-5)
@@ -142,7 +144,7 @@ def summarize_reports(args, cases, reports_by_case):
             # Rebuilding a table must use the archived configuration, not
             # today's CLI defaults. Do not compare incompatible old runs.
             compatible = all(report.get(k) == baseline.get(k) for k in
-                             ("rows", "columns", "threads", "blocks", "iterations"))
+                             ("rows", "columns", "threads", "blocks", "iterations", "experiment_protocol"))
             base = baseline if compatible else {}
             latency = report.get("latency_us", "")
             base_latency = base.get("latency_us")

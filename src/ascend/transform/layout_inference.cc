@@ -55,6 +55,8 @@ namespace tl {
 namespace ascend {
 
 TVM_REGISTER_PASS_CONFIG_OPTION("tl.ascend_layout_diagnostics", Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION("tl.ascend_enable_ub_ownership", Bool);
+TVM_REGISTER_PASS_CONFIG_OPTION("tl.ascend_enable_ub_padding", Bool);
 
 using namespace tirx;
 using namespace ffi;
@@ -547,6 +549,8 @@ public:
   };
 
   bool diagnostics_enabled = false;
+  bool enable_ub_ownership = true;
+  bool enable_ub_padding = true;
   Array<Map<String, ffi::Any>> diagnostics;
 
   void RecordLayoutDiagnostic(
@@ -560,6 +564,8 @@ public:
     record.Set("stage", String(stage));
     record.Set("component", Integer(component));
     record.Set("status", String(status));
+    record.Set("ownership_enabled", Integer(enable_ub_ownership ? 1 : 0));
+    record.Set("padding_enabled", Integer(enable_ub_padding ? 1 : 0));
     record.Set("dma_cost", String("not_modeled"));
     record.Set("address_compute_cost", String("not_modeled"));
     record.Set("synchronization_cost", String("not_modeled"));
@@ -2021,7 +2027,7 @@ private:
         }
       }
       ICHECK(has_best) << "no available layout found" << '\n';
-      if (ownership_eligible.count(members.front())) {
+      if (enable_ub_ownership && ownership_eligible.count(members.front())) {
         auto improved = TryImproveUbOwnership(
             members, layout_map, strict_layout_map, best_infer_list,
             best_layout_map, *cost_model);
@@ -2036,7 +2042,8 @@ private:
                  << " output: mem=" << best_cost.mem
                  << " regs=" << best_cost.regs;
     }
-    TryImproveUbPadding(layout_map, ownership_eligible);
+    if (enable_ub_padding)
+      TryImproveUbPadding(layout_map, ownership_eligible);
   }
 
   // Use the same SIMT UB budget as AutoSchedule (248 KiB less 32 KiB
@@ -2559,6 +2566,14 @@ public:
     collector.diagnostics_enabled =
         tvm::transform::PassContext::Current()
             ->GetConfig<Bool>("tl.ascend_layout_diagnostics", Bool(false))
+            .value();
+    collector.enable_ub_ownership =
+        tvm::transform::PassContext::Current()
+            ->GetConfig<Bool>("tl.ascend_enable_ub_ownership", Bool(true))
+            .value();
+    collector.enable_ub_padding =
+        tvm::transform::PassContext::Current()
+            ->GetConfig<Bool>("tl.ascend_enable_ub_padding", Bool(true))
             .value();
     collector.Collect(f);
     auto result = collector.Run();

@@ -18,8 +18,8 @@
 
 **这是源 kernel 的阶段提取实验，不是原始端到端 kernel 的原样测试。**
 vecadd 来源本来是 SIMT；其余来源是 SIMD，实现已改写为 SIMT。
-跨行组用 `(column, row)` 逻辑循环，固定对照布局让相邻 lane 访问相邻行。
-这是一种受控的 SIMT 映射，不能宣称原始 SIMD kernel 存在同样的 lane 冲突。
+跨行组用 `(column, row)` 逻辑循环，实际线程分配由基础推导和优化共同决定，
+应查看 `loop_layouts`；不能宣称原始 SIMD kernel 存在同样的 lane 冲突。
 保留源阶段的算术，但移除 Cube GEMM、NZ/BF16 打包、多版本和流水线等外围部分。
 原注意力阶段的 alpha、l 作为输入给出，不在本实验重算 QK、PV、softmax 或 reduction。
 每个 KV tile 使用独立的 alpha 和 incoming；因提取阶段的上游不在本实验内，
@@ -34,18 +34,27 @@ vecadd 来源本来是 SIMT；其余来源是 SIMD，实现已改写为 SIMT。
 
 ## 四种模式
 
-| 模式 | 跨行组 | 连续组 |
+| 模式 | tl.ascend_enable_ub_ownership | tl.ascend_enable_ub_padding |
 | --- | --- | --- |
-| baseline | 固定列优先：lane=`r % threads`，无 padding | 固定 float2 分配，无 padding |
-| ownership | UB 地址等价地展平成一维，不指定 loop layout，避开多维 padding 搜索 | 一维 UB，不指定 loop layout |
-| padding | 固定 baseline 线程布局；work/incoming 每 8 行加 32B | 无适用 padding 候选，保持 baseline float2 布局 |
-| auto | 原多维 UB，不指定线程/存储布局，让现有 pass 决策 | 原一维 UB，不指定 loop layout，让 pass 评估 ownership |
+| baseline | false | false |
+| ownership | true | false |
+| padding | false | true |
+| auto | true | true |
 
-baseline 是明确、可复现的控制布局，**不声称等于源 kernel 未优化时的 native 布局**。
-连续组 float2 baseline 让每线程拥有相邻两个元素，再以 slots 覆盖整个 tile；默认
-32×32、32 threads 时每线程处理 32 个元素。现有模型可能选择 float1 ownership，
-降低 b64 拆请求的 entry 成本；实际 ISA 和时延是否改善须看产物和测量。
-auto 可能保留原布局，也可能采用 ownership 或 padding，不强制某种结果。
+**必须重新编译 C++ 库**以注册开关。两个开关默认均为 true，未指定时保持原行为。
+关闭的只是对应优化搜索，必要的基础布局推导及合法性检查始终执行。
+同一个 case 的四组使用完全相同的无注解 kernel；跨行组始终是二维 UB，连续组
+始终是一维 UB，不再通过展平 buffer、固定 float2 或显式 padding 区分模式。
+kernel 工厂没有 mode 参数。每份报告记录 `pass_configs`、输入 IR 的结构哈希，
+并保存 `<mode>.input.tir`，可核对四组输入。默认连续组仍是每线程多个逻辑元素。
+
+auto 保持规则驱动：二维规则跨行访问保留基础 ownership，搜索物理 padding；
+其他支持场景评估 ownership，然后评估适用的 padding 候选。
+合法候选中优先降低模型成本、同成本优先少占用 UB，没有收益则保留原布局。
+它不穷举四种运行模式，也不保证实测全局最优。padding-only 同样通过 pass 搜索，
+不再强制手工周期；不采用 padding 也是有效结果。
+完整开关配置记录在 pass 诊断中。协议标识为 `identical-ir-pass-switches-v1`；
+旧版展平/注解对照结果应保存在另一目录，不能与新版当作同一实验比较。
 完整 `loop_layouts` 和最终 `layout_diagnostics` 均保存到 JSON。
 
 ## 运行

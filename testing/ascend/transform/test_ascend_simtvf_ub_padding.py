@@ -275,3 +275,45 @@ def test_padding_capacity_does_not_charge_512b_per_buffer():
                  if str(r["stage"]) == "final")
     assert int(final["estimated_ub_allocation_bytes"]) == budget
     assert int(final["estimated_ub_extra_allocation_bytes"]) == 192
+
+
+@pytest.mark.parametrize("ownership", [False, True])
+@pytest.mark.parametrize("padding", [False, True])
+def test_independent_ub_optimization_switches(ownership, padding):
+    mod, _, _ = _program()
+    config = {"tl.ascend_enable_ub_ownership": ownership,
+              "tl.ascend_enable_ub_padding": padding,
+              "tl.ascend_layout_diagnostics": True}
+    with tvm.transform.PassContext(config=config):
+        inferred = _infer(mod)
+    assert bool(_storage_layouts(inferred)) == padding
+    final = next(r for r in inferred["main"].attrs["tl.ascend_layout_diagnostics"] if str(r["stage"]) == "final")
+    assert int(final["ownership_enabled"]) == int(ownership)
+    assert int(final["padding_enabled"]) == int(padding)
+    if ownership and padding:
+        tvm.ir.assert_structural_equal(inferred["main"].body, _infer(mod)["main"].body)
+    if padding and not ownership:
+        with tvm.transform.PassContext(config={"tl.ascend_enable_ub_ownership": False,
+                                              "tl.ascend_enable_ub_padding": False}):
+            baseline = _infer(mod)
+        def loop_layouts(module):
+            return [loop.annotations["parallel_loop_layout"] for loop in nodes(module, tirx.For)
+                    if "parallel_loop_layout" in loop.annotations]
+        before, after = loop_layouts(baseline), loop_layouts(inferred)
+        assert len(before) == len(after)
+        for a, b in zip(before, after):
+            tvm.ir.assert_structural_equal(a, b)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_ownership_switch_controls_contiguous_search(enabled):
+    from testing.ascend.transform.test_ascend_simtvf_ub_ownership import _elementwise
+
+    mod = _elementwise(n=8192, threads=128, alignments=(32, 32, 32))
+    with tvm.transform.PassContext(config={"tl.ascend_enable_ub_ownership": enabled,
+                                          "tl.ascend_enable_ub_padding": False,
+                                          "tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(mod)
+    records = inferred["main"].attrs["tl.ascend_layout_diagnostics"]
+    assert any(str(r["stage"]) == "ownership_before" for r in records) == enabled
+    assert not _storage_layouts(inferred)

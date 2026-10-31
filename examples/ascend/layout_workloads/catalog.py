@@ -21,12 +21,20 @@ CASES = {
     "attention_update_finalize": Case("cross_reused", "examples/ascend/flash_attention/core.py", "accumulate_output + finalize_fp32",
                                       "Same KV accumulation, followed by O/l; SIMD stages rewritten to SIMT."),
     "vecadd": Case("continuous_ownership", "examples/ascend/example_vecadd.py", "vector_add(mode='simt')",
-                   "Keep A+B; use one tile per block, no pipeline/multiversion; fixed float2 baseline versus ownership search."),
+                   "Keep A+B; use one tile per block, no pipeline/multiversion; same unannotated IR in all modes."),
     "gemm_bias": Case("continuous_ownership", "examples/ascend/deepgemm/kernels/epilogue.py", "add_bias",
                       "FP32 bias epilogue rewritten from SIMD to contiguous SIMT; omit BF16 conversion and GEMM."),
 }
 
 MODES = ("baseline", "ownership", "padding", "auto")
+
+
+def mode_configs(mode):
+    if mode not in MODES:
+        raise ValueError(f"Unknown mode: {mode}")
+    return {"tl.ascend_layout_diagnostics": True,
+            "tl.ascend_enable_ub_ownership": mode in ("ownership", "auto"),
+            "tl.ascend_enable_ub_padding": mode in ("padding", "auto")}
 
 
 def validate(rows, columns, threads, blocks, updates):

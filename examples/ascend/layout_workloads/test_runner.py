@@ -11,11 +11,18 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from catalog import CASES, validate
+from catalog import CASES, mode_configs, validate
 import run_workloads
 
 
 class ReportTests(unittest.TestCase):
+    def test_mode_switch_matrix(self):
+        expected = {"baseline": (False, False), "ownership": (True, False),
+                    "padding": (False, True), "auto": (True, True)}
+        for mode, flags in expected.items():
+            config = mode_configs(mode)
+            self.assertEqual((config["tl.ascend_enable_ub_ownership"], config["tl.ascend_enable_ub_padding"]), flags)
+
     def test_source_provenance(self):
         self.assertEqual(sorted(Counter(c.category for c in CASES.values()).values()), [2, 2, 2])
         root = Path(__file__).resolve().parents[3]
