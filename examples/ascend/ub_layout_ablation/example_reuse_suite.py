@@ -25,7 +25,7 @@ def save_summary(output, records, candidates=()):
     """Persist after every configuration so a later failure loses no timings."""
     output.mkdir(parents=True, exist_ok=True)
     fields = ["case", "columns", "row_stride", "iterations", "blocks", "mode",
-              "status", "padding_applied", "latency_us", "speedup_vs_baseline",
+              "status", "correctness_passed", "padding_applied", "latency_us", "speedup_vs_baseline",
               "padding_scheme", *STORAGE_FIELDS, *FINAL_IR_FIELDS, *COST_FIELDS,
               *(f"unpadded_{key}" for key in COST_FIELDS), "unmodeled_costs", "report_path"]
     with (output / "summary.csv").open("w", newline="") as handle:
@@ -54,12 +54,16 @@ def save_summary(output, records, candidates=()):
             else:
                 values.append(row["status"])
         lines.append("| " + " | ".join(map(str, (*key, *values))) + " |")
-    lines.extend(["", "| case | iterations | mode | padding scheme | extra UB (B) | estimated extra allocation (B) | final IR UB allocation (B) | final IR extra vs baseline (B) | UB latency (cycles) | service (cycles) | instructions | requests | entries | partial |",
-                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"])
+    lines.extend(["", "| case | iterations | mode | correctness | padding scheme | extra UB (B) | estimated extra allocation (B) | final IR UB allocation (B) | final IR extra vs baseline (B) | UB latency (cycles) | service (cycles) | instructions | requests | entries | partial |",
+                  "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"])
     for row in records:
         keys = ("case", "iterations", "mode", "padding_scheme", "ub_extra_storage_bytes", "estimated_ub_extra_allocation_bytes",
                 "final_ir_ub_allocation_bytes", "final_ir_ub_extra_vs_baseline_bytes", *COST_FIELDS)
-        lines.append("| " + " | ".join(str(row.get(key, "")) for key in keys) + " |")
+        verified = row.get("correctness_passed")
+        correctness = "passed" if verified is True else "not_passed" if verified is False else "unknown"
+        values = [str(row.get(key, "")) for key in keys]
+        values.insert(3, correctness)
+        lines.append("| " + " | ".join(values) + " |")
     lines.extend(["", "Estimated allocation values sum per-buffer sizes rounded to 32B without alias reuse; they are not final UB allocation or device measurements.",
                   "Final IR allocation is read after MergeUBAllocations (per-function UB totals, module maximum); it is not a device compiler report or runtime measurement. Unknown baseline deltas are not zero.",
                   "Costs cover modeled SIMT UB traffic per block; DMA, address computation and synchronization are not modeled.",
@@ -116,7 +120,8 @@ def main():
                                 **final_ir_fields(report, reports.get("baseline")),
                                 "report_path": str(directory / f"{mode}.json"),"case": name, "columns": columns, "row_stride": stride,
                                 "iterations": iterations, "blocks": args.blocks, "mode": mode,
-                                "status": status, "padding_applied": report.get("padding_applied", ""),
+                                "status": status, "correctness_passed": report.get("correctness_passed", "unknown"),
+                                "padding_applied": report.get("padding_applied", ""),
                                 "latency_us": latency if latency is not None else "",
                                 "speedup_vs_baseline": baseline / latency if baseline and latency else ""})
             table = save_summary(args.output, records, candidates)

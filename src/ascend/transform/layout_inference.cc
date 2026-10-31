@@ -1823,31 +1823,20 @@ private:
       const LayoutMap &strict_layout_map,
       const std::vector<TileOperator> &native_ops,
       const LayoutMap &native_layouts, const LayoutCostModel &cost_model) {
-    auto analyze =
-        [&](const std::vector<TileOperator> &ops, const LayoutMap &layouts,
-            std::vector<costmodel::simtvf::SimtUbStride> *strides = nullptr) {
-          return costmodel::simtvf::AnalyzeOwnershipEffect(
-              ops, members, thread_bounds_vec_, layouts, ownership_outer_loops_,
-              strides);
-        };
-    std::vector<costmodel::simtvf::SimtUbStride> strides;
-    auto best_effect = analyze(native_ops, native_layouts, &strides);
+    auto analyze = [&](const std::vector<TileOperator> &ops,
+                       const LayoutMap &layouts) {
+      return costmodel::simtvf::AnalyzeOwnershipEffect(
+          ops, members, thread_bounds_vec_, layouts, ownership_outer_loops_);
+    };
+    auto best_effect = analyze(native_ops, native_layouts);
     RecordLayoutDiagnostic("ownership_before", members.front(), native_layouts,
                            best_effect);
     // Unknown costs cannot justify changing the native plan. The model owns
     // latency composition and comparison; this pass owns attempts and adoption.
     if (!best_effect)
       return std::nullopt;
-    // For regular cross-row traffic, keep the native ownership and search
-    // physical padding after all inference components have been solved.
-    for (const auto &stride : strides) {
-      if (stride.buffer->shape.size() < 2)
-        continue;
-      const auto *columns = stride.buffer->shape.back().as<IntImmNode>();
-      if (columns && columns->value > 0 && stride.elements >= columns->value &&
-          stride.elements % columns->value == 0)
-        return std::nullopt;
-    }
+    // A regular cross-row stride does not prohibit legal redistribution.
+    // Evaluate ownership candidates before searching physical padding.
     std::optional<OwnershipSelection> best;
     int max_width = MaxOwnershipWidth(members, native_ops);
     for (int width = 1;; width *= 2) {

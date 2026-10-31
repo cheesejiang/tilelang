@@ -123,6 +123,7 @@ def run_worker(args):
         report["correctness_passed"] = True
         report["status"] = "correctness_passed"
         save()
+        print(f"{args.case}/{args.mode}: correctness passed (rtol=1e-4, atol=1e-5)", flush=True)
         if args.bench:
             samples = [do_bench(lambda: compiled(*inputs), backend="msprof", _n_warmup=10, _n_repeat=30) * 1000
                        for _ in range(args.rounds)]
@@ -158,6 +159,7 @@ def summarize_reports(args, cases, reports_by_case):
                 report.update(final)
                 path.write_text(json.dumps(report, indent=2))
             records.append({**config, **summary_fields(report.get("layout_diagnostics", [])), **final,
+                            "correctness_passed": report.get("correctness_passed", "unknown"),
                             "status": report.get("status", "failed"), "padding_applied": report.get("padding_applied", ""),
                             "latency_us": latency, "speedup_vs_baseline": base_latency / latency if base_latency and latency else "",
                             "report_path": str(path)})

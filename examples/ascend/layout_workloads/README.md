@@ -59,8 +59,9 @@ vecadd 来源本来是 SIMT；其余来源是 SIMD，实现已改写为 SIMT。
 kernel 工厂没有 mode 参数。每份报告记录 `pass_configs`、输入 IR 的结构哈希，
 并保存 `<mode>.input.tir`，可核对四组输入。默认连续组仍是每线程多个逻辑元素。
 
-auto 保持规则驱动：二维规则跨行访问保留基础 ownership，搜索物理 padding；
-其他支持场景评估 ownership，然后评估适用的 padding 候选。
+auto 对通过现有合法性检查的组件先评估 ownership，再按选中的线程布局评估
+适用的 padding 候选。二维规则跨行访问不再直接跳过 ownership 搜索。
+这只是放开候选评估，不保证二维场景一定找到一维表达下的相同布局或实测收益。
 合法候选中优先降低模型成本、同成本优先少占用 UB，没有收益则保留原布局。
 它不穷举四种运行模式，也不保证实测全局最优。padding-only 同样通过 pass 搜索，
 不再强制手工周期；不采用 padding 也是有效结果。
@@ -168,6 +169,7 @@ python examples/ascend/layout_workloads/run_workloads.py --summarize-only --outp
 
 | 指标 | 含义和来源 |
 | --- | --- |
+| correctness | 独立的精度状态：`passed` 表示全部输出已与 CPU reference 比较通过；未采集/未完成时为 `unknown`，不由 measured 状态推断 |
 | padding scheme | 最终布局识别出的周期和 padding 字节数；`none_or_unrecognized` 表示未识别到周期方案，应结合 JSON 核对 |
 | extra UB (B) | 布局物理大小相对原始存储增加的字节数，由布局 pass 计算 |
 | estimated extra allocation (B) | pass 将各 buffer 按 32B 取整后累加，不计别名复用，计算出的分配增量 |
@@ -212,5 +214,8 @@ python -m pytest testing/ascend/transform/test_ascend_layout_workload_modes.py t
 
 先确认精度、最终布局和成本是否真的改变，再比较时延。相同时延或无优化选择
 都是有效结果，不把“预期收益”当成通过条件。
+`--bench` 始终先验证精度，通过后立即打印 `correctness passed`，再计时。
+性能状态变成 `measured` 不会覆盖 JSON/CSV 中独立的 `correctness_passed` 字段。
+已有 JSON 记录该字段时，可用 `--summarize-only` 为 MD 补出精度列，无需重新跑设备。
 主机测试通过不代表新协议的 C++ 开关、DSL 完整编译和设备精度已验证；
 仍需在对应 Ascend 环境运行前述实验。

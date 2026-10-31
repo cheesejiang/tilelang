@@ -49,6 +49,7 @@ class ReportTests(unittest.TestCase):
                 directory.mkdir(exist_ok=True)
                 size = 4192 if mode == "auto" else 4096
                 report = {"status": "measured", "latency_us": 8.0 if mode in ("auto", "ownership") else 10.0,
+                          "correctness_passed": True,
                           "final_ir_ub": {"status": "known", "ub_allocation_bytes": size},
                           "layout_diagnostics": []}
                 (directory / f"{mode}.json").write_text(json.dumps(report))
@@ -63,6 +64,8 @@ class ReportTests(unittest.TestCase):
             self.assertEqual(float(rows["auto"]["speedup_vs_baseline"]), 1.25)
             self.assertEqual(rows["auto"]["final_ir_ub_extra_vs_baseline_bytes"], "96")
             self.assertEqual(rows["baseline"]["iterations"], "1")
+            self.assertEqual(rows["auto"]["correctness_passed"], "True")
+            self.assertIn("| auto | passed |", (Path(folder) / "summary.md").read_text())
 
     def test_failed_mode_does_not_prevent_other_modes(self):
         with tempfile.TemporaryDirectory() as folder:

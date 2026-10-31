@@ -317,3 +317,22 @@ def test_ownership_switch_controls_contiguous_search(enabled):
     records = inferred["main"].attrs["tl.ascend_layout_diagnostics"]
     assert any(str(r["stage"]) == "ownership_before" for r in records) == enabled
     assert not _storage_layouts(inferred)
+
+
+def test_two_dimensional_cross_row_ownership_reaches_candidate_search():
+    a, b = [tirx.decl_buffer((32, 32), "float32", name=name,
+                             scope="shared.dyn", data_alignment=32) for name in "ab"]
+    loop = _parallel((32, 32), lambda c, r: tirx.BufferStore(b, a[r, c], [r, c]))
+    mod = kernel(_vf(loop, 32), buffers=[a, b])
+    with tvm.transform.PassContext(config={"tl.ascend_enable_ub_ownership": True,
+                                          "tl.ascend_enable_ub_padding": False,
+                                          "tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(mod)
+    records = list(inferred["main"].attrs["tl.ascend_layout_diagnostics"])
+    before = [r for r in records if str(r["stage"]) == "ownership_before"]
+    after = [r for r in records if str(r["stage"]) == "ownership_after"]
+    assert before and len(before) == len(after)
+    for initial, selected in zip(before, after):
+        assert int(initial["component"]) == int(selected["component"])
+        assert float(selected["estimated_latency_cycles"]) <= float(initial["estimated_latency_cycles"])
+    assert not _storage_layouts(inferred)
