@@ -1219,10 +1219,10 @@ private:
       // annotated layouts are available during InferLayout.
       // Must happen after visiting body so buffer_data_to_buffers_ is
       // populated.
-      if (pushed_region_scope && op->annotations.count(attr::kLayoutMap)) {
-        auto map = op->annotations.Get(attr::kLayoutMap)
-                       ->as<Map<Var, Layout>>()
-                       .value();
+      if (pushed_region_scope && op->annotations.count(attr::kLayoutMap) &&
+          !LoadResolvedLayoutAnnotation(op->annotations[attr::kLayoutMap])) {
+        auto map =
+            Downcast<Map<Var, Layout>>(op->annotations[attr::kLayoutMap]);
         for (const auto &[var, layout] : map) {
           if (buffer_data_to_buffers_.count(var)) {
             for (const auto &buffer : buffer_data_to_buffers_[var]) {
@@ -1256,9 +1256,12 @@ private:
 
     // After visiting, apply layouts to all collected buffers
     if (op->annotations.count(attr::kLayoutMap)) {
-      // Check if the layout map is Map<Var, Layout>
-      auto map =
-          op->annotations.Get(attr::kLayoutMap)->as<Map<Var, Layout>>().value();
+      // Frontend annotations use data Vars; this pass emits Buffer keys.
+      // Preserve exact per-view layouts on a rerun instead of downcasting
+      // the inferred map to the frontend representation (an empty optional).
+      if (LoadResolvedLayoutAnnotation(op->annotations[attr::kLayoutMap]))
+        return;
+      auto map = Downcast<Map<Var, Layout>>(op->annotations[attr::kLayoutMap]);
       for (const auto &[var, layout] : map) {
         ICHECK(buffer_data_to_buffers_.count(var))
             << "buffer " << var << " is not found in the block";
@@ -1332,6 +1335,31 @@ private:
         }
       }
     }
+  }
+
+  bool LoadResolvedLayoutAnnotation(const ffi::Any &annotation) {
+    auto resolved = annotation.as<LayoutMap>();
+    if (!resolved)
+      return false;
+    for (const auto &[buffer, layout] : *resolved) {
+      ICHECK(buffer_data_to_buffers_.count(buffer->data))
+          << "Inferred layout buffer " << buffer->name
+          << " is not found in the function";
+      ICHECK(ShapesEqual(layout->InputShape(), buffer->shape, &analyzer_))
+          << "Inferred layout shape does not match buffer " << buffer->name;
+      if (IsReducerV2Buffer(buffer)) {
+        ICHECK(layout.as<PartialFragmentNode>())
+            << "Inferred reducer layout must be a PartialFragment";
+      }
+      if (IsSharedBuffer(buffer)) {
+        ICHECK(layout->DetectInjective()->errors.empty())
+            << "Inferred shared layout must be injective: " << buffer->name;
+      }
+      // Do not collapse Buffer keys to data Vars: distinct alias views can
+      // have different shapes and already-resolved per-view layouts.
+      annotated_layout_map_.Set(buffer, layout);
+    }
+    return true;
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {

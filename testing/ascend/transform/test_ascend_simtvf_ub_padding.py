@@ -57,6 +57,15 @@ def _period_rows(layout, rows, columns, element_bytes):
     return period
 
 
+def _expected_period(stride, element_bytes, columns=32):
+    # With fixed 32B holes, a 64B (mod 128B) lane step already spans two
+    # group residues; a 0B (mod 128B) step spans just one. For 32 active lanes,
+    # the longest equally cheap periods are respectively 16 and 8 lane steps.
+    delta = stride * columns * element_bytes
+    assert delta % 128 in (0, 64)
+    return stride * (16 if delta % 128 == 64 else 8)
+
+
 @pytest.mark.parametrize("stride", [1, 2, 16])
 @pytest.mark.parametrize("dtype,element_bytes", [("float16", 2), ("float32", 4), ("int64", 8)])
 def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
@@ -68,7 +77,7 @@ def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
         buffer_bytes = element_bytes if buffer.same_as(a) else 4
         layout = layouts[str(buffer.name)]
         # Fixed 32B holes; choose the longest equally cheap regular period.
-        period = stride * (16 if buffer_bytes == 2 else 8)
+        period = _expected_period(stride, buffer_bytes)
         assert _period_rows(layout, 32 * stride, 32, buffer_bytes) == period
         for row in range(32 * stride):
             for col in (0, 31):
@@ -81,7 +90,7 @@ def test_cross_row_padding_period_and_lowering(stride, dtype, element_bytes):
     for name in ("a", "b"):
         assert len(physical[name].shape) == 1
         buffer_bytes = 4 if name == "b" else element_bytes
-        period = stride * (16 if buffer_bytes == 2 else 8)
+        period = _expected_period(stride, buffer_bytes)
         expected_elements = 32 * stride * 32 + ((32 * stride - 1) // period) * (32 // buffer_bytes)
         assert int(physical[name].shape[0]) == expected_elements
     # The pass must not replace the committed physical layout on a rerun.
