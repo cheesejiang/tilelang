@@ -24,6 +24,12 @@ CASES = {
                    "Keep A+B; use one tile per block, no pipeline/multiversion; same unannotated IR in all modes."),
     "gemm_bias": Case("continuous_ownership", "examples/ascend/deepgemm/kernels/epilogue.py", "add_bias",
                       "FP32 bias epilogue rewritten from SIMD to contiguous SIMT; omit BF16 conversion and GEMM."),
+    "kda_column_store": Case("sparse_column_store", "examples/kda/chunk_intra_token_parallel.py",
+                             "tilelang_chunk_kda_fwd_intra_token_parallel",
+                             "Isolate one fixed-column store epoch: precompute row dot products on CPU, stage the vector from GM, overwrite column 0 only; preserve all other columns."),
+    "kda_reduce_column_store": Case("sparse_column_store", "examples/kda/chunk_intra_token_parallel.py",
+                                    "tilelang_chunk_kda_fwd_intra_token_parallel",
+                                    "Port rowwise Q*K reduction and one fixed-column store epoch to Ascend SIMT; omit exp gates, pipelining and the rest of KDA; reducer may exclude optimization."),
 }
 
 MODES = ("baseline", "ownership", "padding", "auto")

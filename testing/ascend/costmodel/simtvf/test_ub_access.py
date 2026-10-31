@@ -24,6 +24,19 @@ def test_periodic_row_padding(width, row_stride):
     assert after["entries"] < before["entries"]
 
 
+@pytest.mark.parametrize("columns,native_entries,padded_entries", [(32, 32, 8), (34, 2, 2), (40, 8, 8)])
+def test_sparse_column_store_fixed_32b_padding(columns, native_entries, padded_entries):
+    addresses = [r * columns * 4 for r in range(32)]
+    # One selected column: permuting lanes cannot change the native group
+    # concentration. Padding changes the physical addresses themselves.
+    assert analyze(addresses, store=True)["entries"] == native_entries
+    assert analyze(list(reversed(addresses)), store=True)["entries"] == native_entries
+    padded = [address + (r // 8) * 32 for r, address in enumerate(addresses)]
+    result = analyze(padded, store=True)
+    assert result["entries"] == padded_entries
+    assert result["partial"] == 0  # Each lane writes a complete aligned f32.
+
+
 @pytest.mark.parametrize(
     "width,stride,entries,partial,requests",
     [

@@ -24,7 +24,7 @@ class ReportTests(unittest.TestCase):
             self.assertEqual((config["tl.ascend_enable_ub_ownership"], config["tl.ascend_enable_ub_padding"]), flags)
 
     def test_source_provenance(self):
-        self.assertEqual(sorted(Counter(c.category for c in CASES.values()).values()), [2, 2, 2])
+        self.assertEqual(sorted(Counter(c.category for c in CASES.values()).values()), [2, 2, 2, 2])
         root = Path(__file__).resolve().parents[3]
         for case in CASES.values():
             tree = ast.parse((root / case.source).read_text())
@@ -121,7 +121,11 @@ class ReferenceTests(unittest.TestCase):
             for r in range(3):
                 for c in range(4):
                     x = float(a[0, r, c])
-                    if case == "gemm_scale":
+                    if case == "kda_column_store":
+                        expected = stats[0, 0, r] if c == 0 else x
+                    elif case == "kda_reduce_column_store":
+                        expected = sum(float(a[0, r, d]) * float(b[0, 0, r, d]) for d in range(4)) if c == 0 else x
+                    elif case == "gemm_scale":
                         expected = 1.25 * x
                     elif case == "attention_finalize":
                         expected = x / stats[0, -1, r]

@@ -1,6 +1,6 @@
 # 真实计算阶段的四模式布局实验
 
-本目录从已有 kernel 提取六个计算阶段，比较 baseline、ownership、padding、auto。
+本目录从已有 kernel 提取八个计算阶段，比较 baseline、ownership、padding、auto。
 **同一个 case 的四组输入 IR 完全相同，只改变 pass 的两个独立优化开关。**
 baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选择，不通过实测时延搜索。
 复用 `../ub_layout_ablation/` 的诊断转换、最终 UB 分配读取、CSV/Markdown 总表。
@@ -13,9 +13,10 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | [run_workloads.py](run_workloads.py) | 四模式编译、精度验证、计时、采集诊断、保存总表 |
 | [sweep_workloads.py](sweep_workloads.py) | 固定 blocks 扫描 shape、固定 shape 扫描 blocks，生成跨配置总表 |
 | [kernels.py](kernels.py) | 定义 kernel；工厂不接受 mode 参数，避免模式改变输入 IR |
-| [catalog.py](catalog.py) | 六个场景的来源、分类、参数约束和 mode→pass 开关映射 |
+| [catalog.py](catalog.py) | 场景的来源、分类、参数约束和 mode→pass 开关映射 |
 | [reference.py](reference.py) | CPU 参考公式 |
 | [test_runner.py](test_runner.py) | 不依赖 NPU 的参数、来源、汇总流程测试 |
+| [PADDING_CANDIDATES.md](PADDING_CANDIDATES.md) | 真实 kernel 的源码核查、全部准入检查、阻塞因素和支持扩展的可行性 |
 
 ## 来源和边界
 
@@ -27,9 +28,11 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | 跨行、UB 多次使用 | attention_update_finalize | [core.py / accumulate_output、finalize_fp32](../flash_attention/core.py) | KV 累加，再执行 `O/l` |
 | 连续、多元素/线程 | vecadd | [example_vecadd.py / vector_add](../example_vecadd.py) | `C = A + B` |
 | 连续、多元素/线程 | gemm_bias | [epilogue.py / add_bias](../deepgemm/kernels/epilogue.py) | `C[r,c] = A[r,c] + bias[c]` |
+| 稀疏单列写回 | kda_column_store | [KDA / tilelang_chunk_kda_fwd_intra_token_parallel](../../kda/chunk_intra_token_parallel.py) | 只执行 `O[r,0] = reduced[r]`；归约结果预先计算 |
+| 归约后单列写回 | kda_reduce_column_store | [KDA / tilelang_chunk_kda_fwd_intra_token_parallel](../../kda/chunk_intra_token_parallel.py) | kernel 内计算 `sum_d(A[r,d]*B[r,d])`，再写 `O[r,0]` |
 
 **这是源 kernel 的阶段提取实验，不是原始端到端 kernel 的原样测试。**
-vecadd 来源本来是 SIMT；其余来源是 SIMD，实现已改写为 SIMT。
+vecadd 来源本来是 Ascend SIMT；GEMM/attention 来源是 SIMD，KDA 来源是 CUDA，均为阶段移植。
 跨行组用 `(column, row)` 逻辑循环，实际线程分配由基础推导和优化共同决定，
 应查看 `loop_layouts`；不能宣称原始 SIMD kernel 存在同样的 lane 冲突。
 保留源阶段的算术，但移除 Cube GEMM、NZ/BF16 打包、多版本和流水线等外围部分。
@@ -76,7 +79,7 @@ auto 对通过现有合法性检查的组件先评估 ownership，再按选中�
 如果出现未知 `tl.ascend_enable_ub_*` 开关或缺少诊断属性，应先重新构建，
 而不是删除开关来继续测试。建议使用新目录，避免覆盖旧版实验。
 
-先验证单个 case，再验证全部六个 case、四种模式的精度：
+先验证单个 case，再验证全部 case、四种模式的精度：
 
 ```bash
 python examples/ascend/layout_workloads/run_workloads.py --case vecadd --output layout-workload-results-switches
@@ -104,7 +107,7 @@ python examples/ascend/layout_workloads/run_workloads.py --rows 128 --threads 12
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| --case | all | 单个 case 或六个全部运行 |
+| --case | all | 单个 case 或全部运行 |
 | --mode | all | 单个模式或四种全部运行 |
 | --rows / --columns | 32 / 32 | 每 block tile 的 shape |
 | --threads | 32 | SIMT 线程数；32 的倍数，且整除 rows |
@@ -169,7 +172,7 @@ python examples/ascend/layout_workloads/sweep_workloads.py \
   --block-counts 1 8 16 32 64 --bench --output layout-block-scan
 ```
 
-改成 `--case all` 扫描六个 case；指定 `--mode ownership` 等可只跑一种模式，
+改成 `--case all` 扫描全部 case；指定 `--mode ownership` 等可只跑一种模式，
 但没有同配置 baseline 时相对加速比和 UB 增量会是未知。
 不带 `--bench` 也会精度验证、采集布局及模型成本，只是不测时延。
 
@@ -187,7 +190,7 @@ python examples/ascend/layout_workloads/sweep_workloads.py \
 | `--dry-run` | 关闭 | 只打印并保存扫描计划 |
 | `--summarize-only` | 关闭 | 只读取各配置已有 JSON，重建跨配置总表 |
 
-默认两组共 11 个配置，全部六个 case、四模式共 264 次 case/mode 运行。
+默认两组共 11 个配置，全部八个 case、四模式共 352 次 case/mode 运行。
 所有 shape 都在启动前按预算及线程数约束检查；超出限制会报错，不会自动改变
 threads 或跳过形状，以免引入额外变量。
 
@@ -213,8 +216,8 @@ threads 或跳过形状，以免引入额外变量。
 
 比较 block 数时，总数据量同时变化，应结合吞吐量，不能只比较绝对时延。
 同配置四模式加速比才用于评价优化收益；UB 分配和模型成本是每 block 的指标。
-完整矩阵的连续元素可能让 ownership 消除跨行问题；本扫描不会凭空增加稀疏
-“每行仅取第 0 列”的场景，该场景需要单独的 kernel 实验。
+完整矩阵的连续元素可能让 ownership 消除跨行问题；要研究固定列的稀疏访问，
+请选择下述 KDA 单列写回案例，不能把完整矩阵的结论直接套过去。
 
 补生成扫描总表时，使用与原运行相同的扫描列表和固定参数。例如：
 
@@ -228,6 +231,62 @@ python examples/ascend/layout_workloads/sweep_workloads.py \
 `scan_plan.json` 记录原扫描计划；当前入口要求显式传入相同扫描参数，不自动恢复计划。
 
 ## 结果
+
+### KDA 归约后逐列写回
+
+原 KDA kernel 每轮归约产生一个向量，再执行：
+
+```python
+T.copy(Sum_Aqk_fragment, Sum_Aqk_shared[:, j % CS])
+```
+
+该轮只能写这些行的固定列，不能像独立逐元素 kernel 那样，把待写元素任意换成
+同一行的相邻列。因此新增两个不含模式专属注解的对照案例，均只改写列 0，
+并检查其他列保持不变：
+
+| case | 设备上执行 | 输入/参考结果 | 测试目的 |
+| --- | --- | --- | --- |
+| kda_column_store | `work[r,0] = reduced[r]` | CPU 预计算 `reduced=sum(A*B, -1)`，从 GM 搬入连续向量；其他列保留 A | 隔离单列稀疏写回，给现有 padding 搜索一个支持范围内的候选 |
+| kda_reduce_column_store | `T.alloc_reducer`、点积归约、finalize，再写 `work[r,0]` | CPU 独立计算行点积；其他列保留 A | 保留归约→单列写回的数据流，观察真实约束和当前编译器边界 |
+
+这是选取 `j % CS == 0` 的一个 epoch，不是原 KDA 完整循环。
+为复用现有参数，将归约长度 DK 和输出行跨度 CS 都设为 columns；源代码的
+`block_H` 默认往往比这里的 rows 小，不能将本例结果当成源默认配置的加速比。
+去掉了 exp 门控、流水线、其他计算和后续列，A 同时作为已有输出矩阵和点积的
+一个输入。这些简化及 CUDA→Ascend 移植都记录在 case 的 adaptation 中。
+
+**先验证隔离写回案例**，使用四种独立开关，观察是否出现“ownership 不能消除
+目标列冲突，而 padding 能降低 entry”的结果：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py \
+  --case kda_column_store --bench --output kda-column-results
+```
+
+再验证归约和写回在同一个 kernel 中的版本：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py \
+  --case kda_reduce_column_store --bench --output kda-reduce-column-results
+```
+
+当前 ownership/padding 快路径会保守排除含 reducer 的关联组件，完整版本可能
+四种模式布局相同、模型指标为 `unknown`。这是当前分析能力的边界，不能解释为
+padding 在硬件上无效；本次不放宽 reducer 合法性规则，不绕过同步或完整编译。
+隔离版本也不保证有整体时延收益：它包含整个矩阵的 DMA 搬入/搬出，而只改一列。
+是否有收益要结合精度、实际布局、entry 和整体时延一起判断。
+
+可直接复用扫描入口，先比较固定列访问的行跨度：
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep shapes --case kda_column_store --shapes 32x32 32x34 32x40 128x32 \
+  --blocks 32 --threads 32 --bench --output kda-column-shape-scan
+```
+
+对于一个 32 活跃 lane、各写独立 f32 的请求，模型预计：32 列时原始写入 32 entry，
+每 8 行加 32B 后为 8 entry；34 列原本已是 2 entry，未必值得 padding。
+这是单请求几何预期，不等于整个 kernel 的成本，也不保证 pass 最终采用该周期。
 
 每个 case/mode 单独启动进程，编译/设备故障不会污染其余模式的上下文。
 失败继续收集其他模式，最终返回非零；失败原因写在对应 JSON。
@@ -316,6 +375,12 @@ python -m unittest discover -s examples/ascend/layout_workloads -p 'test_*.py' -
 ```bash
 python -m pytest testing/ascend/transform/test_ascend_layout_workload_modes.py testing/ascend/transform/test_ascend_simtvf_ub_padding.py -q
 ```
+
+修改 C++ 后需要先重新构建。padding 现在使用独立准入检查：固定已解出的线程和
+fragment 布局，支持静态部分列 copy，并最多枚举 1024 次外层调用的实际地址。
+reducer 可留在同一组件，但它直接访问的 UB 仍不能被 padding；不触及候选 UB 的
+归约成本作为共同项排除。`padding_*` 诊断的 `cost_scope` 会明确标注这一范围，
+不能把它当作包含归约的整核成本。详细边界见 [PADDING_CANDIDATES.md](PADDING_CANDIDATES.md)。
 
 先确认精度、最终布局和成本是否真的改变，再比较时延。相同时延或无优化选择
 都是有效结果，不把“预期收益”当成通过条件。

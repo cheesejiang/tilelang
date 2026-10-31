@@ -638,8 +638,14 @@ public:
     }
     record.Set("buffers", buffers);
     record.Set("cost_scope",
-               String(component == -1 ? "function_simt_ub_only"
-                                      : "component_simt_ub_only"));
+               String(std::string(stage).rfind("padding_", 0) == 0
+                          ? "padding_scored_ops_only_invariant_ops_excluded"
+                      : component == -1 ? "function_simt_ub_only"
+                                        : "component_simt_ub_only"));
+    if (std::string(stage).rfind("padding_", 0) == 0) {
+      record.Set("invariant_ops_cost", String("excluded_common_term_not_zero"));
+      record.Set("outer_phase_limit", Integer(1024));
+    }
     record.Set("cost_known",
                Integer(effect && effect->ub_access.estimated_latency ? 1 : 0));
     if (effect) {
@@ -2032,7 +2038,7 @@ private:
                  << " regs=" << best_cost.regs;
     }
     if (enable_ub_padding)
-      TryImproveUbPadding(layout_map, ownership_eligible);
+      TryImproveUbPadding(layout_map);
   }
 
   // Use the same SIMT UB budget as AutoSchedule (248 KiB less 32 KiB
@@ -2081,10 +2087,113 @@ private:
     return total;
   }
 
-  void TryImproveUbPadding(LayoutMap &layouts,
-                           const std::unordered_set<int> &eligible) {
-    // Score the whole shared-storage/fragment component, not just the loop
-    // that supplied a stride hint. Do not change the solved ownership here.
+  // Physical padding never reruns inference or changes the solved fragment,
+  // reducer or loop ownership. Unsupported operators may remain in a component
+  // only when they provably do not touch the storage being padded.
+  bool IsPaddingScoredOp(int member) const {
+    const auto *loop = infer_list_[member].as<ParallelOpNode>();
+    if (const auto *copy = infer_list_[member].as<CopyNode>()) {
+      if (!ownership_simt_copies_.count(member))
+        return false;
+      loop = copy->par_op_.get();
+    }
+    return loop && !loop->HasReducerUpdates() &&
+           loop->GetLoopLayout().defined();
+  }
+
+  bool PaddingOpTouches(int member, const Buffer &buffer) const {
+    bool touches = false;
+    PostOrderVisit(infer_list_stmt_[member], [&](const ObjectRef &node) {
+      if (const auto *load = node.as<BufferLoadNode>())
+        touches |= load->buffer->data.same_as(buffer->data);
+      if (const auto *store = node.as<BufferStoreNode>())
+        touches |= store->buffer->data.same_as(buffer->data);
+      if (const auto *var = node.as<VarNode>())
+        touches |= var == buffer->data.get();
+    });
+    return touches;
+  }
+
+  bool CanChangeUbPadding(const std::vector<int> &members) {
+    for (int member : members) {
+      if (ownership_excluded_ops_.count(member))
+        return false;
+      const auto *copy = infer_list_[member].as<CopyNode>();
+      if (copy && !ownership_simt_copies_.count(member)) {
+        // Preserve all existing DMA direction, argument and escape checks.
+        if (!CanChangeUbOwnership({member}, false))
+          return false;
+        continue;
+      }
+      if (!IsPaddingScoredOp(member))
+        continue; // Candidate-specific storage isolation is checked below.
+      const auto *loop = infer_list_[member].as<ParallelOpNode>();
+      if (copy) {
+        loop = copy->par_op_.get();
+        if (!copy->annotations.empty() || copy->dst_block.defined() ||
+            copy->src->dtype != copy->dst->dtype ||
+            (!IsFragmentBuffer(copy->src) && !IsFragmentBuffer(copy->dst)))
+          return false;
+        // Unlike ownership, preserve the already inferred partial-copy plan.
+        // Constant extents and uniform offsets are required; actual offsets
+        // are evaluated over every enclosing serial phase by the cost model.
+        for (const auto &ranges : {copy->src_range, copy->dst_range})
+          for (const auto &range : ranges) {
+            const auto *size = range->extent.as<IntImmNode>();
+            if (!size || size->value <= 0 ||
+                !IsOwnershipUniformExpr(range->min,
+                                        ownership_outer_loops_[member]))
+              return false;
+          }
+      } else if (!simt_loops_.count(loop->GetRoot().get())) {
+        return false;
+      }
+      const auto *threads = thread_bounds_vec_[member]->extent.as<IntImmNode>();
+      if (!threads || threads->value <= 0)
+        return false;
+      for (const auto &var : loop->GetLoopVars()) {
+        const auto *size = var->dom->extent.as<IntImmNode>();
+        if (!size || size->value <= 0 || !is_zero(var->dom->min))
+          return false;
+      }
+      bool legal = true;
+      auto access = [&](const Buffer &buffer, const Array<PrimExpr> &indices) {
+        if (buffer->dtype.lanes() != 1 || buffer->dtype.bits() < 8 ||
+            indices.size() != buffer->shape.size())
+          legal = false;
+        // Fragment layouts are immutable here, including user annotations.
+        if (!IsFragmentBuffer(buffer) && !CanChangeBufferOwnership(buffer))
+          legal = false;
+        for (const auto &index : indices)
+          PostOrderVisit(index, [&](const ObjectRef &node) {
+            if (node.as<BufferLoadNode>() || node.as<CallNode>())
+              legal = false;
+          });
+      };
+      PostOrderVisit(loop->GetRoot(), [&](const ObjectRef &node) {
+        if (const auto *load = node.as<BufferLoadNode>())
+          access(load->buffer, load->indices);
+        if (const auto *store = node.as<BufferStoreNode>())
+          access(store->buffer, store->indices);
+        if (node.as<CallNode>())
+          legal = false;
+        if (node.as<StmtNode>() && !node.as<ForNode>() &&
+            !node.as<BufferStoreNode>() && !node.as<SeqStmtNode>())
+          legal = false;
+        if (const auto *nested = node.as<ForNode>();
+            nested && nested->kind != ForKind::kParallel)
+          legal = false;
+      });
+      if (!legal)
+        return false;
+    }
+    return true;
+  }
+
+  void TryImproveUbPadding(LayoutMap &layouts) {
+    // Cover the whole storage/fragment component. Score supported SIMT users;
+    // candidate-specific isolation proves that omitted operators are unchanged.
+    // Do not change the solved ownership here.
     UnionFind<int> uf;
     std::unordered_map<const VarNode *, int> first_user;
     for (int i = 0; i < infer_list_.size(); ++i) {
@@ -2095,6 +2204,8 @@ private:
           data = load->buffer->data.get();
         if (const auto *store = node.as<BufferStoreNode>())
           data = store->buffer->data.get();
+        if (const auto *var = node.as<VarNode>(); var && var->dtype.is_handle())
+          data = var;
         if (data) {
           auto [it, inserted] = first_user.emplace(data, i);
           if (!inserted)
@@ -2106,28 +2217,18 @@ private:
     for (int i = 0; i < infer_list_.size(); ++i)
       components[uf.Find(i)].push_back(i);
     for (const auto &[root, members] : components) {
-      // Eligible full-tile SIMT copies lower through ParallelOp and the same
-      // physical load/store remapping as compute. Require their solved loop
-      // so the cost model includes the copy's UB traffic. DMA is admitted here
-      // but every candidate must satisfy the shared physical descriptor check.
-      if (std::any_of(members.begin(), members.end(), [&](int member) {
-            if (!eligible.count(member))
-              return true;
-            if (infer_list_[member].as<ParallelOpNode>())
-              return false;
-            const auto *copy = infer_list_[member].as<CopyNode>();
-            if (!copy)
-              return true;
-            if (!ownership_simt_copies_.count(member))
-              return false; // CanChangeUbOwnership already checked GM<->UB.
-            return !copy->par_op_.defined() ||
-                   !copy->par_op_->GetLoopLayout().defined();
-          }))
+      if (!CanChangeUbPadding(members))
+        continue;
+      std::vector<int> scored;
+      for (int member : members)
+        if (IsPaddingScoredOp(member))
+          scored.push_back(member);
+      if (scored.empty())
         continue;
       std::vector<costmodel::simtvf::SimtUbStride> strides;
       auto best = costmodel::simtvf::AnalyzeOwnershipEffect(
-          infer_list_, members, thread_bounds_vec_, layouts,
-          ownership_outer_loops_, &strides);
+          infer_list_, scored, thread_bounds_vec_, layouts,
+          ownership_outer_loops_, &strides, true);
       RecordLayoutDiagnostic("padding_before", root, layouts, best);
       if (!best)
         continue;
@@ -2135,6 +2236,19 @@ private:
       std::vector<std::pair<const BufferNode *, int64_t>> tried;
       for (const auto &stride : strides) {
         const Buffer &buffer = stride.buffer;
+        // Omitted reduction/initialization/opaque operations are a common,
+        // unchanged term, not a zero-cost estimate. Never pad their storage:
+        // their UB/scratch lowering is not modeled by this comparison.
+        bool invariant = true;
+        for (int member : members) {
+          if (IsPaddingScoredOp(member) ||
+              (infer_list_[member].as<CopyNode>() &&
+               !ownership_simt_copies_.count(member)))
+            continue;
+          invariant &= !PaddingOpTouches(member, buffer);
+        }
+        if (!invariant)
+          continue;
         // Enumerate up to one warp of padding phases. Periods are multiples
         // of the observed row step, including 8*s and 16*s. Score actual
         // addresses: starting offsets and other users need not share a phase.
@@ -2217,8 +2331,8 @@ private:
             continue;
           }
           auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
-              infer_list_, members, thread_bounds_vec_, trial,
-              ownership_outer_loops_);
+              infer_list_, scored, thread_bounds_vec_, trial,
+              ownership_outer_loops_, nullptr, true);
           // Compare unrounded storage on ties: allocator rounding can hide
           // the savings of a longer period. Native storage wins equal costs.
           bool smaller = *PaddingFootprint(trial, false) <
@@ -2304,7 +2418,8 @@ private:
    * remain with the existing scheduler and do not change this legality rule.
    * At least one SIMT access must touch UB for the component to be scored.
    */
-  bool CanChangeUbOwnership(const std::vector<int> &members) {
+  bool CanChangeUbOwnership(const std::vector<int> &members,
+                            bool require_simt_ub = true) {
     arith::Analyzer analyzer;
     bool has_ub = false;
     for (int member : members) {
@@ -2476,7 +2591,7 @@ private:
           return false;
       }
     }
-    return has_ub;
+    return has_ub || !require_simt_ub;
   }
 };
 

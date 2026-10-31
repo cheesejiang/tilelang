@@ -6,7 +6,7 @@ from tilelang import tvm
 from tilelang.ascend import transform
 from tvm import tirx
 
-from testing.ascend._ir import copy, kernel, nodes, seq
+from testing.ascend._ir import copy, kernel, nodes, region, seq
 from testing.ascend.transform.test_ascend_simtvf_ub_ownership import _executed_store_indices, _infer, _parallel, _vf
 
 
@@ -198,22 +198,107 @@ def test_padding_through_full_tile_simt_copy(direction, stride):
         assert sorted(_executed_store_indices(lowered, "a")) == expected
 
 
-@pytest.mark.parametrize("kind", ["partial", "annotation", "escape"])
+@pytest.mark.parametrize("kind", ["annotation", "escape"])
 def test_unsupported_simt_copy_retains_unpadded_storage(kind):
     mod, a, b = _program()
     fragment = tirx.decl_buffer(a.shape, "float32", name="fragment", scope="local.fragment")
     kwargs = {}
-    if kind == "partial":
-        kwargs = {"src_shape": [16, 32], "dst_shape": [16, 32]}
-    elif kind == "annotation":
+    if kind == "annotation":
         kwargs = {"annotations": {"coalesced_width": tirx.IntImm("int32", 1)}}
     stmts = [copy(a, fragment, **kwargs), nodes(mod, tirx.For)[0]]
     if kind == "escape":
-        stmts.append(tirx.Evaluate(tirx.call_extern("int32", "consume", fragment.data)))
+        stmts.append(tirx.Evaluate(tirx.call_extern("int32", "consume", a.data)))
     inferred = _infer(kernel(_vf(seq(*stmts), 32), buffers=[a, b, fragment]))
     layouts = _storage_layouts(inferred)
     assert "a" not in layouts
     assert "b" not in layouts
+
+
+def _column_copy_program(iterations=32):
+    work = tirx.decl_buffer((32, 32), "float32", name="work", scope="shared.dyn")
+    values = tirx.decl_buffer((32, 1), "float32", name="values", scope="local.fragment")
+    k = tirx.Var("column", "int32")
+    transfer = copy(values, work, dst_indices=[0, k % 32], dst_shape=[32, 1])
+    body = _vf(tirx.For(k, 0, iterations, tirx.ForKind.SERIAL, transfer), 32)
+    # This is the immutable placement supplied by a preceding collective:
+    # one result per lane, not a freely repartitionable whole matrix.
+    placement = tilelang.layout.Fragment(
+        (32, 1), forward_thread_fn=lambda r, c: r, forward_index_fn=lambda r, c: 0
+    )
+    return kernel(body, buffers=[work, values], annotations={"layout_map": {values.data: placement}})
+
+
+def test_partial_column_copy_padding_preserves_fragment_and_all_phases():
+    program = _column_copy_program()
+    with tvm.transform.PassContext(config={"tl.ascend_enable_ub_padding": False}):
+        native = _infer(program)
+    with tvm.transform.PassContext(config={"tl.ascend_layout_diagnostics": True}):
+        inferred = _infer(program)
+    layouts = _storage_layouts(inferred)
+    assert "work" not in _storage_layouts(native)
+    period = _period_rows(layouts["work"], 32, 32, 4)
+    assert period == 8
+    after = [record for record in inferred["main"].attrs["tl.ascend_layout_diagnostics"]
+             if str(record["stage"]) == "padding_after"]
+    assert len(after) == 1
+    assert int(after[0]["requests"]) == 32
+    assert int(after[0]["entries"]) == 32 * 8
+    assert str(after[0]["cost_scope"]) == "padding_scored_ops_only_invariant_ops_excluded"
+    tvm.ir.assert_structural_equal(layouts["values"], _storage_layouts(native)["values"])
+    with inferred["main"].attrs["target"]:
+        lowered = transform.AscendLowerTileOp()(inferred)
+    expected = [(r * 32 + c + (r // period) * 8,) for r in range(32) for c in range(32)]
+    assert sorted(_executed_store_indices(lowered, "work")) == expected
+
+
+def test_partial_copy_phase_budget_retains_native_storage():
+    # The scorer must not extrapolate column-zero cost when it cannot cover
+    # every invocation within its bounded phase enumeration budget.
+    assert "work" not in _storage_layouts(_infer(_column_copy_program(1025)))
+
+
+@pytest.mark.parametrize("reduce_from_output", [False, True])
+def test_reducer_component_padding_only_changes_isolated_output(reduce_from_output):
+    source = tirx.decl_buffer((32, 32), "float32", name="source", scope="shared.dyn")
+    work = tirx.decl_buffer((32, 32), "float32", name="work", scope="shared.dyn")
+    acc = tirx.decl_buffer((32, 1), "float32", name="acc", scope="local.reducer")
+    values = tirx.decl_buffer((32, 1), "float32", name="values", scope="local.fragment")
+
+    def tileop(name, *args):
+        return tirx.Evaluate(tirx.Call("handle", tvm.ir.Op.get(name), list(args)))
+
+    operand = work if reduce_from_output else source
+    update = _parallel(
+        (32, 32),
+        lambda r, c: tileop("tl.reducer_update", acc[r, 0], operand[r, c]),
+    )
+    body = _vf(seq(
+        tileop("tl.tileop.reducer_init", region(acc, 2)),
+        update,
+        tileop("tl.tileop.finalize_reducer_v2", region(acc, 3), region(values, 2)),
+        copy(values, work, dst_shape=[32, 1]),
+    ), 32)
+    placement = tilelang.layout.Fragment(
+        (32, 1), forward_thread_fn=lambda r, c: r, forward_index_fn=lambda r, c: 0
+    )
+    program = kernel(body, buffers=[source, work, acc, values], annotations={
+        "reducer_info_v2": {acc.data: {"op": "sum"}},
+        "layout_map": {values.data: placement},
+    })
+    with tvm.transform.PassContext(config={"tl.ascend_enable_ub_padding": False}):
+        native = _infer(program)
+    inferred = _infer(program)
+    native_layouts, layouts = _storage_layouts(native), _storage_layouts(inferred)
+    assert "work" not in native_layouts
+    assert ("work" in layouts) == (not reduce_from_output)
+    assert "source" not in layouts
+    tvm.ir.assert_structural_equal(layouts["values"], native_layouts["values"])
+    # The reducer update's ownership must remain exactly the native plan.
+    def loop_layouts(mod):
+        return [n.annotations["parallel_loop_layout"] for n in nodes(mod, tirx.For)
+                if "parallel_loop_layout" in n.annotations]
+    for before, after in zip(loop_layouts(native), loop_layouts(inferred), strict=True):
+        tvm.ir.assert_structural_equal(before, after)
 
 
 @pytest.mark.parametrize("stride", [1, 2, 16])

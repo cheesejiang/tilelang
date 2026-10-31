@@ -56,11 +56,16 @@ struct SimtUbStride {
 // over their enclosing loop domains, indexed by operator like thread_bounds.
 // The caller checks uniform execution and loop/copy legality. DMA boundaries
 // are not part of the SIMT cost component; pipeline overlap is not modeled.
+// Padding callers may enumerate_outer_indices: varying serial indices are
+// substituted for every invocation (at most 1024), with a separate pipeline
+// drain per invocation. Unresolved or larger domains return unknown. The
+// default preserves ownership's invariant-access contract and scoring.
 std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     const std::vector<TileOperator> &operators, const std::vector<int> &members,
     const std::vector<Range> &thread_bounds, const LayoutMap &layouts,
     const std::vector<std::vector<tirx::For>> &outer_loops,
-    std::vector<SimtUbStride> *strides = nullptr);
+    std::vector<SimtUbStride> *strides = nullptr,
+    bool enumerate_outer_indices = false);
 
 // Compare estimated latency only. Missing estimates and ties retain the
 // current candidate. Request geometry is handled by the UB model.

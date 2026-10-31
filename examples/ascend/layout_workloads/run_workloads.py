@@ -1,4 +1,4 @@
-"""Six source-backed stage extracts with four-mode layout diagnostics."""
+"""Source-backed stage extracts with four-mode layout diagnostics."""
 
 import argparse
 from dataclasses import asdict
@@ -59,6 +59,13 @@ def run_worker(args):
         stats = torch.rand(args.blocks, tiles + 1, args.rows)
         stats[:, :-1, :] = stats[:, :-1, :] * 0.4 + 0.5
         stats[:, -1, :] = stats[:, -1, :] + 1
+        if args.case == "kda_column_store":
+            # Isolate the writeback: only the contiguous row-result vector is
+            # transferred in this stage. No reduction work is timed here.
+            stats[:, 0, :] = (a * b[:, 0]).sum(-1)
+            report["reduction_in_timed_kernel"] = False
+        elif args.case == "kda_reduce_column_store":
+            report["reduction_in_timed_kernel"] = True
         expected = reference(args.case, a, b, stats)
         inputs = [x.to("npu") for x in (a, b, stats)]
         snapshots = {}

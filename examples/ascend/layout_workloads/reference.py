@@ -2,6 +2,10 @@
 
 
 def reference(case, a, incoming, stats):
+    if case in ("kda_column_store", "kda_reduce_column_store"):
+        result = a * 1.0
+        result[:, :, 0] = stats[:, 0, :] if case == "kda_column_store" else (a * incoming[:, 0]).sum(-1)
+        return result
     if case == "gemm_scale":
         return a * 1.25
     if case == "attention_finalize":

@@ -78,7 +78,8 @@ public:
   // not reconstruct the ownership mapping independently or commit this IR.
   std::optional<std::vector<SimtUbAccess>>
   Collect(const ParallelOpNode *op, const Range &threads,
-          const LayoutMap &layouts, std::vector<SimtUbStride> *strides) {
+          const LayoutMap &layouts, std::vector<SimtUbStride> *strides,
+          const Map<Var, PrimExpr> &bindings = {}) {
     layouts_ = layouts;
     strides_ = strides;
     Var tx("ub_access_thread");
@@ -93,6 +94,7 @@ public:
     Stmt lowered = LowerParallelLoop(
         op->GetRoot(), op->GetLoopLayout(), tx, &analyzer_, layouts,
         op->GetPredicate(tx), true, op->LoopLayoutRequiresPaddingGuard());
+    lowered = Substitute(lowered, bindings);
     // Warp index is an ordinary serial coordinate for period compression.
     Var warp("ub_access_warp");
     warp_ = warp;
@@ -418,7 +420,7 @@ std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     const std::vector<TileOperator> &operators, const std::vector<int> &members,
     const std::vector<Range> &thread_bounds, const LayoutMap &layouts,
     const std::vector<std::vector<For>> &outer_loops,
-    std::vector<SimtUbStride> *strides) {
+    std::vector<SimtUbStride> *strides, bool enumerate_outer_indices) {
   OwnershipEffect total;
   total.ub_access.estimated_latency = 0;
   total.ub_access.service_cycles = 0;
@@ -453,34 +455,83 @@ std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     if (!extent || extent->value <= 0 ||
         extent->value > std::numeric_limits<int>::max())
       return std::nullopt;
-    auto accesses = SimtUbAccessCollector().Collect(loop, thread_bounds[member],
-                                                    layouts, strides);
-    if (!accesses)
-      return std::nullopt;
-    for (const auto &access : *accesses) {
-      auto cost =
-          EstimateSimtUbAccessLatency(access.instructions, access.store);
-      if (!cost || !cost->estimated_latency || !cost->service_cycles)
+    // Padding keeps ownership fixed, but a partial copy may select a different
+    // column on each serial invocation. Price each actual phase; never multiply
+    // the cost at column zero by the invocation count. Bound compile-time work
+    // and retain native storage when the complete domain cannot be enumerated.
+    bool varying = false;
+    if (enumerate_outer_indices)
+      PostOrderVisit(loop->GetRoot(), [&](const ObjectRef &node) {
+        if (const auto *var = node.as<VarNode>())
+          for (const auto &outer : outer_loops[member])
+            varying |= outer->loop_var.get() == var;
+      });
+    std::vector<Map<Var, PrimExpr>> phases;
+    if (varying) {
+      constexpr int64_t kMaxPaddingPhases = 1024;
+      if (*invocations > kMaxPaddingPhases)
         return std::nullopt;
-      total.ub_access.estimated_latency = AddCycles(
-          total.ub_access.estimated_latency,
-          EstimateInstructionCycles({cost->estimated_latency}, *invocations));
-      total.ub_access.service_cycles = AddCycles(
-          total.ub_access.service_cycles,
-          EstimateInstructionCycles({cost->service_cycles}, *invocations));
-      if (!total.ub_access.estimated_latency || !total.ub_access.service_cycles)
-        return std::nullopt;
-      auto accumulate = [&](int64_t &sum, int64_t count) {
-        if (count > (std::numeric_limits<int64_t>::max() - sum) / *invocations)
+      arith::Analyzer analyzer;
+      Map<Var, PrimExpr> bindings;
+      std::function<bool(size_t)> enumerate = [&](size_t depth) {
+        if (depth == outer_loops[member].size()) {
+          phases.push_back(bindings);
+          return true;
+        }
+        const auto &outer = outer_loops[member][depth];
+        auto min = analyzer.Simplify(Substitute(outer->min, bindings));
+        auto extent = analyzer.Simplify(Substitute(outer->extent, bindings));
+        const auto *start = min.as<IntImmNode>();
+        const auto *size = extent.as<IntImmNode>();
+        if (!start || !size || size->value < 0 ||
+            size->value > kMaxPaddingPhases)
           return false;
-        sum += count * *invocations;
+        for (int64_t i = 0; i < size->value; ++i) {
+          bindings.Set(outer->loop_var, Integer(start->value + i));
+          if (!enumerate(depth + 1))
+            return false;
+        }
+        bindings.erase(outer->loop_var);
         return true;
       };
-      if (!accumulate(total.ub_access.instructions, cost->instructions) ||
-          !accumulate(total.ub_access.requests, cost->requests) ||
-          !accumulate(total.ub_access.entries, cost->entries) ||
-          !accumulate(total.ub_access.partial, cost->partial))
+      if (!enumerate(0) || phases.size() != static_cast<size_t>(*invocations))
         return std::nullopt;
+      invocations = 1;
+    } else {
+      phases.emplace_back();
+    }
+    for (const auto &bindings : phases) {
+      auto accesses = SimtUbAccessCollector().Collect(
+          loop, thread_bounds[member], layouts, strides, bindings);
+      if (!accesses)
+        return std::nullopt;
+      for (const auto &access : *accesses) {
+        auto cost =
+            EstimateSimtUbAccessLatency(access.instructions, access.store);
+        if (!cost || !cost->estimated_latency || !cost->service_cycles)
+          return std::nullopt;
+        total.ub_access.estimated_latency = AddCycles(
+            total.ub_access.estimated_latency,
+            EstimateInstructionCycles({cost->estimated_latency}, *invocations));
+        total.ub_access.service_cycles = AddCycles(
+            total.ub_access.service_cycles,
+            EstimateInstructionCycles({cost->service_cycles}, *invocations));
+        if (!total.ub_access.estimated_latency ||
+            !total.ub_access.service_cycles)
+          return std::nullopt;
+        auto accumulate = [&](int64_t &sum, int64_t count) {
+          if (count >
+              (std::numeric_limits<int64_t>::max() - sum) / *invocations)
+            return false;
+          sum += count * *invocations;
+          return true;
+        };
+        if (!accumulate(total.ub_access.instructions, cost->instructions) ||
+            !accumulate(total.ub_access.requests, cost->requests) ||
+            !accumulate(total.ub_access.entries, cost->entries) ||
+            !accumulate(total.ub_access.partial, cost->partial))
+          return std::nullopt;
+      }
     }
   }
   return total;
