@@ -1,6 +1,6 @@
 # 真实计算阶段的四模式布局实验
 
-本目录从已有 kernel 提取八个计算阶段，比较 baseline、ownership、padding、auto。
+本目录从已有 kernel 提取九个计算阶段，比较 baseline、ownership、padding、auto。
 **同一个 case 的四组输入 IR 完全相同，只改变 pass 的两个独立优化开关。**
 baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选择，不通过实测时延搜索。
 复用 `../ub_layout_ablation/` 的诊断转换、最终 UB 分配读取、CSV/Markdown 总表。
@@ -15,6 +15,7 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | [kernels.py](kernels.py) | 定义 kernel；工厂不接受 mode 参数，避免模式改变输入 IR |
 | [catalog.py](catalog.py) | 场景的来源、分类、参数约束和 mode→pass 开关映射 |
 | [reference.py](reference.py) | CPU 参考公式 |
+| [column_store_audit.py](column_store_audit.py) | 检查 lowering 后列写回的实际活跃 lane、地址和 group 分布 |
 | [test_runner.py](test_runner.py) | 不依赖 NPU 的参数、来源、汇总流程测试 |
 | [PADDING_CANDIDATES.md](PADDING_CANDIDATES.md) | 真实 kernel 的源码核查、全部准入检查、阻塞因素和支持扩展的可行性 |
 
@@ -30,6 +31,71 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | 连续、多元素/线程 | gemm_bias | [epilogue.py / add_bias](../deepgemm/kernels/epilogue.py) | `C[r,c] = A[r,c] + bias[c]` |
 | 稀疏单列写回 | kda_column_store | [KDA / tilelang_chunk_kda_fwd_intra_token_parallel](../../kda/chunk_intra_token_parallel.py) | 只执行 `O[r,0] = reduced[r]`；归约结果预先计算 |
 | 归约后单列写回 | kda_reduce_column_store | [KDA / tilelang_chunk_kda_fwd_intra_token_parallel](../../kda/chunk_intra_token_parallel.py) | kernel 内计算 `sum_d(A[r,d]*B[r,d])`，再写 `O[r,0]` |
+| 归约后逐列写回 | flash_decode_column_store | [Flash Decoding / flashattn](../../flash_decoding/example_gqa_decode_varlen_logits.py) | 每轮读取不同 logits，计算 `max_n(logits[k,h,n])` 并写 `S[h,k]` |
+
+## Flash Decoding 列写回验证
+
+这是 `reduce_max → scores_max fragment → S_shared[:,k]` 的 Ascend SIMT 阶段移植。
+输入 logits 在 CPU 随机生成、经 GM 搬入；省略 QK/PV GEMM、在线 softmax 更新、
+后续归一化、FP16 转换、动态长度和流水线。归约输入 UB `logits` 与结果 UB
+`scores_out` 独立，结果矩阵每一列都写入并验证，不依赖未初始化值。
+
+```python
+for k in T.serial(columns):
+    T.copy(B[block, k, :, :], logits)
+    with T.SimtVF(threads=threads):
+        maxima = T.alloc_reducer((rows,), "float32", op="max")
+        T.reducer_init(maxima)
+        for h, n in T.Parallel(rows, 32):
+            T.reducer_update(maxima[h], logits[h, n])
+        result = T.alloc_fragment((rows,), "float32")
+        T.finalize_reducer(maxima, result)
+        T.copy(result, scores_out[:, k])
+T.copy(scores_out, C[block, :, :])
+```
+
+- `--rows`：每个 block 处理的 head 数；仍须满足本框架 rows 整除 threads 的限制。
+- `--columns`：不同 KV 输出 tile 的数量，同时是结果矩阵列数、外层循环次数。
+- 每个 tile 每个 head 固定有 **32 个 logits**，独立于 `--columns`。
+- `--updates`：这个 case 不使用；表里的 iterations 等于 columns。
+- 输入 B 为 `[blocks, columns, rows, 32]`，输出 C 为 `[blocks, rows, columns]`。
+  通用接口的 A、Stats 未参与计算；CPU 参考为 `B.amax(-1).swapaxes(1,2)`。
+- 不固定 fragment、不指定 loop layout、不显式 padding。四模式输入 IR 相同，
+  各模式实际结果放置由原生推导决定，不强制选择 padding。
+
+本次补充了只读诊断，需要重新构建 C++ 库。先跑四模式精度与诊断：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py \
+  --case flash_decode_column_store --rows 32 --columns 32 --threads 32 \
+  --blocks 32 --output flash-column-results
+```
+
+精度通过后计时；可以将 rows 改为 64，观察不同 head 数下的线程放置：
+
+```bash
+python examples/ascend/layout_workloads/run_workloads.py \
+  --case flash_decode_column_store --rows 64 --columns 32 --threads 32 \
+  --blocks 32 --bench --output flash-column-r64-results
+```
+
+查看输出目录的 `summary.md`、`summary.csv`、`candidates.csv`。每模式 JSON 的
+`column_store_audit` 保存 lowering 后的活跃 lane 和地址样本，同时保存 `.lowered.tir`。
+MD 的 `Lowered column-store audit` 表给出活跃 lane 范围、同 group 不同行的最大数、
+存在这类冲突的 batch 数。只检查标量 TIR store，不声称它就是设备最终 ISA；
+遇到未解析 predicate、向量化或分析预算上限时显示 unknown，不据此宣称存在冲突。
+
+**先看 baseline 的实际活跃 lane。** 如果每个 warp store batch 只有一个 lane，
+就没有本实验假设的多 lane 列冲突。即使多 lane 有冲突，模型 entry 改善也不保证
+整核时延下降：当前例子每轮仍包含 DMA 和归约。
+
+含归约时，完整函数的 UB 成本可能仍为 unknown。诊断额外记录
+`padding_scored_final` / `padding_scored_unpadded`，供四模式比较同一类可评分操作。
+若总表采用这些局部指标，会在 **model cost scope** 表 / CSV 的 `cost_scope`
+中标注 `padding_scored_ops_only_invariant_ops_excluded`。它不包含归约成本，
+不能当作整核耗时，排除项也不是零成本。完整原始诊断仍保留在 JSON。
+
+## 通用实验边界
 
 **这是源 kernel 的阶段提取实验，不是原始端到端 kernel 的原样测试。**
 vecadd 来源本来是 Ascend SIMT；GEMM/attention 来源是 SIMD，KDA 来源是 CUDA，均为阶段移植。

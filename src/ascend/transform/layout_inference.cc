@@ -855,6 +855,25 @@ public:
                              costmodel::simtvf::AnalyzeOwnershipEffect(
                                  infer_list_, all, thread_bounds_vec_,
                                  layout_map, ownership_outer_loops_));
+      // Diagnostic-only subset, including when padding search is disabled.
+      // This makes all four modes comparable for a reducer + column-copy
+      // component without pretending that the reducer has zero cost.
+      std::vector<int> scored;
+      for (int member : all)
+        if (IsPaddingScoredOp(member))
+          scored.push_back(member);
+      if (!scored.empty()) {
+        RecordLayoutDiagnostic("padding_scored_unpadded", -1, native,
+                               costmodel::simtvf::AnalyzeOwnershipEffect(
+                                   infer_list_, scored, thread_bounds_vec_,
+                                   native, ownership_outer_loops_, nullptr,
+                                   true));
+        RecordLayoutDiagnostic("padding_scored_final", -1, layout_map,
+                               costmodel::simtvf::AnalyzeOwnershipEffect(
+                                   infer_list_, scored, thread_bounds_vec_,
+                                   layout_map, ownership_outer_loops_, nullptr,
+                                   true));
+      }
     }
     return {layout_map, for_map, predicate_map, padding_guard_map};
   }

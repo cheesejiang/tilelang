@@ -48,6 +48,12 @@ ownership/padding 搜索，不是整个布局推导 pass 不运行。
 
 ## 候选实现与建议优先级
 
+新增可运行阶段提取例子：`run_workloads.py --case flash_decode_column_store`。
+来源为 `examples/flash_decoding/example_gqa_decode_varlen_logits.py` 的逐 tile
+`reduce_max → fragment → S_shared[:,k]`，实现见 kernels.py，参数与命令见 README。
+归约输入与结果 UB 独立，不强制 fragment 放置；附实际 lowering 地址/mask 审计。
+这用于验证候选，不代表已证实 padding 收益或已移植完整 Flash Decoding。
+
 | 实现 | 实际代码/数据流 | 适合 padding 的理由或反证 | 当前阻碍 | 可行性与建议 |
 | --- | --- | --- | --- | --- |
 | [KDA token-parallel](../../kda/chunk_intra_token_parallel.py) | `reduce_sum(Aqk_shared, Sum_Aqk_fragment)` 后 `copy(..., Sum_Aqk_shared[:, j % CS])`，另一支写 `Sum_Akk_shared[:, d]` | 每个 epoch 的目标是一列，不能像完整逐元素计算那样随意换成同一行的相邻列；但每请求是否有多个活跃写 lane 尚未确认 | CUDA 原实现需移植；归约/初始化 TileOp；部分列 SIMT copy；循环变量改变列索引；同组件 `exp2`；`Beta_shared` 的并行 GM 读取；block 相关迭代数和条件；启用多阶段时还有 DMA 版本限制 | **先核对 lane/mask，后决定是否开发。** 固定 ownership 的部分列物理重映射可分步支持；原形态完整支持涉及多项检查和成本分析，难度中到高 |

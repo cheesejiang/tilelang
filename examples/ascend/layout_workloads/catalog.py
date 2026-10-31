@@ -30,9 +30,22 @@ CASES = {
     "kda_reduce_column_store": Case("sparse_column_store", "examples/kda/chunk_intra_token_parallel.py",
                                     "tilelang_chunk_kda_fwd_intra_token_parallel",
                                     "Port rowwise Q*K reduction and one fixed-column store epoch to Ascend SIMT; omit exp gates, pipelining and the rest of KDA; reducer may exclude optimization."),
+    "flash_decode_column_store": Case("reduced_columns", "examples/flash_decoding/example_gqa_decode_varlen_logits.py",
+                                      "flashattn",
+                                      "Port per-KV-tile row max and S_shared[:,k] writeback to Ascend SIMT; use different input logits for every tile; omit QK/PV, online rescaling, FP16 conversion and variable lengths; do not pin result ownership."),
 }
 
 MODES = ("baseline", "ownership", "padding", "auto")
+
+# Number of logits per head in each incoming tile. Independent of the number
+# of output columns / KV tiles, so changing columns does not change reduction.
+FLASH_KV_WIDTH = 32
+
+
+def iteration_count(case, columns, updates):
+    if case == "flash_decode_column_store":
+        return columns
+    return updates if CASES[case].category == "cross_reused" else 1
 
 
 def mode_configs(mode):

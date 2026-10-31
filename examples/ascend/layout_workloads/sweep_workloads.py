@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-from catalog import CASES, MODES, validate
+from catalog import CASES, MODES, iteration_count, validate
 import run_workloads  # noqa: F401 - sets up the shared report helpers' import path.
 from layout_diagnostics import COST_FIELDS, STORAGE_FIELDS, FINAL_IR_FIELDS, candidate_rows, final_ir_fields, summary_fields
 
@@ -62,7 +62,7 @@ def collect_configuration(args, config):
                 report = json.loads(path.read_text())
                 expected = {"rows": config.rows, "columns": config.columns, "threads": config.threads,
                             "blocks": config.blocks,
-                            "iterations": args.updates if spec.category == "cross_reused" else 1}
+                            "iterations": iteration_count(case, config.columns, args.updates)}
                 if any(report.get(k) != v for k, v in expected.items()):
                     raise ValueError(f"Archived configuration does not match scan plan: {path}")
                 reports[mode] = report
@@ -74,7 +74,7 @@ def collect_configuration(args, config):
             latency = report.get("latency_us")
             before = base.get("latency_us")
             metadata = {**asdict(config), "case": case, "mode": mode,
-                        "iterations": args.updates if spec.category == "cross_reused" else 1}
+                        "iterations": iteration_count(case, config.columns, args.updates)}
             elements = config.rows * config.columns * config.blocks
             rows.append({**metadata, **summary_fields(report.get("layout_diagnostics", [])),
                          **final_ir_fields(report, base),
@@ -94,7 +94,7 @@ def save_sweep(output, rows, candidates):
     output.mkdir(parents=True, exist_ok=True)
     fields = ["scan", "case", "rows", "columns", "threads", "blocks", "iterations", "mode", "status",
               "correctness_passed", "experiment_protocol", "latency_us", "speedup_vs_baseline",
-              "output_elements", "output_melems_per_s", "padding_scheme",
+              "output_elements", "output_melems_per_s", "padding_scheme", "cost_scope",
               *STORAGE_FIELDS, *FINAL_IR_FIELDS, *COST_FIELDS,
               *(f"unpadded_{key}" for key in COST_FIELDS), "unmodeled_costs", "report_path"]
     with (output / "summary.csv").open("w", newline="") as handle:
@@ -121,7 +121,7 @@ def save_sweep(output, rows, candidates):
         lines.append("| " + " | ".join(map(str, (*key, *values))) + " |")
     columns = ["scan", "case", "rows", "columns", "threads", "blocks", "iterations", "mode", "correctness",
                "padding_scheme", "speedup_vs_baseline", "output_melems_per_s", "estimated_ub_extra_allocation_bytes",
-               "final_ir_ub_allocation_bytes", "final_ir_ub_extra_vs_baseline_bytes", *COST_FIELDS]
+               "final_ir_ub_allocation_bytes", "final_ir_ub_extra_vs_baseline_bytes", *COST_FIELDS, "cost_scope"]
     lines.extend(["", "| " + " | ".join(columns) + " |", "| " + " | ".join("---" for _ in columns) + " |"])
     for row in rows:
         verified = row["correctness_passed"]

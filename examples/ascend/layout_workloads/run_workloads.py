@@ -9,7 +9,7 @@ import statistics
 import subprocess
 import sys
 
-from catalog import CASES, MODES, mode_configs, validate
+from catalog import CASES, MODES, FLASH_KV_WIDTH, iteration_count, mode_configs, validate
 
 # Reuse the existing report formats, final-allocation reader and summary writer.
 SUPPORT = Path(__file__).resolve().parents[1] / "ub_layout_ablation"
@@ -37,7 +37,7 @@ def run_worker(args):
     path = directory / f"{args.mode}.json"
     report = {**asdict(source), "case": args.case, "mode": args.mode,
               "rows": args.rows, "columns": args.columns, "threads": args.threads, "blocks": args.blocks,
-              "iterations": args.updates if source.category == "cross_reused" else 1,
+              "iterations": iteration_count(args.case, args.columns, args.updates),
               "status": "compiling", "padding_applied": False}
     source_path = Path(__file__).resolve().parents[3] / source.source
     report["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
@@ -54,8 +54,9 @@ def run_worker(args):
         tilelang.disable_cache()
         torch.manual_seed(args.seed)
         a = torch.randn(args.blocks, args.rows, args.columns)
-        tiles = args.updates if source.category == "cross_reused" else 1
-        b = torch.randn(args.blocks, tiles, args.rows, args.columns)
+        tiles = iteration_count(args.case, args.columns, args.updates)
+        width = FLASH_KV_WIDTH if args.case == "flash_decode_column_store" else args.columns
+        b = torch.randn(args.blocks, tiles, args.rows, width)
         stats = torch.rand(args.blocks, tiles + 1, args.rows)
         stats[:, :-1, :] = stats[:, :-1, :] * 0.4 + 0.5
         stats[:, -1, :] = stats[:, -1, :] + 1
@@ -66,6 +67,9 @@ def run_worker(args):
             report["reduction_in_timed_kernel"] = False
         elif args.case == "kda_reduce_column_store":
             report["reduction_in_timed_kernel"] = True
+        elif args.case == "flash_decode_column_store":
+            report.update(reduction_in_timed_kernel=True, kv_tile_width=FLASH_KV_WIDTH,
+                          kv_output_tiles=tiles, result_ownership="native_reducer_placement_unpinned")
         expected = reference(args.case, a, b, stats)
         inputs = [x.to("npu") for x in (a, b, stats)]
         snapshots = {}
@@ -73,7 +77,7 @@ def run_worker(args):
         @tvm.ir.instrument.pass_instrument
         class Capture:
             def run_after_pass(self, mod, info):
-                if info.name in ("tl.AscendLayoutInference", "tl.MergeUBAllocations"):
+                if info.name in ("tl.AscendLayoutInference", "tl.AscendLowerTileOp", "tl.MergeUBAllocations"):
                     snapshots[info.name] = mod
 
         class CaptureTool(PassInstrumentationTool):
@@ -112,6 +116,16 @@ def run_worker(args):
             raise RuntimeError("Missing layout diagnostics; rebuild the TileLang library")
         report["layout_diagnostics"] = records
         report["loop_layouts"] = loops
+        if args.case == "flash_decode_column_store":
+            from column_store_audit import collect_column_store_audit
+            lowered = snapshots.get("tl.AscendLowerTileOp")
+            report["column_store_audit"] = collect_column_store_audit(lowered, "scores_out")
+            audit = report["column_store_audit"]
+            print(f"{args.case}/{args.mode}: column-store audit={audit['status']}; "
+                  f"max_active_lanes={audit.get('max_active_lanes', 'unknown')}; "
+                  f"conflicting_batches={audit.get('conflicting_batches', 'unknown')}", flush=True)
+            if lowered is not None:
+                (directory / f"{args.mode}.lowered.tir").write_text(str(lowered))
         report.update(summary_fields(records))
         report["padding_applied"] = any("padding_bytes" in b for r in records if r.get("stage") == "final" for b in r.get("buffers", []))
         report["padding_policy"] = "rule_based_search" if report["pass_configs"]["tl.ascend_enable_ub_padding"] else "disabled"
@@ -157,7 +171,7 @@ def summarize_reports(args, cases, reports_by_case):
             latency = report.get("latency_us", "")
             base_latency = base.get("latency_us")
             config = {"case": case, "columns": report.get("columns", args.columns), "row_stride": 1,
-                      "iterations": report.get("iterations", args.updates if cases[case].category == "cross_reused" else 1),
+                      "iterations": report.get("iterations", iteration_count(case, args.columns, args.updates)),
                       "blocks": report.get("blocks", args.blocks), "mode": mode}
             candidates.extend({**config, **row} for row in candidate_rows(report.get("layout_diagnostics", [])))
             final = final_ir_fields(report, base)
@@ -171,6 +185,21 @@ def summarize_reports(args, cases, reports_by_case):
                             "latency_us": latency, "speedup_vs_baseline": base_latency / latency if base_latency and latency else "",
                             "report_path": str(path)})
     save_summary(args.output, records, candidates)
+    audits = [(case, mode, report["column_store_audit"])
+              for case, reports in reports_by_case.items() for mode, report in reports.items()
+              if "column_store_audit" in report]
+    if audits:
+        lines = ["", "## Lowered column-store audit", "",
+                 "| case | mode | status | min active lanes | max active lanes | max distinct lines/group | conflicting batches |",
+                 "| --- | --- | --- | --- | --- | --- | --- |"]
+        for case, mode, audit in audits:
+            cells = [case, mode, *(audit.get(k, "unknown") for k in
+                      ("status", "min_active_lanes", "max_active_lanes", "max_distinct_lines_per_group", "conflicting_batches"))]
+            lines.append("| " + " | ".join(map(str, cells)) + " |")
+        lines += ["", "Static scalar TIR store batches after AscendLowerTileOp, not backend ISA or device measurements.",
+                  "Unknown audit results are not evidence of conflict. A single active lane per batch does not demonstrate a multi-lane column conflict."]
+        with (args.output / "summary.md").open("a") as handle:
+            handle.write("\n".join(lines) + "\n")
 
 
 def main():
@@ -178,10 +207,10 @@ def main():
     parser.add_argument("--case", choices=["all", *CASES], default="all")
     parser.add_argument("--mode", choices=["all", *MODES], default="all")
     parser.add_argument("--rows", type=int, default=32)
-    parser.add_argument("--columns", type=int, default=32)
+    parser.add_argument("--columns", type=int, default=32, help="tile columns; for flash_decode_column_store, number of different KV output tiles")
     parser.add_argument("--threads", type=int, default=32)
     parser.add_argument("--blocks", type=int, default=32)
-    parser.add_argument("--updates", type=int, default=4, help="number of different incoming KV tiles, not dummy repetitions")
+    parser.add_argument("--updates", type=int, default=4, help="different incoming tiles for attention_update cases; flash_decode_column_store uses --columns instead")
     parser.add_argument("--rounds", type=int, default=3, help="independent benchmark batches; report their median")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--bench", action="store_true")

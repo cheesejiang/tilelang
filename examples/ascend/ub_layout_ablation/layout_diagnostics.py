@@ -81,15 +81,25 @@ def final_report(records):
 def summary_fields(records):
     final = final_report(records)
     native = next((r for r in reversed(records) if r.get("stage") == "final_ownership_unpadded"), {})
+    costs = final
+    if final.get("cost_known") == 0:
+        scoped = next((r for r in reversed(records) if r.get("stage") == "padding_scored_final"), {})
+        if scoped.get("cost_known") == 1:
+            costs = scoped
+            native = next((r for r in reversed(records) if r.get("stage") == "padding_scored_unpadded"), {})
     schemes = []
     for buffer in final.get("buffers", []):
         if "padding_bytes" in buffer:
             schemes.append(f"{buffer['buffer']}: every {buffer['period_rows']} rows +{buffer['padding_bytes']}B")
-    result = {key: final.get(key, "unknown") for key in (*COST_FIELDS, *STORAGE_FIELDS)}
+    result = {key: costs.get(key, "unknown") for key in COST_FIELDS}
+    result.update({key: final.get(key, "unknown") for key in STORAGE_FIELDS})
+    result["cost_scope"] = costs.get("cost_scope", "unknown")
     result["padding_scheme"] = "; ".join(schemes) or "none_or_unrecognized"
     for key in COST_FIELDS:
         result[f"unpadded_{key}"] = native.get(key, "unknown")
     result["unmodeled_costs"] = "DMA; address computation; synchronization"
+    if costs is not final:
+        result["unmodeled_costs"] += "; reducer and other excluded operations"
     return result
 
 

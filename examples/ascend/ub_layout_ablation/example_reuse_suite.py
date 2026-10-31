@@ -26,7 +26,7 @@ def save_summary(output, records, candidates=()):
     output.mkdir(parents=True, exist_ok=True)
     fields = ["case", "columns", "row_stride", "iterations", "blocks", "mode",
               "status", "correctness_passed", "padding_applied", "latency_us", "speedup_vs_baseline",
-              "padding_scheme", *STORAGE_FIELDS, *FINAL_IR_FIELDS, *COST_FIELDS,
+              "padding_scheme", "cost_scope", *STORAGE_FIELDS, *FINAL_IR_FIELDS, *COST_FIELDS,
               *(f"unpadded_{key}" for key in COST_FIELDS), "unmodeled_costs", "report_path"]
     with (output / "summary.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -64,7 +64,11 @@ def save_summary(output, records, candidates=()):
         values = [str(row.get(key, "")) for key in keys]
         values.insert(3, correctness)
         lines.append("| " + " | ".join(values) + " |")
-    lines.extend(["", "Estimated allocation values sum per-buffer sizes rounded to 32B without alias reuse; they are not final UB allocation or device measurements.",
+    lines.extend(["", "| case | mode | model cost scope |", "| --- | --- | --- |"])
+    for row in records:
+        lines.append(f"| {row['case']} | {row['mode']} | {row.get('cost_scope', 'unknown')} |")
+    lines.extend(["", "A padding_scored_ops_only scope excludes reducer/unsupported operators; its cycles are not whole-kernel time and excluded costs are not zero.",
+                  "Estimated allocation values sum per-buffer sizes rounded to 32B without alias reuse; they are not final UB allocation or device measurements.",
                   "Final IR allocation is read after MergeUBAllocations (per-function UB totals, module maximum); it is not a device compiler report or runtime measurement. Unknown baseline deltas are not zero.",
                   "Costs cover modeled SIMT UB traffic per block; DMA, address computation and synchronization are not modeled.",
                   "Unpadded costs retain final ownership and hypothetically remove UB storage layouts; they are not the original ownership cost."])

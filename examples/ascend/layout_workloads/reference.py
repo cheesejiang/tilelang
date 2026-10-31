@@ -2,6 +2,9 @@
 
 
 def reference(case, a, incoming, stats):
+    if case == "flash_decode_column_store":
+        maxima = incoming.amax(dim=-1) if hasattr(incoming, "amax") else incoming.max(axis=-1)
+        return maxima.swapaxes(1, 2)
     if case in ("kda_column_store", "kda_reduce_column_store"):
         result = a * 1.0
         result[:, :, 0] = stats[:, 0, :] if case == "kda_column_store" else (a * incoming[:, 0]).sum(-1)

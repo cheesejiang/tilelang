@@ -2,8 +2,15 @@
 
 import tilelang.ascend.language as T
 
+if __package__:
+    from .catalog import FLASH_KV_WIDTH
+else:
+    from catalog import FLASH_KV_WIDTH
+
 
 def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4):
+    if case == "flash_decode_column_store":
+        return _make_flash_decode_column_kernel(rows, columns, threads, blocks)
     if case in ("kda_column_store", "kda_reduce_column_store"):
         return _make_kda_column_kernel(case, rows, columns, threads, blocks, updates)
     # Mode is deliberately absent from the kernel factory: all four runs
@@ -62,6 +69,40 @@ def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4):
                         for c, r in T.Parallel(columns, rows):
                             work[r, c] = work[r, c] / denominator[r]
             T.copy(work, C[block, :, :])
+
+    return main
+
+
+def _make_flash_decode_column_kernel(rows, columns, threads, blocks):
+    """Independent per-tile row maxima -> one output column per iteration.
+
+    A/Stats keep the common runner signature but are unused. Input logits are
+    supplied in B; this is the reduce/writeback stage, not a full attention.
+    All modes use the native reducer result placement; no pinned fragments.
+    """
+    width = FLASH_KV_WIDTH
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((blocks, rows, columns), "float32"),
+        B: T.Tensor((blocks, columns, rows, width), "float32"),
+        Stats: T.Tensor((blocks, columns + 1, rows), "float32"),
+        C: T.Tensor((blocks, rows, columns), "float32"),
+    ):
+        with T.Kernel(blocks) as block:
+            logits = T.alloc_shared((rows, width), "float32")
+            scores_out = T.alloc_shared((rows, columns), "float32")
+            for k in T.serial(columns):
+                T.copy(B[block, k, :, :], logits)
+                with T.SimtVF(threads=threads):
+                    maxima = T.alloc_reducer((rows,), "float32", op="max")
+                    T.reducer_init(maxima)
+                    for h, n in T.Parallel(rows, width):
+                        T.reducer_update(maxima[h], logits[h, n])
+                    result = T.alloc_fragment((rows,), "float32")
+                    T.finalize_reducer(maxima, result)
+                    T.copy(result, scores_out[:, k])
+            T.copy(scores_out, C[block, :, :])
 
     return main
 
