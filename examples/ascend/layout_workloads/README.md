@@ -18,6 +18,7 @@ baseline 仍执行必要的布局推导；auto 按现有规则和模型成本选
 | [column_store_audit.py](column_store_audit.py) | 检查 lowering 后列写回的实际活跃 lane、地址和 group 分布 |
 | [test_runner.py](test_runner.py) | 不依赖 NPU 的参数、来源、汇总流程测试 |
 | [PADDING_CANDIDATES.md](PADDING_CANDIDATES.md) | 真实 kernel 的源码核查、全部准入检查、阻塞因素和支持扩展的可行性 |
+| [TILEKERNELS_PADDING_CANDIDATES.md](TILEKERNELS_PADDING_CANDIDATES.md) | TileKernels 转置/量化候选、原有优化、地址模型预筛选与移植限制 |
 
 ## 来源和边界
 
@@ -500,6 +501,41 @@ python examples/ascend/layout_workloads/run_workloads.py --summarize-only --outp
 `loop_layouts`、完整 `layout_diagnostics`、最终分配明细 `final_ir_ub`、
 `latency_samples_us` 和源代码信息。解释优化效果时先检查四组输入和开关，再检查
 实际布局、模型成本是否改变，最后比较实测时延。
+
+## KDA 列写回：联合扫描 rows、columns 和 blocks
+
+`grid` 将每种 tile shape 与每种 block 数交叉组合。建议固定 `threads=32`，
+扫描行数 32/64/128/256、列数 32/64、blocks 1/8/32：共 24 组配置，
+每组运行 baseline、ownership、padding、auto，共 96 次模式测试。
+这些 tile 均满足当前脚本的 UB 预算检查。
+
+在 TileLang 根目录运行：
+
+```bash
+python examples/ascend/layout_workloads/sweep_workloads.py \
+  --sweep grid --case kda_column_store --mode all \
+  --shapes 32x32 32x64 64x32 64x64 128x32 128x64 256x32 256x64 \
+  --block-counts 1 8 32 --threads 32 \
+  --bench --rounds 5 --output kda-column-sweeps
+```
+
+先预览计划时，在同一条命令末尾加 `--dry-run`，不编译、不执行 kernel。
+只验证精度和布局时去掉 `--bench`；此时不会产生实测时延。
+归档结果需要重新汇总时，使用原命令加 `--summarize-only`，不重新运行设备。
+
+总结果保存在 `kda-column-sweeps/summary.md` 和 `summary.csv`，包括四模式时延、
+精度、padding 周期、UB 分配和模型成本；候选明细在 `candidates.csv`。
+每组原始结果位于 `grid/r128_c32_t32_b8/kda_column_store/` 这类目录中。
+某组运行失败会记录状态并继续其他配置，已完成结果持续汇总。
+
+`rows/columns` 是每个 block 的 tile 大小，输入形状为 `(blocks, rows, columns)`；
+增加 blocks 不会自动切分 rows。比较列宽影响时固定 rows/blocks，比较行数影响时
+固定 columns/blocks，比较并行度时固定 shape。不同配置工作量不同，不应直接
+按绝对时延判断优化优劣，应比较同配置相对于 baseline 的加速比。
+KDA 只写第 0 列，实际目标列写回元素数为 `blocks*rows`；表中的
+`output_melems_per_s` 使用完整输出矩阵元素数，不代表列写回吞吐率。
+此命令是板端测试，不会自动启动 msprof simulator；仿真单配置继续使用
+`run_workloads.py --worker`。
 
 ## 检查脚本
 

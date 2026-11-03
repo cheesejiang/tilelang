@@ -1,5 +1,9 @@
 # 现有 kernel 的 padding 候选与准入限制核查
 
+补充搜索：见 [TileKernels 候选核查](TILEKERNELS_PADDING_CANDIDATES.md)。
+独立 transpose 和融合 transpose 有真实 shared 重排结构、原有 padding 证据；
+已做地址模型预筛选，尚无新增 Ascend 实测加速结论。
+
 范围：静态检查本仓库 KDA、GDN、Ascend RMSNorm/FP8/Attention/DeepGEMM、
 Sparse MLA、K-pool、TopK 和 mHC 的相关实现，以及当前 Ascend 布局优化代码。
 这不是设备性能报告，也不是对所有参数和全部 lowering 分支的运行验证。

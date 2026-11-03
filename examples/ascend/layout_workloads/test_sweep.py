@@ -72,6 +72,18 @@ class SweepTests(unittest.TestCase):
             text = (Path(folder) / "summary.md").read_text()
             self.assertIn("| shapes | gemm_scale | 32 | 34 |", text)
 
+    def test_kda_grid_plan(self):
+        args = SimpleNamespace(sweep="grid", shapes=[(r, c) for r in (32, 64, 128, 256) for c in (32, 64)],
+                               threads=32, block_counts=[1, 8, 32], updates=4, case="kda_column_store")
+        plan = sweep.configurations(args)
+        self.assertEqual(len(plan), 24)
+        self.assertEqual(len({c.directory for c in plan}), 24)
+        self.assertEqual({(c.rows, c.columns, c.blocks) for c in plan},
+                         {(r, c, b) for r, c in args.shapes for b in args.block_counts})
+        args.shapes = [(1024, 64)]
+        with self.assertRaisesRegex(ValueError, "UB budget"):
+            sweep.configurations(args)
+
 
 if __name__ == "__main__":
     unittest.main()

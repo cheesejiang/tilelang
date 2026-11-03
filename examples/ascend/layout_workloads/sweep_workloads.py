@@ -1,4 +1,4 @@
-"""Scan tile shapes at fixed blocks, then blocks at a fixed tile shape."""
+"""Scan tile shapes, block counts, or their Cartesian product."""
 
 import argparse
 import csv
@@ -43,6 +43,9 @@ def configurations(args):
         result.extend(Configuration("shapes", r, c, args.threads, args.blocks) for r, c in args.shapes)
     if args.sweep in ("blocks", "both"):
         result.extend(Configuration("blocks", args.rows, args.columns, args.threads, b) for b in args.block_counts)
+    if args.sweep == "grid":
+        result.extend(Configuration("grid", r, c, args.threads, b)
+                      for r, c in args.shapes for b in args.block_counts)
     result = list(dict.fromkeys(result))
     for config in result:
         validate(config.rows, config.columns, config.threads, config.blocks, args.updates)
@@ -130,7 +133,9 @@ def save_sweep(output, rows, candidates):
         verified = row["correctness_passed"]
         values = {**row, "correctness": "passed" if verified is True else "not_passed" if verified is False else "unknown"}
         lines.append("| " + " | ".join(f"{values[k]:.3f}" if isinstance(values.get(k), float) else str(values.get(k, "")) for k in columns) + " |")
-    lines.extend(["", "shapes: blocks and threads fixed; blocks: shape and threads fixed.",
+    lines.extend(["", "shapes: blocks and threads fixed; blocks: shape and threads fixed; grid: every shape/block-count combination, threads fixed.",
+                  "rows and columns describe one block's tile, not the entire input; total rows = rows*blocks.",
+                  "For kda_column_store, only column 0 is overwritten: target column-store elements = rows*blocks, not rows*columns*blocks.",
                   "Output throughput is blocks*rows*columns / latency_us in Melem/s; not memory bandwidth or operation throughput.",
                   "UB allocation and model costs are per block; do not multiply them by blocks when comparing local conflicts.",
                   "Final IR allocation is not device-measured usage; model cycles exclude unmodeled DMA/synchronization/address costs.",
@@ -140,7 +145,8 @@ def save_sweep(output, rows, candidates):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sweep", choices=["shapes", "blocks", "both"], default="both")
+    parser.add_argument("--sweep", choices=["shapes", "blocks", "both", "grid"], default="both",
+                        help="both runs two isolated scans; grid combines every --shapes item with every --block-counts item")
     parser.add_argument("--shapes", type=parse_shape, nargs="+", default=[(32, 16), (32, 32), (32, 34), (32, 40), (64, 32), (128, 32)])
     parser.add_argument("--rows", type=int, default=32, help="fixed rows for block scan")
     parser.add_argument("--columns", type=int, default=32, help="fixed columns for block scan")
