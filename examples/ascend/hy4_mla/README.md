@@ -12,6 +12,7 @@ The caller supplies the physical KV row indices.
 | `testing.py` | Inputs, the FP32 reference, and numerical checks |
 | `run.py` | Correctness check and optional warm-cache timing |
 | `test_hy4_mla.py` | NPU regressions for the core |
+| `test_edge_cases_npu.py` | Finite sink overflow, multi-tile rescaling, invalid prefixes, and zero-burst copy regressions |
 | `test_interface.py`, `test_interface_npu.py` | CPU and NPU tests of the call adapter |
 
 ```python
@@ -71,6 +72,19 @@ enables warm-cache NPU Event timing and prints JSON; the default is a
 correctness check only. `--no-pipeline` disables the pipelined schedule, and
 `--num-cores` overrides the launch core count. The TFLOPS figure above is a
 separate `msprof op` measurement. `run.py` does not flush L2 or report it.
+
+Run the edge-case regressions separately with:
+
+```bash
+python -m pytest examples/ascend/hy4_mla/test_edge_cases_npu.py -q
+```
+
+The finite-sink cases require nonzero representable outputs even when the sink
+exceeds the KV logits by 90 or 100. They are regression tests for intermediate
+FP32 exponential overflow and may fail until sink normalization is stabilized.
+The zero-burst microtest checks UB preservation and the nonzero-copy control;
+confirming the absence of a discarded GM read additionally requires inspecting
+generated code or device traces.
 
 Pair gathers use a zero-or-two burst count. The local `T.assume(n_burst > 0)`
 suppresses the compiler's copy guard while retaining the runtime DMA count;
