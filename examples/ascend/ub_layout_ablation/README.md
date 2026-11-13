@@ -284,3 +284,9 @@ JSON 的 `final_ir_ub` 保留每个函数和各 UB 分配的名称、shape、字
 这些是 TileLang 分配后的 IR 数据，不是 Bisheng 资源报告或设备运行时测量。
 
 使用原命令重新运行即可生成新列，旧 JSON 不会自动补充数据。
+
+## 原生 SIMT UB 8B 读合并微基准
+
+[ub_merge_cycles](ub_merge_cycles/README.md) 使用原生 SIMT 对比同一个 8B 块内的
+不同地址读取、分散资源读取和同资源冲突读取，采集设备 clock cycles，
+用于验证成本模型所依据的硬件读合并行为。运行方法和验证限制见该目录说明。
