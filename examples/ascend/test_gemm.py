@@ -46,3 +46,24 @@ def test_gemm_accumulate(out_dtype):
     kernel(a.npu(), b.npu(), output)
     expected = (a.float() @ b.float().T).to(initial.dtype) + initial
     torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+@tilelang.testing.requires_ascend
+@pytest.mark.parametrize("blocks", [27, 29, 56])
+@pytest.mark.parametrize("mixed", [False, True])
+def test_gemm_block_partition(blocks, mixed):
+    # Forty output tiles exercise both a partial persistent round and grids
+    # larger than the task count, using the real swizzle and epilogue.
+    m, n, k = 2048, 1280, 512
+    a = (torch.randn(m, k, device="npu") * 0.125).to(torch.bfloat16)
+    b = (torch.randn(n, k, device="npu") * 0.125).to(torch.bfloat16)
+    dtype = torch.float32 if mixed else torch.bfloat16
+    out = torch.full((m, n), float("nan"), dtype=dtype, device="npu")
+    kernel = tilelang.compile(
+        gemm(m, k, n, out_dtype="float32" if mixed else "bfloat16", MIXED=mixed, num_blocks=blocks),
+        target="ascend",
+    )
+    kernel(a, b, out)
+    torch.npu.synchronize()
+    tolerance = 1e-3 if mixed else 1e-2
+    torch.testing.assert_close(out, (a.float() @ b.float().T).to(dtype), rtol=tolerance, atol=tolerance)

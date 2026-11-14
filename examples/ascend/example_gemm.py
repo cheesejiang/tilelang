@@ -9,7 +9,8 @@ from tilelang.profiler import do_bench
 
 
 def gemm(
-    M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float32", MIXED=None, hf32=None, enable_unit_flag=True, acc=False
+    M_DIM=8192, K_DIM=8192, N_DIM=8192, dtype="bfloat16", out_dtype="float32", MIXED=None, hf32=None, enable_unit_flag=True, acc=False,
+    num_blocks=32,
 ):
     """Persistent, auto-scheduled GEMM: C = X @ W.T.
 
@@ -17,7 +18,9 @@ def gemm(
     hf32 selects FP32 input rounding: None, nearest_zero or nearest_even.
     acc accumulates into a pre-initialized output via store-mode atomics.
     """
-    NUM_BLOCKS = 32
+    if num_blocks <= 0:
+        raise ValueError("num_blocks must be positive")
+    NUM_BLOCKS = num_blocks
     is_fp32 = dtype == "float32"
     if MIXED is None:
         MIXED = not is_fp32 and out_dtype != "bfloat16"

@@ -8,13 +8,17 @@ import tilelang.ascend.language as T
 from tilelang.profiler import do_bench
 
 
-def vector_add(N, mode="simt"):
-    num_blocks, num_threads, tile, num_stages = 64, 2048, 8192, 2
+def vector_add(N, mode="simt", num_blocks=64):
+    num_threads, tile, num_stages = 2048, 8192, 2
     if mode not in ("simt", "simd"):
         raise ValueError("mode must be simt or simd")
-    if N <= 0 or N % (tile * num_blocks):
-        raise ValueError(f"N must be a positive multiple of {tile * num_blocks}")
-    iterations = N // (tile * num_blocks)
+    if num_blocks <= 0:
+        raise ValueError("num_blocks must be positive")
+    if N <= 0 or N % tile:
+        raise ValueError(f"N must be a positive multiple of {tile}")
+    num_tiles = N // tile
+    iterations = (num_tiles + num_blocks - 1) // num_blocks
+    full_grid = num_tiles % num_blocks == 0
 
     @T.prim_func
     def main(A: T.Tensor((N,), "float32"), B: T.Tensor((N,), "float32"), C: T.Tensor((N,), "float32")):
@@ -25,21 +29,24 @@ def vector_add(N, mode="simt"):
             T.annotate_buffer_versions({a: num_stages, b: num_stages, c: num_stages})
             for step in T.Pipelined(iterations, num_stages=num_stages):
                 begin = (step * num_blocks + bx) * tile
-                T.copy(A[begin : begin + tile], a)
-                T.copy(B[begin : begin + tile], b)
-                if mode == "simt":
-                    with T.SimtVF(threads=num_threads):
-                        for i in T.Parallel(tile):
-                            c[i] = a[i] + b[i]
-                else:
-                    with T.SimdVF():
-                        mask = T.simd.pset(32)
-                        for i in range(tile // 64):
-                            a_reg = T.simd.vld(a[i * 64])
-                            b_reg = T.simd.vld(b[i * 64])
-                            result = T.simd.vadd(a_reg, b_reg, mask)
-                            T.simd.vsts(c[i * 64], result, mask)
-                T.copy(c, C[begin : begin + tile])
+                # Preserve the branch-free existing path for full grids. The
+                # final partial round is needed when sweeping C-1/C/C+1.
+                if full_grid or step * num_blocks + bx < num_tiles:
+                    T.copy(A[begin : begin + tile], a)
+                    T.copy(B[begin : begin + tile], b)
+                    if mode == "simt":
+                        with T.SimtVF(threads=num_threads):
+                            for i in T.Parallel(tile):
+                                c[i] = a[i] + b[i]
+                    else:
+                        with T.SimdVF():
+                            mask = T.simd.pset(32)
+                            for i in range(tile // 64):
+                                a_reg = T.simd.vld(a[i * 64])
+                                b_reg = T.simd.vld(b[i * 64])
+                                result = T.simd.vadd(a_reg, b_reg, mask)
+                                T.simd.vsts(c[i * 64], result, mask)
+                    T.copy(c, C[begin : begin + tile])
 
     return main
 

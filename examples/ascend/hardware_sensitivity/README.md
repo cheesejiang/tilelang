@@ -125,3 +125,52 @@ working set does not reconfigure its L2 capacity, and allocating less memory
 does not simulate a different GM subsystem. These experiments identify
 sensitivity and establish a baseline; they cannot establish another SKU's
 performance or a before/after regression without measurements on that SKU.
+
+## Real-operator follow-up: C-1, C, C+1, 2C
+
+`real_operators.py` imports the existing `example_vecadd.vector_add` and
+`example_gemm.gemm` implementations rather than the simple kernels above.
+The examples now accept optional `num_blocks`, preserving defaults of 64 and
+32 respectively. VecAdd also handles a final incomplete **block round**;
+element counts must still be whole 8192-element tiles.
+
+```bash
+# Small first check (15 cases on 9579).
+python examples/ascend/hardware_sensitivity/real_operators.py \
+  --vector-elements 1048576 --gemm-sizes 1024 \
+  --samples 3 --repeats 3 --no-plots --output real-smoke
+
+# Full follow-up (25 cases on 9579).
+python examples/ascend/hardware_sensitivity/real_operators.py \
+  --no-plots --output real-9579
+```
+
+The default suite measures:
+
+| Operator | Workload | C on 9579 | Block candidates |
+|---|---|---:|---|
+| Real SIMT VecAdd (pipelined) | 2^24 elements | 56 | 55, 56, 57, 112, original 64 |
+| Real BF16 Cube GEMM | square 2048 and 4096, BF16 output | 28 | 27, 28, 29, 56, original 32 |
+| Real BF16 mixed GEMM | square 2048 and 4096, FP32 output | 28 | 27, 28, 29, 56, original 32 |
+
+Each group uses identical input values, shape, tiles, buffers and pipeline
+configuration across block candidates, in shuffled order. Compilation and two
+sentinel-output correctness checks are outside timing. Timing reuses the warm
+NPU event method above. Reference buffers remain allocated throughout each
+group, consistently across its block candidates. Cube and mixed GEMM have
+different output types; compare block choices **within** a group rather than
+attributing a direct cross-mode comparison solely to core type.
+
+`results.csv` is flushed after each case. `summary.csv` adds
+`latency_ratio_to_C` and `latency_ratio_to_original`: >1 means slower than that
+baseline. Device information and generated sources are also saved. Plot with:
+
+```bash
+python examples/ascend/hardware_sensitivity/real_operators.py \
+  --plot-only --output real-9579
+```
+
+Use `--operators vecadd`, `gemm_cube`, or `gemm_mixed` to isolate a workload.
+RMSNorm and FlashAttention are not included: their current task partitioning
+has divisibility constraints that prevent a fair same-shape C±1 sweep without
+additional algorithm changes.
