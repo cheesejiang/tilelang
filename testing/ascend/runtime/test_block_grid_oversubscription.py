@@ -3,8 +3,8 @@
 Run on an A5 board with the Ascend backend from this checkout. No inter-block
 barriers are used: this checks dispatch coverage, not simultaneous residency.
 
-Both decorated JIT factories and explicit PrimFunc construction/compilation
-are exercised, using identical kernel bodies and output checks.
+Both eager JIT calls with tensor arguments and explicit PrimFunc construction/
+compilation are exercised, using matching kernel bodies and output checks.
 """
 
 import pytest
@@ -50,21 +50,42 @@ def _matrix_kernel(blocks, mixed):
     return main
 
 
-@tilelang.jit(target="ascend", execution_backend="tvm_ffi", mode="lazy")
-def _jit_vector_kernel(blocks):
-    return _vector_kernel(blocks)
+@tilelang.jit(target="ascend", execution_backend="tvm_ffi")
+def _jit_vector_kernel(out, blocks: int):
+    out: T.Tensor((blocks, 32), "float32")
+    with T.Kernel(blocks) as bx:
+        buf = T.alloc_shared((32,), "float32")
+        with T.SimtVF(threads=32):
+            for i in T.Parallel(32):
+                buf[i] = T.cast(bx + 1, "float32")
+        T.copy(buf, out[bx, :])
 
 
-@tilelang.jit(target="ascend", execution_backend="tvm_ffi", mode="lazy")
-def _jit_matrix_kernel(blocks, mixed):
-    return _matrix_kernel(blocks, mixed)
+@tilelang.jit(target="ascend", execution_backend="tvm_ffi")
+def _jit_matrix_kernel(a, b, out, blocks: int, mixed: bool):
+    a: T.Tensor((blocks, 16, 16), "float16")
+    b: T.Tensor((16, 16), "float16")
+    out: T.Tensor((blocks, 16, 16), "float32")
+    with T.Kernel(blocks) as bx:
+        al1 = T.alloc_l1((16, 16), "float16")
+        bl1 = T.alloc_l1((16, 16), "float16")
+        acc = T.alloc_l0c((16, 16), "float32")
+        T.copy(a[bx, :, :], al1)
+        T.copy(b, bl1)
+        T.gemm(al1, bl1, acc, transpose_B=True, clear_accum=True)
+        if mixed:
+            ub = T.alloc_shared((8, 16), "float32")
+            T.dual_copy(acc, ub)
+            T.dual_copy(ub, out[bx, :, :])
+        else:
+            T.copy(acc, out[bx, :, :])
 
 
 def _build_kernel(mode, blocks, build_path):
     if build_path == "jit":
         if mode == "vector":
-            return _jit_vector_kernel(blocks)
-        return _jit_matrix_kernel(blocks, mode == "mixed")
+            return lambda out: _jit_vector_kernel(out, blocks=blocks)
+        return lambda a, b, out: _jit_matrix_kernel(a, b, out, blocks=blocks, mixed=mode == "mixed")
 
     # Same pattern as layout_workloads: construct a PrimFunc, explicitly
     # compile it, then invoke the returned callable separately.
