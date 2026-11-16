@@ -17,6 +17,8 @@ import sys
 import time
 import traceback
 
+from block_config import BLOCK_CASES, POLICIES, select_blocks
+
 
 CASES = [
     "vecadd_simt", "vecadd_simd", "rmsnorm_fused",
@@ -90,12 +92,24 @@ def prepare(case, args, torch, torch_npu, tilelang):
         assert torch.isfinite(expected).all().item()
         torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
 
+    def block_configuration(original, tasks, unit):
+        props = torch.npu.get_device_properties(args.device)
+        physical = int(getattr(props, "vector_core_num" if unit == "aiv" else "cube_core_num"))
+        target = args.target_cores if args.target_cores is not None else physical
+        blocks = select_blocks(args.block_policy, original, target, tasks)
+        meta.update(blocks=blocks, block_policy=args.block_policy, original_blocks=original,
+                    physical_cores=physical, target_cores=target, core_unit=unit, task_tiles=tasks,
+                    core_source="explicit_target" if args.target_cores is not None else "device_query",
+                    configuration="original_default_blocks" if args.block_policy == "original" else "experimental_block_policy")
+        return blocks
+
     if case.startswith("vecadd"):
         from example_vecadd import vector_add
         n = 2**30 if full else 2**20
         a, b = tensor((n,)), tensor((n,))
-        kernel = compile_kernel(vector_add(n, case.removeprefix("vecadd_")), args, tilelang)
-        meta.update(shape=[n], dtype="float32", blocks=64, eager_api="torch.add")
+        blocks = block_configuration(64, n // 8192, "aiv")
+        kernel = compile_kernel(vector_add(n, case.removeprefix("vecadd_"), num_blocks=blocks), args, tilelang)
+        meta.update(shape=[n], dtype="float32", eager_api="torch.add")
         return lambda: kernel(a, b), lambda: torch.add(a, b), lambda x, y: close(x, y, 0, 0), meta
 
     if case == "rmsnorm_fused":
@@ -126,13 +140,14 @@ def prepare(case, args, torch, torch_npu, tilelang):
         a, b = tensor((n, n), dtype), tensor((n, n), dtype)
         mixed = case == "gemm_mixed_fp32"
         name = "bfloat16" if dtype == torch.bfloat16 else "float32"
-        kernel = compile_kernel(gemm(n, n, n, dtype=name, out_dtype=name, MIXED=mixed), args, tilelang)
+        blocks = block_configuration(32, (n // 256) ** 2, "cube")
+        kernel = compile_kernel(gemm(n, n, n, dtype=name, out_dtype=name, MIXED=mixed, num_blocks=blocks), args, tilelang)
         def validate(x, y):
             reference = (a.cpu().float() @ b.cpu().float().T).to(dtype)
             tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-3
             close(x.cpu(), reference, tolerance, tolerance)
             close(y.cpu(), reference, tolerance, tolerance)
-        meta.update(shape=[n, n, n], dtype=name, output_dtype=name, blocks=32,
+        meta.update(shape=[n, n, n], dtype=name, output_dtype=name,
                     eager_api="torch.mm", hf32=False)
         return lambda: kernel(a, b), lambda: torch.mm(a, b.T), validate, meta
 
@@ -332,7 +347,7 @@ def worker(args):
         elif args.worker.startswith(("gemm_fp32", "gemm_mixed")):
             raise Unavailable("Cannot verify/disable Torch-NPU FP32 matmul HF32 mode")
         props = torch.npu.get_device_properties(args.device)
-        row.update(device=str(props), tilelang_path=tilelang.__file__, arch=args.arch,
+        row.update(device=str(props), device_name=str(props.name), tilelang_path=tilelang.__file__, arch=args.arch,
                    torch_version=torch.__version__, hf32=False if hf32_controlled else "unverified")
         for package in ("torch-npu", "tilelang"):
             try:
@@ -434,9 +449,15 @@ def run_rounds(args):
     summary = []
     for case in dict.fromkeys(args.cases):
         rows = [row for row in records if row["case"] == case]
-        item = dict(case=case, rounds=args.rounds,
+        device_names = sorted({row["device_name"] for row in rows if row.get("device_name")})
+        item = dict(case=case, device_name=";".join(device_names) or "unknown", rounds=args.rounds,
                     passed_rounds=sum(row["status"] == "passed" for row in rows))
-        valid = all(row["status"] == "passed" for row in rows)
+        for key in ("profile", "shape", "dtype", "arch", "blocks", "block_policy", "original_blocks",
+                    "physical_cores", "target_cores", "core_unit", "task_tiles", "core_source", "configuration"):
+            values = {str(row[key]) for row in rows if row.get(key) is not None}
+            if len(values) == 1:
+                item[key] = next(iter(values))
+        valid = all(row["status"] == "passed" for row in rows) and len(device_names) <= 1
         metrics = []
         if valid:
             try:
@@ -477,6 +498,8 @@ def main():
     parser.add_argument("--attention-baseline", choices=["fusion", "sdpa"], default="fusion")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--arch", default="dav-3510")
+    parser.add_argument("--block-policy", choices=POLICIES, default="original")
+    parser.add_argument("--target-cores", type=int, help="Explicit target core count for block experiments; does not emulate hardware")
     parser.add_argument("--timing", choices=["profiler", "event", "wall"], default="profiler")
     parser.add_argument("--rounds", type=int, default=3, help="Independent suite processes (default: 3)")
     parser.add_argument("--warmup", type=int, default=3)
@@ -495,6 +518,10 @@ def main():
         parser.error("rounds/warmup/samples/repeats/timeout must be positive")
     if args.timing == "profiler" and args.repeats != 1:
         parser.error("profiler timing requires --repeats 1: one call per profile window")
+    if args.target_cores is not None and args.target_cores <= 0:
+        parser.error("--target-cores must be positive")
+    if (args.block_policy != "original" or args.target_cores is not None) and any(case not in BLOCK_CASES for case in ([args.worker] if args.worker else args.cases)):
+        parser.error("block experiments support only VecAdd and ordinary GEMM; select them with --cases")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.worker:
@@ -517,7 +544,8 @@ def main():
         except (OSError, subprocess.TimeoutExpired) as error:
             metadata[tool] = {"error": str(error)}
     (args.output / "environment.json").write_text(json.dumps(metadata, indent=2))
-    fields = ["case", "status", "comparison_type", "eager_api", "profile", "shape", "dtype", "blocks",
+    fields = ["case", "device_name", "device", "arch", "status", "comparison_type", "eager_api", "profile", "shape", "dtype", "blocks",
+              "block_policy", "original_blocks", "physical_cores", "target_cores", "core_unit", "task_tiles", "core_source", "configuration",
               "timing", "protocol", "metric", "cache_policy", "flush_bytes", "warmup", "samples", "repeats",
               "tilelang_latency_us", "eager_latency_us", "tilelang_mean_us", "eager_mean_us",
               "tilelang_stdev_us", "eager_stdev_us", "tilelang_median_us", "eager_median_us", "speedup", "tilelang_min_us", "tilelang_max_us",
@@ -537,7 +565,9 @@ def main():
                        "--profile", args.profile, "--device", str(args.device), "--arch", args.arch,
                        "--timing", args.timing, "--warmup", str(args.warmup), "--samples", str(args.samples),
                        "--repeats", str(args.repeats), "--seed", str(args.seed), "--output", str(run_dir),
-                       "--attention-baseline", args.attention_baseline]
+                       "--attention-baseline", args.attention_baseline, "--block-policy", args.block_policy]
+            if args.target_cores is not None:
+                command.extend(["--target-cores", str(args.target_cores)])
             print(f"Running {case} ...", flush=True)
             try:
                 with (args.output / f"{case}.log").open("w") as log:

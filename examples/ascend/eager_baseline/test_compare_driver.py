@@ -39,9 +39,10 @@ class DriverTests(unittest.TestCase):
             torch.testing.assert_close(torch.pow(2.0, raw.float() - 127), decoded, rtol=0, atol=0)
             self.assertEqual(set(decoded.flatten().tolist()), {0.5, 1.0, 2.0})
 
-    def run_driver(self, folder, callback):
+    def run_driver(self, folder, callback, extra=()):
         argv = ["compare.py", "--cases", "vecadd_simt", "--profile", "full",
                 "--rounds", "1", "--timing", "event", "--samples", "3", "--repeats", "5", "--output", str(folder)]
+        argv.extend(extra)
         def run(command, **kwargs):
             if "--worker" not in command:
                 return SimpleNamespace(returncode=0, stdout="host-test", stderr="")
@@ -62,9 +63,9 @@ class DriverTests(unittest.TestCase):
                     if broken and len(calls) == 2:
                         return SimpleNamespace(returncode=-6)
                     with (destination / "results.csv").open("w", newline="") as handle:
-                        writer = csv.DictWriter(handle, fieldnames=["case", "status", "tilelang_median_us", "eager_median_us"])
+                        writer = csv.DictWriter(handle, fieldnames=["case", "device_name", "status", "tilelang_median_us", "eager_median_us"])
                         writer.writeheader()
-                        writer.writerow(dict(case="vecadd_simt", status="passed", tilelang_median_us=[10, 20, 90][len(calls) - 1], eager_median_us=40))
+                        writer.writerow(dict(case="vecadd_simt", device_name="Ascend950PR_9579", status="passed", tilelang_median_us=[10, 20, 90][len(calls) - 1], eager_median_us=40))
                     return SimpleNamespace(returncode=0)
                 with patch.object(sys, "argv", ["compare.py"]), patch.object(compare.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
                     if broken:
@@ -78,6 +79,7 @@ class DriverTests(unittest.TestCase):
                 with (args.output / "summary.csv").open() as handle:
                     row = next(csv.DictReader(handle))
                 self.assertEqual(row["status"], "incomplete_or_failed" if broken else "passed")
+                self.assertEqual(row["device_name"], "Ascend950PR_9579")
                 if broken:
                     self.assertNotIn("speedup", row)
                 else:
@@ -102,6 +104,21 @@ class DriverTests(unittest.TestCase):
                 rows = list(csv.DictReader(handle))
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["speedup"], "1.25")
+
+    def test_block_policy_and_target_cores_reach_worker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            def callback(command):
+                self.assertEqual(command[command.index("--block-policy") + 1], "auto")
+                self.assertEqual(command[command.index("--target-cores") + 1], "24")
+                destination = Path(command[command.index("--output") + 1])
+                (destination / "vecadd_simt.json").write_text(json.dumps(
+                    dict(case="vecadd_simt", status="passed", blocks=24, target_cores=24, block_policy="auto")))
+                return SimpleNamespace(returncode=0)
+            self.run_driver(Path(folder), callback, ["--block-policy", "auto", "--target-cores", "24"])
+            with (Path(folder) / "results.csv").open() as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["blocks"], "24")
+            self.assertEqual(row["block_policy"], "auto")
 
     def test_crash_cannot_reuse_old_success(self):
         with tempfile.TemporaryDirectory() as folder:

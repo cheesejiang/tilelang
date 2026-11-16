@@ -219,3 +219,7 @@ torch_npu.npu_quant_matmul(
 ## 14. 改用TileOPs式profiler计时
 
 用户明确要求改代码：默认timing=profiler，warmup3、samples15、repeats1、三轮独立进程。每次预热/正式调用前1GiB缓存驱逐并同步，清缓存位于profiler窗口外；窗口内一次完整调用，统计全部kernel执行区间并集，避免重叠重复计数。单轮以15样本均值为latency，加速比=eager_latency/TL_latency；三轮对各轮均值取均值。保留median/min/max/stdev和原始trace、解析记录。新增profile_parser.py/profiler_timer.py适配本地TileOPs方法；parser依赖CANN9.2 FFTS格式，缺记录或清缓存混入会失败，不回退event。未导入TileOPs预约与锁频机制；旧event/wall仍可显式选择，不能混用结果。8项主机测试通过；新profiler路径待上板；需重建9579性能基线。
+
+## 15. 9579 blocks优化实验实现
+
+用户授权开始代码。新增eager_baseline/block_config.py与block_tuning.py，扩展compare.py的--block-policy（默认original不变）及--target-cores。支持VecAdd SIMT/SIMD、普通GEMM BF16/FP32/mixedFP32；original=64/32，auto=min(目标AIV或Cube核数,任务tile数)，以及C-1/C/C+1/2C候选。构造DSL前决定B，并传给已有num_blocks参数，无框架Pass或原算子默认改动。block_tuning默认smoke+full、每配置三轮profiler，随机化配置顺序、同seed相同输入；保留正确性/原始trace/环境。summary记录actual physical_cores、target_cores、blocks、policy等，speedup_vs_original=原TL耗时/候选TL耗时，原speedup仍是eager/TL。失败不丢弃或生成有效优化收益。显式目标核数只验证配置逻辑，不模拟其他SKU，也不是已实现无卡离线编译。主机测试后上板待用户完成。

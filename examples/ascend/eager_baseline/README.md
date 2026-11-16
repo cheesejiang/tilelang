@@ -210,3 +210,70 @@ The default reproduces their timing/cache/statistics method. TileOPs reservation
 and clock-management infrastructure are not imported, and the protocol is named
 `ascend-profiler-cold-cache-v1` rather than claiming its locked-clock protocol.
 Re-establish the 9579 baseline; earlier event results are not comparable.
+
+`results.csv` includes `device_name` (the actual device properties name),
+`device` and `arch`; `summary.csv` includes `device_name` for cross-SKU comparison.
+Conflicting device names across rounds invalidate the aggregate.
+
+## 9579 block-configuration experiment
+
+`block_tuning.py` compares the original configurations against pre-lowering
+core-aware configurations for VecAdd SIMT/SIMD and ordinary GEMM
+BF16/FP32/mixed-FP32. No operator default or framework pass is changed.
+
+Policies: `original` (64 for VecAdd, 32 for GEMM), `auto` (minimum of target
+core count and output task count), `c-1`, `c`, `c+1`, `2c`. VecAdd queries AIV
+count and has N/8192 tasks; GEMM queries Cube count and has (M/256)*(N/256)
+output tiles. Only `auto` clamps to task count; other candidates intentionally
+exercise idle/oversubscribed blocks. Each candidate reconstructs the DSL with
+its B so indexing, persistent loops and launch count agree.
+
+Start with a small experiment:
+
+```bash
+python examples/ascend/eager_baseline/block_tuning.py \
+  --profiles smoke --rounds 1 --output blocks-smoke
+```
+
+Then run both existing shape profiles, three independent rounds per candidate:
+
+```bash
+python examples/ascend/eager_baseline/block_tuning.py \
+  --profiles smoke full --rounds 3 --output blocks-9579
+```
+
+Each candidate reuses compare.py's correctness/profiler protocol (3 warmups,
+15 samples per side, 1 GiB eviction), original dtypes/tiles/pipelines and eager
+reference. Jobs run in reproducibly shuffled order. Same case/profile uses
+identical seed and values across policies. Each candidate/round/case is in a
+fresh process; raw profiles, logs, environment and sources remain under runs/.
+The original and `auto` policies are both measured even when their B matches
+another candidate; equality does not imply identical noisy timing measurements.
+
+Top-level `summary.csv` records actual physical cores, target cores, policy,
+chosen blocks, tasks, shape, latencies and two distinct ratios:
+
+- `speedup`: eager latency / candidate TileLang latency.
+- `speedup_vs_original`: original TileLang latency / candidate TileLang latency;
+  >1 means improvement over the original configuration. Baseline failure or
+  candidate failure prevents this comparison; failures remain in the report.
+
+Evaluate each case/shape separately. Candidate-best results are exploratory,
+not proof of a universally optimal policy. Validate a chosen policy with a
+separate output run; do not hide regressions or replace original baseline rows.
+
+For a single policy without the sweep:
+
+```bash
+python examples/ascend/eager_baseline/compare.py \
+  --cases vecadd_simt gemm_bf16 --profile smoke --block-policy auto \
+  --rounds 1 --output blocks-auto
+```
+
+Explicit target specifications can override device-query input:
+`block_tuning.py --target-vector-cores 48 --target-cube-cores 24 ...`, or
+`compare.py --cases gemm_bf16 --block-policy auto --target-cores 24 ...`.
+Actual device core counts are still recorded separately. This checks generated
+configurations on 9579, not performance of another SKU. Configuration selection
+is host-only (block_config.py), but these benchmark commands require an NPU
+for correctness and timing and do not implement a standalone offline compiler.
