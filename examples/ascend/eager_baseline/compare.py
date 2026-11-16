@@ -92,7 +92,7 @@ def prepare(case, args, torch, torch_npu, tilelang):
 
     if case.startswith("vecadd"):
         from example_vecadd import vector_add
-        n = 2**24 if full else 2**20
+        n = 2**30 if full else 2**20
         a, b = tensor((n,)), tensor((n,))
         kernel = compile_kernel(vector_add(n, case.removeprefix("vecadd_")), args, tilelang)
         meta.update(shape=[n], dtype="float32", blocks=64, eager_api="torch.add")
@@ -121,7 +121,7 @@ def prepare(case, args, torch, torch_npu, tilelang):
 
     if case.startswith("gemm_"):
         from example_gemm import gemm
-        n = 4096 if full else 1024
+        n = 8192 if full else 1024
         dtype = torch.bfloat16 if case == "gemm_bf16" else torch.float32
         a, b = tensor((n, n), dtype), tensor((n, n), dtype)
         mixed = case == "gemm_mixed_fp32"
@@ -138,9 +138,15 @@ def prepare(case, args, torch, torch_npu, tilelang):
 
     if case.startswith("deepgemm"):
         from examples.ascend.deepgemm import api
+        # BMM/grouped have no fixed original performance entry; retain their
+        # explicit representative shape. Dense shapes follow ascend_perf_regression.
         n, m, k = (1024, 1024, 1024) if full else (256, 256, 256)
         groups = 8 if full else 2
         fp8 = case == "deepgemm_fp8_quant_matmul"
+        if full and case == "deepgemm_bf16":
+            m, n, k = 4096, 4096, 4096
+        elif full and fp8:
+            m, n, k = 1024, 4096, 7168
         dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
         if case == "deepgemm_bmm":
             a, b = tensor((groups, m, k), dtype), tensor((groups, n, k), dtype)
@@ -215,7 +221,7 @@ def prepare(case, args, torch, torch_npu, tilelang):
         if case == "mha_bf16":
             s1, heads, skv = (4096 if full else 512), 1, (4096 if full else 512)
         else:
-            s1, heads, skv = (1024 if full else 128), (4 if full else 32), (4096 if full else 1024)
+            s1, heads, skv = (8192 if full else 128), 32, (8192 if full else 1024)
         qlen = s1 * heads
         q, k, v = tensor((qlen, d), torch.bfloat16), tensor((skv, d), torch.bfloat16), tensor((skv, d), torch.bfloat16)
         qs = q.view(s1, heads, d).permute(1, 0, 2).unsqueeze(0).contiguous()
@@ -344,25 +350,48 @@ def worker(args):
         check_npu_outputs(actual, torch)
         validate(actual, reference)
         del reference, actual
+        profiler_records = {"tilelang": [], "eager": []}
+        timer = None
+        if args.timing == "profiler":
+            from profiler_timer import ProfilerTimer, PROTOCOL, FLUSH_BYTES
+            timer = ProfilerTimer(args.output / "profiles", torch)
+            row.update(protocol=PROTOCOL, cache_policy="1GiB eviction before every call",
+                       flush_bytes=FLUSH_BYTES, metric="mean_device_busy_union_us")
+        else:
+            row.update(protocol="legacy-" + args.timing, cache_policy="warm-cache, no flush",
+                       metric="median_batch_average_us")
+        row.update(warmup=args.warmup, samples=args.samples, repeats=args.repeats)
         for _ in range(args.warmup):
-            tl()
-            eager()
+            for fn in (tl, eager):
+                if timer:
+                    timer.warmup(fn)
+                else:
+                    fn()
         torch.npu.synchronize()
         samples = {"tilelang": [], "eager": []}
-        for round_id in range(args.samples):
-            for name, fn in (("tilelang", tl), ("eager", eager)) if round_id % 2 == 0 else (("eager", eager), ("tilelang", tl)):
-                samples[name].append(timed(fn, torch, args.repeats, args.timing))
-        # Recheck fresh results after repeated execution (incl. atomic paths).
+        for sample_id in range(args.samples):
+            for name, fn in (("tilelang", tl), ("eager", eager)) if sample_id % 2 == 0 else (("eager", eager), ("tilelang", tl)):
+                if timer:
+                    record = timer.measure(fn, name, sample_id)
+                    profiler_records[name].append(record)
+                    samples[name].append(record["latency_ms"] * 1000)
+                else:
+                    samples[name].append(timed(fn, torch, args.repeats, args.timing))
         actual, reference = tl(), eager()
         torch.npu.synchronize()
         validate(actual, reference)
         for name, values in samples.items():
+            row[name + "_mean_us"] = statistics.mean(values)
             row[name + "_median_us"] = statistics.median(values)
             row[name + "_min_us"] = min(values)
             row[name + "_max_us"] = max(values)
             row[name + "_samples_us"] = values
+            row[name + "_latency_us"] = statistics.mean(values) if timer else statistics.median(values)
+            row[name + "_stdev_us"] = statistics.stdev(values) if len(values) > 1 else 0.0
+        if timer:
+            row["profiler_records"] = profiler_records
         row.update(status="passed", correctness="passed",
-                   speedup=row["eager_median_us"] / row["tilelang_median_us"])
+                   speedup=row["eager_latency_us"] / row["tilelang_latency_us"])
     except Unavailable as error:
         row.update(status="baseline_unavailable", error=str(error))
     except Exception as error:
@@ -373,6 +402,74 @@ def worker(args):
     return 0 if row["status"] != "failed" else 1
 
 
+def run_rounds(args):
+    """Launch whole suites in fresh processes and aggregate only complete passes."""
+    records = []
+    failed = False
+    for index in range(1, args.rounds + 1):
+        # A fresh directory prevents a crashed suite from exposing stale CSV data.
+        directory = args.output / f"round-{index:02d}-{time.time_ns()}"
+        directory.mkdir(parents=True)
+        command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:],
+                   "--rounds", "1", "--output", str(directory)]
+        print(f"Running independent round {index}/{args.rounds}: {directory}", flush=True)
+        with (directory / "suite.log").open("w") as log:
+            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT)
+        rows = {}
+        csv_path = directory / "results.csv"
+        if csv_path.exists():
+            with csv_path.open() as handle:
+                rows = {row["case"]: row for row in csv.DictReader(handle)}
+        failed |= result.returncode != 0
+        for case in dict.fromkeys(args.cases):
+            row = dict(rows.get(case, dict(case=case, status="suite_incomplete")))
+            row.update(round=index, round_directory=str(directory))
+            records.append(row)
+        print(f"Round {index}/{args.rounds} finished, exit={result.returncode}", flush=True)
+    fields = list(dict.fromkeys(key for row in records for key in row))
+    with (args.output / "results.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(records)
+    summary = []
+    for case in dict.fromkeys(args.cases):
+        rows = [row for row in records if row["case"] == case]
+        item = dict(case=case, rounds=args.rounds,
+                    passed_rounds=sum(row["status"] == "passed" for row in rows))
+        valid = all(row["status"] == "passed" for row in rows)
+        metrics = []
+        if valid:
+            try:
+                metrics = [(float(row.get("tilelang_latency_us", row.get("tilelang_median_us"))), float(row.get("eager_latency_us", row.get("eager_median_us")))) for row in rows]
+                valid = all(math.isfinite(t) and math.isfinite(e) and t > 0 and e > 0 for t, e in metrics)
+            except (KeyError, TypeError, ValueError):
+                valid = False
+        item["status"] = "passed" if valid else "incomplete_or_failed"
+        if valid:
+            aggregate = statistics.mean if args.timing == "profiler" else statistics.median
+            tl = aggregate(t for t, e in metrics)
+            eager = aggregate(e for t, e in metrics)
+            ratios = [e / t for t, e in metrics]
+            item.update(tilelang_latency_us=tl, eager_latency_us=eager, speedup=eager / tl,
+                        timing=args.timing, aggregation="mean_of_round_means" if args.timing == "profiler" else "median_of_round_medians",
+                        round_speedup_min=min(ratios), round_speedup_max=max(ratios))
+        else:
+            failed = True
+        summary.append(item)
+    fields = list(dict.fromkeys(key for row in summary for key in row))
+    with (args.output / "summary.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(summary)
+    (args.output / "rounds.json").write_text(json.dumps(dict(
+        rounds=args.rounds, warmup=args.warmup, samples=args.samples, repeats=args.repeats,
+        profile=args.profile, timing=args.timing, summary=summary), indent=2))
+    print(f"Per-round results: {args.output / 'results.csv'}", flush=True)
+    print(f"Independent-round summary: {args.output / 'summary.csv'}", flush=True)
+    if failed:
+        raise SystemExit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", nargs="+", choices=CASES, default=CASES)
@@ -380,10 +477,11 @@ def main():
     parser.add_argument("--attention-baseline", choices=["fusion", "sdpa"], default="fusion")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--arch", default="dav-3510")
-    parser.add_argument("--timing", choices=["event", "wall"], default="event")
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--samples", type=int, default=5)
-    parser.add_argument("--repeats", type=int, default=20)
+    parser.add_argument("--timing", choices=["profiler", "event", "wall"], default="profiler")
+    parser.add_argument("--rounds", type=int, default=3, help="Independent suite processes (default: 3)")
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--samples", type=int, default=15)
+    parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--output", type=Path, default=Path("eager-baseline-9579"))
@@ -393,12 +491,17 @@ def main():
     if args.list:
         print("\n".join(CASES))
         return
-    if min(args.warmup, args.samples, args.repeats) <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
-        parser.error("warmup/samples/repeats/timeout must be positive")
+    if min(args.rounds, args.warmup, args.samples, args.repeats) <= 0 or not math.isfinite(args.timeout) or args.timeout <= 0:
+        parser.error("rounds/warmup/samples/repeats/timeout must be positive")
+    if args.timing == "profiler" and args.repeats != 1:
+        parser.error("profiler timing requires --repeats 1: one call per profile window")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.worker:
         raise SystemExit(worker(args))
+    if args.rounds > 1:
+        run_rounds(args)
+        return
     # Never read an old per-case JSON as a result of a failed new run.
     metadata = {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}
     metadata["started_at_utc"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -415,7 +518,9 @@ def main():
             metadata[tool] = {"error": str(error)}
     (args.output / "environment.json").write_text(json.dumps(metadata, indent=2))
     fields = ["case", "status", "comparison_type", "eager_api", "profile", "shape", "dtype", "blocks",
-              "timing", "tilelang_median_us", "eager_median_us", "speedup", "tilelang_min_us", "tilelang_max_us",
+              "timing", "protocol", "metric", "cache_policy", "flush_bytes", "warmup", "samples", "repeats",
+              "tilelang_latency_us", "eager_latency_us", "tilelang_mean_us", "eager_mean_us",
+              "tilelang_stdev_us", "eager_stdev_us", "tilelang_median_us", "eager_median_us", "speedup", "tilelang_min_us", "tilelang_max_us",
               "eager_min_us", "eager_max_us", "tilelang_samples_us", "eager_samples_us", "note", "error"]
     failed = False
     counts = Counter()

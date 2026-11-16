@@ -100,36 +100,52 @@ performed. Source: [official quant_matmul documentation](https://github.com/Asce
 
 | Family | smoke | full |
 |---|---|---|
-| VecAdd | N=2^20 | N=2^24 |
+| VecAdd | N=2^20 | N=2^30 |
 | RMSNorm | batch=128,d=4096 | batch=4096,d=4096 |
-| GEMM | 1024³ | 4096³ |
-| DeepGEMM dense | 256³ | 1024³ |
+| GEMM | 1024³ | 8192³ |
+| DeepGEMM BF16 dense | 256³ | 4096³ |
+| DeepGEMM FP8 dense | 256³ | M=1024,N=4096,K=7168 |
 | DeepGEMM grouped/BMM | groups=2,M=N=K=256 | groups=8,M=N=K=1024 |
 | MHA | S=512,D=128 | S=4096,D=128 |
-| GQA/manual/backward | S1=128,G=32,S2=1024,D=128 | S1=1024,G=4,S2=4096,D=128 |
+| GQA/manual/backward | S1=128,G=32,S2=1024,D=128 | S1=8192,G=32,S2=8192,D=128 |
 
-Attention full shapes are deliberately smaller than the examples' largest
-8192/G32 configuration, to establish interface compatibility first. Do not
-compare them against historical results with different shapes or output types.
+Full shapes follow the original examples' performance entry defaults for
+VecAdd, RMSNorm, GEMM, MHA and GQA/manual/backward. DeepGEMM dense follows
+`maint/scripts/ascend_perf_regression.py` (BF16 4096³ and FP8 1024x4096x7168).
+BMM/grouped have no corresponding fixed original performance entry, so their
+representative groups=8, M=N=K=1024 shapes are retained. Only shapes are aligned:
+existing comparison dtypes, output semantics and timing contracts are unchanged.
+Do not compare historical full results with these new shapes as one workload.
 
 ## Measurement contract
 
 - Correctness is checked before and after timed repeated execution. GEMM and
   RMSNorm have CPU FP32 references; quant/attention/DeepGEMM are checked against
   their stated eager computation, using existing example-style tolerances.
-- Default `--timing event` uses NPU event intervals around a batch of launches.
-  Host enqueue gaps/device waits can contribute; this is not profiler-isolated
-  instruction time. `--timing wall` separately measures synchronized host elapsed
-  time, including host API/allocator overhead. Never merge the two metrics.
-- Both callables allocate their output(s) on each call. Necessary casts,
-  reductions, output preparation, and all composite operators are timed.
-  Compilation, input generation, reference validation and warmup are excluded.
-- Shared input values are prepared once; eager and TL can use separate,
-  pre-prepared layouts, recorded where applicable. Layout preparation costs are
-  excluded, so this is not a complete application-layout conversion benchmark.
-- Warm-cache, no explicit flush. Each sample batch runs `--repeats` calls.
-  Sample order alternates TL/eager and eager/TL. Defaults: warmup=10, samples=5,
-  repeats=20. Repeat a session into another directory for stability checks.
+- Default `--timing profiler` follows the measurement portion of TileOPs'
+  Ascend protocol: 3 warmups per side, 15 samples per side, one complete call
+  per profiler window. A 1 GiB cache-eviction kernel and synchronization precede
+  every warmup/sample, outside the window. TL/eager order alternates by sample.
+- Timing is the union of device kernel execution intervals, covering all kernels
+  in the callable and counting overlapping AIC/AIV activity only once. Host
+  launch gaps and Python/allocator overhead are not part of this metric.
+  Within-call reuse is preserved; cache eviction is an experimental policy,
+  not proof of complete eviction of every cache level on every SKU.
+- Both callables allocate outputs on each call. Necessary device casts,
+  reductions, output preparation, zeroing and composite kernels remain inside
+  the profiled callable. Compilation, input generation, validation and initial
+  setup are outside measurement.
+- Raw profiler traces and parsed per-sample records are retained. Missing raw
+  records, unresolvable flush calibration or flush work inside a measured
+  window fail the case; no automatic event/CPU timing fallback is used.
+  The raw parser follows TileOPs' CANN 9.2 FFTS record format and must be verified
+  against the installed profiler version on the board.
+- Legacy `--timing event` and `--timing wall` remain explicit alternatives, with
+  no cache eviction. Specify their desired `--samples/--repeats/--warmup`;
+  do not mix their results with profiler measurements. Profiler mode requires
+  `--repeats 1`. The defaults are now warmup=3, samples=15, repeats=1.
+- Shared values and API-specific layouts are prepared before measurement. This
+  is not a full application-layout conversion benchmark.
 - Default Torch FP32 matmul HF32 is disabled if the installed control exists.
   FP32-sensitive cases are marked unavailable if that control cannot be verified.
 - Check profiling separately if exact lower-level library/operator dispatch is
@@ -147,14 +163,16 @@ compare them against historical results with different shapes or output types.
 - `runs/`: fresh worker directories including generated sources where compiled
   through this wrapper. Existing JIT/DeepGEMM internal compilation is not exported.
 
-`speedup = eager_median_us / tilelang_median_us`. Above 1 means TL faster **than
+`speedup = eager_latency_us / tilelang_latency_us`. In profiler mode latency
+is the arithmetic mean of the 15 device-busy samples; median/min/max/stdev
+remain descriptive fields. Above 1 means TL faster **than
 that named baseline**, not necessarily faster than a native fused kernel.
 The report distinguishes passed, unavailable, failed, crash and timeout. No
 speedup is emitted for an unavailable/failed comparison. A previous result is
 never reused as the result of a failed new measurement.
 
-This initial version has host-side syntax/driver checks only until run on the
-9579. It adds benchmark tooling; it does not change TileLang backend code.
+The earlier FP8 case was confirmed working on 9579; this new profiler timing
+path has host-side checks only until separately verified on the board. It adds benchmark tooling; it does not change TileLang backend code.
 
 Split-K GEMM and FP8 group quantization are excluded from this performance
 comparison suite: their cast/composite baselines do not provide the desired
@@ -162,3 +180,33 @@ fused-operator comparison. Their original correctness tests remain included.
 
 RMSNorm uses only the validated fused `npu_rms_norm` baseline; the separate
 eager-composite RMSNorm case has been removed.
+
+## Independent rounds
+
+The driver defaults to `--rounds 3`. Each round starts a fresh suite process,
+and each case runs in its own worker process. Each round repeats correctness,
+3 cold-cache warmup calls per side, 15 alternating single-call profiler
+samples per side, and post-timing correctness checks. Rounds do not clear
+compiler caches or reset the device. Device clocks are not locked by this
+driver; run on an idle device with a consistent clock/power policy.
+Use `--rounds 1` for a single suite, or override `--warmup/--samples/--repeats`.
+
+```bash
+python examples/ascend/eager_baseline/compare.py \
+  --profile full --rounds 3 --output eager-full-three-rounds
+```
+
+Each `round-XX-<timestamp>/` contains its own environment.json, results.csv,
+suite.log, case logs, JSON and generated sources. Top-level results.csv retains
+all round rows. summary.csv reports per-case arithmetic mean of the round mean latencies in
+profiler mode, `speedup = mean(eager round means) / mean(TileLang round means)`,
+and min/max of individual round speedups. Any missing, failed, timed-out or
+unavailable round prevents a valid aggregate speedup; it is not dropped.
+rounds.json records the protocol arguments and summary. Cross-SKU retention
+and pass thresholds are not calculated automatically.
+
+Reference: local TileOPs `benchmarks/ascend/timing.py` and `profile_parser.py`.
+The default reproduces their timing/cache/statistics method. TileOPs reservation
+and clock-management infrastructure are not imported, and the protocol is named
+`ascend-profiler-cold-cache-v1` rather than claiming its locked-clock protocol.
+Re-establish the 9579 baseline; earlier event results are not comparable.

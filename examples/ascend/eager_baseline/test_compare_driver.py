@@ -41,13 +41,47 @@ class DriverTests(unittest.TestCase):
 
     def run_driver(self, folder, callback):
         argv = ["compare.py", "--cases", "vecadd_simt", "--profile", "full",
-                "--samples", "3", "--repeats", "5", "--output", str(folder)]
+                "--rounds", "1", "--timing", "event", "--samples", "3", "--repeats", "5", "--output", str(folder)]
         def run(command, **kwargs):
             if "--worker" not in command:
                 return SimpleNamespace(returncode=0, stdout="host-test", stderr="")
             return callback(command)
         with patch.object(sys, "argv", argv), patch.object(compare.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
             compare.main()
+
+    def test_three_rounds_keep_failures_and_aggregate_complete_cases(self):
+        for broken, timing in ((False, "event"), (True, "event"), (False, "profiler")):
+            with self.subTest(broken=broken, timing=timing), tempfile.TemporaryDirectory() as folder:
+                args = SimpleNamespace(output=Path(folder), rounds=3, cases=["vecadd_simt"],
+                                       warmup=10, samples=5, repeats=1, profile="full", timing=timing)
+                calls = []
+                def run(command, **kwargs):
+                    destination = Path(command[-1])
+                    self.assertEqual(command[-4:-2], ["--rounds", "1"])
+                    calls.append(destination)
+                    if broken and len(calls) == 2:
+                        return SimpleNamespace(returncode=-6)
+                    with (destination / "results.csv").open("w", newline="") as handle:
+                        writer = csv.DictWriter(handle, fieldnames=["case", "status", "tilelang_median_us", "eager_median_us"])
+                        writer.writeheader()
+                        writer.writerow(dict(case="vecadd_simt", status="passed", tilelang_median_us=[10, 20, 90][len(calls) - 1], eager_median_us=40))
+                    return SimpleNamespace(returncode=0)
+                with patch.object(sys, "argv", ["compare.py"]), patch.object(compare.subprocess, "run", side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                    if broken:
+                        with self.assertRaises(SystemExit):
+                            compare.run_rounds(args)
+                    else:
+                        compare.run_rounds(args)
+                self.assertEqual(len(set(calls)), 3)
+                with (args.output / "results.csv").open() as handle:
+                    self.assertEqual(len(list(csv.DictReader(handle))), 3)
+                with (args.output / "summary.csv").open() as handle:
+                    row = next(csv.DictReader(handle))
+                self.assertEqual(row["status"], "incomplete_or_failed" if broken else "passed")
+                if broken:
+                    self.assertNotIn("speedup", row)
+                else:
+                    self.assertEqual(float(row["speedup"]), 1.0 if timing == "profiler" else 2.0)
 
     def test_fresh_result_and_configuration(self):
         with tempfile.TemporaryDirectory() as folder:

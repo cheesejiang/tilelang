@@ -207,3 +207,15 @@ torch_npu.npu_quant_matmul(
 ## 11. FP8 上板新增错误与修正
 
 用户报告原生接口报错 `Input x2 tensor and scale tensor's transpose are not same`。包装中x2=b.T保留转置视图，但native_sb在transpose后调用contiguous，导致转置布局不一致。已删除B scale的contiguous，让它与x2同为转置视图，并增加CPU stride检查（B scale stride=(2,K/32,1)）。这是测试包装修正，未改原始算子；修正后仍待9579复测。
+
+## 12. full形状更新
+
+按用户要求，full对齐原始性能入口：VecAdd N=2^30；RMSNorm batch4096,d4096；GEMM8192³；MHA S4096,D128；GQA/manual/backward S1=8192,G32,S2=8192,D128。DeepGEMM dense按原性能回归清单：BF164096³，FP8 M1024,N4096,K7168。BMM/grouped没有对应固定原性能入口，保留groups8、每组1024³作为代表形状并明确标注。smoke不变；仅对齐形状，原对照dtype/语义不变。旧full结果不能与新full混作同一工作负载。用户已确认新FP8用例在9579复测通过（该确认对应此次扩大full形状之前）。
+
+## 13. 默认三轮独立转测
+
+用户要求自动三轮。compare.py新增--rounds默认3，每轮新suite进程，每用例新worker；每轮独立目录保存环境和日志，根results.csv保留所有轮次，summary.csv对各轮median耗时取median再计算eager/TL比值，保留逐轮比值min/max。任一轮失败/缺失/对照不可用不生成有效汇总加速比；--rounds1可单轮。保留原预热10、5组×20次event协议。已检查本地TileOPs Ascend方法：预热3、采样15、每次1GiB清缓存、profiler设备busy区间并集、均值；其计时口径不同，当前未声称复现该协议。新增三轮成功和失败汇总主机测试，5项测试通过；未在本机NPU运行。跨型号保持率仍未自动计算。
+
+## 14. 改用TileOPs式profiler计时
+
+用户明确要求改代码：默认timing=profiler，warmup3、samples15、repeats1、三轮独立进程。每次预热/正式调用前1GiB缓存驱逐并同步，清缓存位于profiler窗口外；窗口内一次完整调用，统计全部kernel执行区间并集，避免重叠重复计数。单轮以15样本均值为latency，加速比=eager_latency/TL_latency；三轮对各轮均值取均值。保留median/min/max/stdev和原始trace、解析记录。新增profile_parser.py/profiler_timer.py适配本地TileOPs方法；parser依赖CANN9.2 FFTS格式，缺记录或清缓存混入会失败，不回退event。未导入TileOPs预约与锁频机制；旧event/wall仍可显式选择，不能混用结果。8项主机测试通过；新profiler路径待上板；需重建9579性能基线。
