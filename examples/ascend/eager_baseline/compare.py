@@ -19,10 +19,10 @@ import traceback
 
 
 CASES = [
-    "vecadd_simt", "vecadd_simd", "rmsnorm_fused", "rmsnorm_composite",
-    "gemm_bf16", "gemm_fp32", "gemm_mixed_fp32", "splitk_atomic", "splitk_deterministic",
-    "quant_simt", "quant_simd", "deepgemm_bf16", "deepgemm_bmm", "deepgemm_grouped",
-    "deepgemm_fp8_composite", "mha_bf16", "gqa", "gqa_manual", "gqa_backward",
+    "vecadd_simt", "vecadd_simd", "rmsnorm_fused",
+    "gemm_bf16", "gemm_fp32", "gemm_mixed_fp32",
+    "deepgemm_bf16", "deepgemm_bmm", "deepgemm_grouped",
+    "deepgemm_fp8_quant_matmul", "mha_bf16", "gqa", "gqa_manual", "gqa_backward",
 ]
 
 
@@ -35,6 +35,30 @@ def require(module, name):
     if value is None:
         raise Unavailable(f"Required eager interface missing: {name}")
     return value
+
+
+def fp8_scales(m, n, k, torch, device):
+    """Same non-unit K32 E8M0 values in each interface's physical layout.
+
+    TL NT API: A [M,K/64], B [N,K/64] int16. Both logical
+    scale tensors have MN-contiguous storage; NT keeps both inputs as given.
+    ACL MX: A [M,K/64,2], B [K/64,N,2] raw uint8 E8M0 encodings.
+    """
+    if k % 64:
+        raise ValueError("This benchmark requires K divisible by 64")
+    def operand(rows, phase):
+        exponent = (torch.arange(rows, device=device)[:, None]
+                    + torch.arange(k // 32, device=device)[None, :] + phase) % 3 + 126
+        raw = exponent.to(torch.uint8).contiguous()
+        # Pack adjacent K32 exponents into one int16, then prepare the
+        # MN-contiguous layout expected by the DeepGEMM public API.
+        packed = raw.view(torch.int16).T.contiguous().T
+        native = raw.view(rows, k // 64, 2)
+        decoded = torch.pow(2.0, exponent.float() - 127)
+        return packed, native, decoded
+    sa, native_a, decoded_a = operand(m, 0)
+    sb, native_b, decoded_b = operand(n, 1)
+    return sa, sb, native_a, native_b.transpose(0, 1).contiguous(), decoded_a, decoded_b
 
 
 def compile_kernel(func, args, tilelang, out_idx=-1, fast_math=False):
@@ -72,21 +96,15 @@ def prepare(case, args, torch, torch_npu, tilelang):
         meta.update(shape=[n], dtype="float32", blocks=64, eager_api="torch.add")
         return lambda: kernel(a, b), lambda: torch.add(a, b), lambda x, y: close(x, y, 0, 0), meta
 
-    if case.startswith("rmsnorm"):
+    if case == "rmsnorm_fused":
         from example_rmsnorm import rms_norm_fwd
         batch, d, eps = (4096 if full else 128), 4096, 1e-6
         x, weight = tensor((batch, d)), tensor((d,))
         kernel = compile_kernel(rms_norm_fwd(batch, d), args, tilelang, out_idx=[1, 3])
         tl = lambda: kernel(x.flatten(), weight, eps)
-        if case.endswith("fused"):
-            op = require(torch_npu, "npu_rms_norm")
-            eager = lambda: op(x, weight, eps)
-            meta.update(comparison_type="eager_fused", eager_api="torch_npu.npu_rms_norm")
-        else:
-            def eager():
-                rstd = torch.rsqrt(x.square().mean(-1) + eps)
-                return x * rstd[:, None] * weight, rstd
-            meta.update(comparison_type="eager_composite", eager_api="square/mean/add/rsqrt/mul/mul")
+        op = require(torch_npu, "npu_rms_norm")
+        eager = lambda: op(x, weight, eps)
+        meta.update(comparison_type="eager_fused", eager_api="torch_npu.npu_rms_norm")
         def validate(actual, expected):
             # Independently check both implementations against the FP32 CPU formula.
             xc, wc = x.cpu(), weight.cpu()
@@ -116,44 +134,11 @@ def prepare(case, args, torch, torch_npu, tilelang):
                     eager_api="torch.mm", hf32=False)
         return lambda: kernel(a, b), lambda: torch.mm(a, b.T), validate, meta
 
-    if case.startswith("splitk"):
-        from example_gemm_splitk import gemm_splitk
-        m, n, k = 512, 512, 8192 if full else 1024
-        a, b = tensor((m, k), torch.bfloat16), tensor((n, k), torch.bfloat16)
-        kernel = compile_kernel(gemm_splitk(m, k, n, split_k=4, deterministic=case.endswith("deterministic")), args, tilelang)
-        def eager():
-            return torch.mm(a.float(), b.float().T)
-        meta.update(shape=[m, n, k], dtype="bfloat16", output_dtype="float32", blocks=16,
-                    comparison_type="eager_composite", eager_api="BF16→FP32 casts + FP32 torch.mm",
-                    note="Not a native BF16 matmul throughput comparison; casts are timed")
-        return lambda: kernel(a, b), eager, lambda x, y: close(x, y, 1e-2, 1e-2), meta
-
-    if case.startswith("quant"):
-        from example_per_token_cast_to_fp8 import per_token_cast_to_fp8
-        m, n = (8192 if full else 128), 8192
-        x = tensor((m, n))
-        x[0].zero_()
-        # The existing JIT factory uses environment target defaults set by worker.
-        kernel = per_token_cast_to_fp8(m, n, case.removeprefix("quant_"))
-        def eager():
-            groups = x.view(m, n // 128, 128)
-            amax = groups.abs().float().amax(-1).clamp_min(0.0001)
-            q = (groups * (448.0 / amax[..., None])).to(torch.float8_e4m3fn)
-            return q.reshape(m, n).contiguous(), amax / 448.0
-        def validate(actual, expected):
-            from tilelang.utils.tensor import torch_assert_close
-            torch_assert_close(actual[0].float(), expected[0].float(), rtol=0.01, atol=0.01)
-            close(actual[1], expected[1], 1e-5, 1e-7)
-        meta.update(shape=[m, n], dtype="float32", output_dtype="float8_e4m3fn + float32 scale",
-                    comparison_type="eager_composite", eager_api="view/abs/amax/clamp/mul/cast/contiguous",
-                    group_size=128, note="Not dynamic_block_quant; preserves FP32 and amax floor")
-        return lambda: kernel(x), eager, validate, meta
-
     if case.startswith("deepgemm"):
         from examples.ascend.deepgemm import api
         n, m, k = (1024, 1024, 1024) if full else (256, 256, 256)
         groups = 8 if full else 2
-        fp8 = case == "deepgemm_fp8_composite"
+        fp8 = case == "deepgemm_fp8_quant_matmul"
         dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
         if case == "deepgemm_bmm":
             a, b = tensor((groups, m, k), dtype), tensor((groups, n, k), dtype)
@@ -182,16 +167,35 @@ def prepare(case, args, torch, torch_npu, tilelang):
         else:
             a, b = tensor((m, k), dtype), tensor((n, k), dtype)
             if fp8:
-                # Unit K32 scales, packed in the example's UE8M0 representation.
-                sa = torch.full(((k + 63) // 64, m), 0x7F7F, dtype=torch.int16, device="npu")
-                sb = torch.full(((k + 63) // 64, n), 0x7F7F, dtype=torch.int16, device="npu")
+                op = require(torch_npu, "npu_quant_matmul")
+                e8m0 = getattr(torch_npu, "float8_e8m0fnu", None)
+                if e8m0 is None:
+                    e8m0 = require(torch, "float8_e8m0fnu")
+                sa, sb, native_sa, native_sb, decoded_a, decoded_b = fp8_scales(m, n, k, torch, "npu")
+                native_b = b.T
                 def tl():
                     out = torch.empty((m, n), dtype=torch.float32, device="npu")
-                    api.fp8_gemm_nt((a, sa), (b, sb), out)
+                    api.fp8_gemm_nt((a, sa), (b, sb), out, recipe=(1, 1, 32))
                     return out
-                eager = lambda: torch.mm(a.float(), b.float().T)
-                meta.update(comparison_type="eager_composite", eager_api="FP8→FP32 casts + FP32 mm",
-                            note="Unit K32 scales only; not FP8 hardware performance or non-unit-scale coverage")
+                def eager():
+                    return op(a, native_b, native_sb, pertoken_scale=native_sa,
+                              pertoken_scale_dtype=e8m0, scale_dtype=e8m0,
+                              group_sizes=[1, 1, 32], output_dtype=torch.float32)
+                # Independent CPU formula validates both layout translations.
+                # Casts/dequantization are validation only, never the timed baseline.
+                reference = ((a.cpu().float() * decoded_a.cpu().repeat_interleave(32, dim=1))
+                             @ (b.cpu().float() * decoded_b.cpu().repeat_interleave(32, dim=1)).T)
+                def validate(actual, expected):
+                    close(actual.cpu(), reference, 1e-3, 1e-3)
+                    close(expected.cpu(), reference, 1e-3, 1e-3)
+                meta.update(shape=[m, n, k], output_dtype="float32", dtype=str(dtype),
+                            configuration="example_runtime_core_selection", comparison_type="eager_fused",
+                            eager_api="torch_npu.npu_quant_matmul", group_sizes=[1, 1, 32],
+                            scale_values=[0.5, 1.0, 2.0],
+                            scale_layouts={"tilelang_A": list(sa.shape), "tilelang_B": list(sb.shape),
+                                           "eager_A": list(native_sa.shape), "eager_B": list(native_sb.shape)},
+                            note="FP8 operands and E8M0 K32 scales; both FP32 outputs; scale packing outside timing")
+                return tl, eager, validate, meta
             else:
                 def tl():
                     out = torch.empty((m, n), dtype=torch.bfloat16, device="npu")
@@ -317,7 +321,7 @@ def worker(args):
         hf32_controlled = matmul is not None and hasattr(matmul, "allow_hf32")
         if hf32_controlled:
             matmul.allow_hf32 = False
-        elif args.worker.startswith(("gemm_fp32", "gemm_mixed", "splitk", "deepgemm_fp8")):
+        elif args.worker.startswith(("gemm_fp32", "gemm_mixed")):
             raise Unavailable("Cannot verify/disable Torch-NPU FP32 matmul HF32 mode")
         props = torch.npu.get_device_properties(args.device)
         row.update(device=str(props), tilelang_path=tilelang.__file__, arch=args.arch,

@@ -39,15 +39,12 @@ can still require external recovery before subsequent processes can run.
 |---|---|---|
 | `vecadd_simt`, `vecadd_simd` | `torch.add` | standard; FP32, original 64 blocks |
 | `rmsnorm_fused` | `torch_npu.npu_rms_norm` | fused; FP32, epsilon=1e-6, validates Y and RSTD; unsupported FP32 is reported, not cast |
-| `rmsnorm_composite` | square/mean/add/rsqrt/mul/mul | composite; separate explicit alternative |
 | `gemm_bf16` | BF16 `torch.mm` | standard; BF16 output on both sides, original 32 blocks |
 | `gemm_fp32`, `gemm_mixed_fp32` | FP32 `torch.mm` | standard; FP32 inputs/outputs, HF32 disabled; mixed explicitly enabled for TL |
-| `splitk_atomic`, `splitk_deterministic` | BF16→FP32 casts + FP32 `torch.mm` | composite, FP32 output; casts included; **not native BF16 matmul throughput** |
-| `quant_simt`, `quant_simd` | FP32 view/abs/amax/clamp/scale/FP8 cast | composite; 128-element groups, amax floor 1e-4, FP32 scale; includes zero row |
 | `deepgemm_bf16` | BF16 `torch.mm` | standard; BF16 output on both sides |
 | `deepgemm_bmm` | BF16 `torch.bmm` | standard; BF16 output, transpose view pre-created by operands |
 | `deepgemm_grouped` | `torch_npu.npu_grouped_matmul` | fused candidate; M-group ends and supported output dtype must pass installed API probe; no silent Python-loop fallback |
-| `deepgemm_fp8_composite` | FP8→FP32 casts + FP32 `torch.mm` | composite with **unit K32 scales only**, not a quant_matmul or FP8 peak-throughput comparison |
+| `deepgemm_fp8_quant_matmul` | `torch_npu.npu_quant_matmul` | fused MX FP8 E4M3FN, K32 E8M0 scales, FP32 outputs; non-unit scales 0.5/1/2 |
 | `mha_bf16` | `npu_fusion_attention`, or explicitly selected SDPA | uses existing attention builder with **BF16 output**, unlike original MHA wrapper's FP32 output; comparison configuration is recorded |
 | `gqa`, `gqa_manual` | `npu_fusion_attention`, or explicitly selected SDPA | BF16 output, same logical GQA, 32 TL blocks; pre-created contiguous Q head layout outside timing |
 | `gqa_backward` | NPU SDPA `autograd.grad` | composite/framework backward; forward excluded; TL timing includes Delta + dQ zero + fused backward; no accumulated `.grad` |
@@ -58,11 +55,44 @@ Other exceptions, including unsupported dtype/shape, numerical errors and device
 errors, are recorded as `failed` with traceback rather than guessed from error
 strings or silently substituted. Inspect the log to determine the cause.
 
-The first version does **not** claim an installed, validated direct
-`npu_quant_matmul` match for DeepGEMM's UE8M0 representation, nor a direct FP32
-`npu_dynamic_block_quant` counterpart. Composite rows are clearly named. It also
-does not benchmark every DeepGEMM layout/epilogue/random-rounding variant; those
-remain in the full correctness baseline.
+The FP8 case calls `npu_quant_matmul` directly with `group_sizes=[1,1,32]`,
+raw uint8 E8M0 scales and explicit `scale_dtype`/`pertoken_scale_dtype`.
+It never falls back to FP32 matmul. API absence is recorded as unavailable;
+installed-version signature or device errors are recorded with a traceback.
+This suite does not benchmark every DeepGEMM layout/epilogue/random-rounding
+variant; those remain in the full correctness baseline.
+
+### FP8 direct comparison
+
+```bash
+python examples/ascend/eager_baseline/compare.py \
+  --cases deepgemm_fp8_quant_matmul --profile smoke \
+  --output eager-fp8-smoke
+
+python examples/ascend/eager_baseline/compare.py \
+  --cases deepgemm_fp8_quant_matmul --profile full \
+  --output eager-fp8-full
+```
+
+Both operands use FP8 E4M3FN. Per-K32 scale values vary across rows and K groups
+among 0.5, 1, and 2; these are exactly representable in E8M0. Both outputs are
+FP32. An independent CPU FP32 dequantization/matmul reference checks each side
+before/after timing. CPU reference work is not timed.
+
+Scale layouts are prepared outside timing from the same exponent values:
+
+- TileLang NT API: A `[M,K/64]` packed int16, M-contiguous physical storage;
+  B `[N,K/64]` packed int16, N-contiguous physical storage. The public
+  NT API keeps these logical shapes; it transposes scales internally for the kernel.
+- Native API: A `[M,K/64,2]`, B `[K/64,N,2]`, uint8 E8M0 encodings, interpreted
+  using the explicit E8M0 dtype arguments. Weight is an ND transposed view.
+
+The former composite case's scale dimensions did not match the public
+DeepGEMM API. This replacement corrects the layouts; an unequal-M/N CPU test
+checks byte packing, transposition, and decoded values. It does not establish
+NPU kernel compatibility. Any operand-format/version restriction on the board
+must be inspected from that case's log; no silent format/type substitution is
+performed. Source: [official quant_matmul documentation](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_quant_matmul.md).
 
 ## Shapes
 
@@ -71,8 +101,6 @@ remain in the full correctness baseline.
 | VecAdd | N=2^20 | N=2^24 |
 | RMSNorm | batch=128,d=4096 | batch=4096,d=4096 |
 | GEMM | 1024³ | 4096³ |
-| Split-K | M=N=512,K=1024,split=4 | M=N=512,K=8192,split=4 |
-| Quant | M=128,N=8192 | M=N=8192 |
 | DeepGEMM dense | 256³ | 1024³ |
 | DeepGEMM grouped/BMM | groups=2,M=N=K=256 | groups=8,M=N=K=1024 |
 | MHA | S=512,D=128 | S=4096,D=128 |
@@ -105,7 +133,7 @@ compare them against historical results with different shapes or output types.
 - Check profiling separately if exact lower-level library/operator dispatch is
   required. NPU output checks do not prove that no internal CPU fallback occurred.
 - Input generation and tensor allocation can require more memory than the
-  nominal input/output size; full quantization and backward are not memory-limit
+  nominal input/output size; full-size workloads are not memory-limit
   tests. No GM auto-splitting is implemented.
 
 ## Files to return
@@ -125,3 +153,10 @@ never reused as the result of a failed new measurement.
 
 This initial version has host-side syntax/driver checks only until run on the
 9579. It adds benchmark tooling; it does not change TileLang backend code.
+
+Split-K GEMM and FP8 group quantization are excluded from this performance
+comparison suite: their cast/composite baselines do not provide the desired
+fused-operator comparison. Their original correctness tests remain included.
+
+RMSNorm uses only the validated fused `npu_rms_norm` baseline; the separate
+eager-composite RMSNorm case has been removed.

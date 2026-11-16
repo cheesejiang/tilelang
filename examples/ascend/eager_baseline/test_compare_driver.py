@@ -16,6 +16,27 @@ import compare
 
 
 class DriverTests(unittest.TestCase):
+    def test_fp8_scale_layouts_encode_identical_nonunit_values(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("CPU Torch is required for the bit-packing check")
+        m, n, k = 3, 5, 192
+        sa, sb, native_a, native_b, decoded_a, decoded_b = compare.fp8_scales(m, n, k, torch, "cpu")
+        self.assertEqual(tuple(sa.shape), (m, k // 64))
+        self.assertEqual(tuple(sb.shape), (n, k // 64))
+        self.assertEqual(sa.stride(), (1, m))
+        self.assertEqual(sb.stride(), (1, n))
+        self.assertEqual(tuple(native_a.shape), (m, k // 64, 2))
+        self.assertEqual(tuple(native_b.shape), (k // 64, n, 2))
+        for packed, native, decoded, rows in ((sa, native_a, decoded_a, m),
+                                               (sb, native_b.transpose(0, 1), decoded_b, n)):
+            raw = native.contiguous().view(rows, k // 32)
+            unpacked = packed.contiguous().view(torch.uint8).view(rows, k // 32)
+            torch.testing.assert_close(unpacked, raw, rtol=0, atol=0)
+            torch.testing.assert_close(torch.pow(2.0, raw.float() - 127), decoded, rtol=0, atol=0)
+            self.assertEqual(set(decoded.flatten().tolist()), {0.5, 1.0, 2.0})
+
     def run_driver(self, folder, callback):
         argv = ["compare.py", "--cases", "vecadd_simt", "--profile", "full",
                 "--samples", "3", "--repeats", "5", "--output", str(folder)]
