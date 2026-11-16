@@ -1,0 +1,277 @@
+{
+  "scope": "Existing Python sources excluding ub_layout_ablation/, layout_workloads/, and hardware_sensitivity/, and redundant example_simd_register_store.py (covered by VecAdd SIMD); inventory, not proof of complete API coverage",
+  "files": [
+    {
+      "path": "deepgemm/__init__.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/api.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "_check_quantized_pair;_dtype_name;_same_device;_get_major_type_ab;_check_major_type_cd;_num_cores;_copy_source;_gemm_early_return;_get_outer_stride;_expected_k_from_ks;_get_gemm_desc;_physical;_compiled_shape;_fp8_operand;_scale_recipe;_get_recipe;_check_sf_layout;_transform_sf_into_required_layout;_prepare_scales;_launch_gemm;_make_bf16_gemm;_make_fp8_gemm;bf16_bmm;fp8_bmm;einsum;fp8_einsum;_make_m_grouped_bf16_gemm_contiguous;_make_m_grouped_fp8_gemm_contiguous;k_grouped_bf16_gemm_tn_contiguous;k_grouped_fp8_gemm_tn_contiguous;k_grouped_fp8_gemm_nt_contiguous",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/bench_deepgemm.py",
+      "role": "benchmark_entry",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "run_regression_perf;run_transform_sf_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/config.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "ceil_div;select_gemm_config;execution_config;select_transform_sf_config",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/epilogue.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "resolve;arguments",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/__init__.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/bf16_gemm.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "_build_kernel;build_bf16_gemm;build_bf16_batched_gemm;build_bf16_m_grouped_gemm;build_bf16_k_grouped_gemm",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/common.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "align_up;clamp;physical_shape;matrix_region;scale_region",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/compute.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "make_compute",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/copy.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "make_gm_to_l1_copy;make_l1_to_l0_copy;make_scale_copy",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/epilogue.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "apply_alpha;add_bias;zero_empty_groups;quantize_fp8;stochastic_round_bf16;make_store_output",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/fp8_gemm.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "_build_kernel;build_fp8_gemm;build_fp8_batched_gemm;build_fp8_m_grouped_gemm;build_fp8_k_grouped_gemm",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/kernels/transform_sf.py",
+      "role": "operator_support",
+      "correctness_entry": "deepgemm/test_deepgemm.py；导出 API 未测组合单列",
+      "performance_group": "P03/P05/P06；scale转换辅助",
+      "top_level_functions": "_transpose_16rows;build_transform_sf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "deepgemm/test_deepgemm.py",
+      "role": "correctness_test",
+      "correctness_entry": "deepgemm/test_deepgemm.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "_input;test_bf16_dense_alpha_accumulation;test_fp8_batched_scales;test_bf16_m_grouped_padding;test_fp8_k_grouped_scale_tail;test_bf16_dense_bias;test_fp8_quantization_epilogue;test_stochastic_rounding;test_transform_sf_strided;test_transform_sf_group_padding;test_transform_sf_passthrough_and_empty",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "example_gemm.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_gemm.py",
+      "performance_group": "P03",
+      "top_level_functions": "gemm;ref_program;run_regression_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "example_gemm_splitk.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_gemm_splitk.py",
+      "performance_group": "P04",
+      "top_level_functions": "gemm_splitk;ref_program;run_regression_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "example_per_token_cast_to_fp8.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_per_token_cast_to_fp8.py",
+      "performance_group": "P07",
+      "top_level_functions": "per_token_cast_simt;per_token_cast_simd;ref_program;per_token_cast_to_fp8;run_regression_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "example_rmsnorm.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_rmsnorm.py",
+      "performance_group": "P02",
+      "top_level_functions": "rms_norm_fwd;ref_program;run_regression_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "example_vecadd.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_vecadd.py",
+      "performance_group": "P01",
+      "top_level_functions": "vector_add;run_regression_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/core.py",
+      "role": "operator_builder",
+      "correctness_entry": "经 flash_attention 对应 test_*.py",
+      "performance_group": "P08/P09",
+      "top_level_functions": "flash_attention_fwd",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/core_bwd.py",
+      "role": "operator_builder",
+      "correctness_entry": "经 flash_attention 对应 test_*.py",
+      "performance_group": "P08/P09",
+      "top_level_functions": "flash_attention_bwd_preprocess;flash_attention_bwd_fused_dq_atomic_staged",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/example_gqa.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_gqa.py",
+      "performance_group": "P08",
+      "top_level_functions": "gqa;ref_program;run_regression_perf;bench_torch_gqa",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/example_gqa_bwd.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_gqa_bwd.py",
+      "performance_group": "P09",
+      "top_level_functions": "gqa_fwd_with_lse;ref_backward;run_correctness;_profile_msprof;_print_pipe_utilization;run_regression_perf;run_performance_comparison",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/example_gqa_manual_schedule.py",
+      "role": "operator_entry",
+      "correctness_entry": "flash_attention/test_gqa_manual_schedule.py",
+      "performance_group": "P08辅助",
+      "top_level_functions": "manual_schedule_gqa;check_correctness;run_regression_perf",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/example_mha.py",
+      "role": "operator_entry",
+      "correctness_entry": "test_mha.py",
+      "performance_group": "P08",
+      "top_level_functions": "mha;ref_program;run_regression_perf;bench_torch_mha",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/test_gqa.py",
+      "role": "correctness_test",
+      "correctness_entry": "flash_attention/test_gqa.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_gqa",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/test_gqa_bwd.py",
+      "role": "correctness_test",
+      "correctness_entry": "flash_attention/test_gqa_bwd.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_gqa_bwd",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/test_gqa_manual_schedule.py",
+      "role": "correctness_test",
+      "correctness_entry": "flash_attention/test_gqa_manual_schedule.py",
+      "performance_group": "P08辅助",
+      "top_level_functions": "test_gqa_manual_schedule",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "flash_attention/test_mha.py",
+      "role": "correctness_test",
+      "correctness_entry": "flash_attention/test_mha.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_mha",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "test_gemm.py",
+      "role": "correctness_test",
+      "correctness_entry": "test_gemm.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_gemm;test_gemm_accumulate;test_gemm_block_partition",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "test_gemm_splitk.py",
+      "role": "correctness_test",
+      "correctness_entry": "test_gemm_splitk.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_gemm_splitk",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "test_per_token_cast_to_fp8.py",
+      "role": "correctness_test",
+      "correctness_entry": "test_per_token_cast_to_fp8.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_per_token_cast_to_fp8",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "test_rmsnorm.py",
+      "role": "correctness_test",
+      "correctness_entry": "test_rmsnorm.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_rmsnorm",
+      "execution_status": "not_run_in_this_task"
+    },
+    {
+      "path": "test_vecadd.py",
+      "role": "correctness_test",
+      "correctness_entry": "test_vecadd.py",
+      "performance_group": "see_BASELINE_PLAN",
+      "top_level_functions": "test_vecadd;test_vecadd_block_partition",
+      "execution_status": "not_run_in_this_task"
+    }
+  ]
+}
