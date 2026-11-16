@@ -29,6 +29,8 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(sb.stride(), (1, n))
         self.assertEqual(tuple(native_a.shape), (m, k // 64, 2))
         self.assertEqual(tuple(native_b.shape), (k // 64, n, 2))
+        self.assertEqual(native_b.stride(), (2, k // 32, 1))
+        self.assertFalse(native_b.is_contiguous())
         for packed, native, decoded, rows in ((sa, native_a, decoded_a, m),
                                                (sb, native_b.transpose(0, 1), decoded_b, n)):
             raw = native.contiguous().view(rows, k // 32)

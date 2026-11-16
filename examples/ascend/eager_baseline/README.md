@@ -85,7 +85,9 @@ Scale layouts are prepared outside timing from the same exponent values:
   B `[N,K/64]` packed int16, N-contiguous physical storage. The public
   NT API keeps these logical shapes; it transposes scales internally for the kernel.
 - Native API: A `[M,K/64,2]`, B `[K/64,N,2]`, uint8 E8M0 encodings, interpreted
-  using the explicit E8M0 dtype arguments. Weight is an ND transposed view.
+  using the explicit E8M0 dtype arguments. Weight and B scales both retain
+  transposed views: do not make only the B scales contiguous, since the native
+  interface requires their transpose layouts to agree.
 
 The former composite case's scale dimensions did not match the public
 DeepGEMM API. This replacement corrects the layouts; an unequal-M/N CPU test

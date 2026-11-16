@@ -58,7 +58,9 @@ def fp8_scales(m, n, k, torch, device):
         return packed, native, decoded
     sa, native_a, decoded_a = operand(m, 0)
     sb, native_b, decoded_b = operand(n, 1)
-    return sa, sb, native_a, native_b.transpose(0, 1).contiguous(), decoded_a, decoded_b
+    # Preserve the transposed view: native x2=b.T and its MX scales must
+    # agree on transpose layout, not merely on logical dimensions.
+    return sa, sb, native_a, native_b.transpose(0, 1), decoded_a, decoded_b
 
 
 def compile_kernel(func, args, tilelang, out_idx=-1, fast_math=False):
