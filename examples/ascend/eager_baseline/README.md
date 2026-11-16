@@ -277,3 +277,58 @@ Actual device core counts are still recorded separately. This checks generated
 configurations on 9579, not performance of another SKU. Configuration selection
 is host-only (block_config.py), but these benchmark commands require an NPU
 for correctness and timing and do not implement a standalone offline compiler.
+
+## Logical-block to physical-core diagnosis
+
+Run the independent small BF16 Cube GEMM diagnostic, without external msprof:
+
+```bash
+python examples/ascend/eager_baseline/diagnose_block_mapping.py \
+  --blocks 16 28 29 32 56 --size 1024 --output block-mapping
+```
+
+For the first comparison only:
+
+```bash
+python examples/ascend/eager_baseline/diagnose_block_mapping.py \
+  --blocks 28 29 --output block-mapping-28-29
+```
+
+The driver uses one fresh process per blocks value and prints all records,
+grouped by raw `asc_get_core_id()` and sorted by entry time. Copy the console
+text back for analysis; no binary archive is required. A new output directory
+is required for reruns. Each blocks directory contains `run.log`, `records.csv`,
+`metadata.json`, `original.asc` and `instrumented.asc`; the root `records.csv`
+combines configurations. Stop on errors rather than hide a missing record.
+
+This reuses the original BF16 Cube GEMM DSL, then instruments the generated
+source in a process-local Ascend postproc callback. It does not change operator
+defaults, compiler passes or the original performance suite. Kernel caching is
+disabled so a cached uninstrumented kernel cannot silently run.
+
+The output tensor has a larger backing allocation: its MxN BF16 view is followed
+by 128 bytes of record storage per logical block. The callback addresses this
+non-overlapping tail through the existing C pointer, preserving the launch ABI.
+Each block records logical ID, raw core ID, entry/completion system cycles,
+issued output-tile count, and exit core ID. The tile counter increments only
+inside the existing guarded output-store path, including persistent iterations.
+Empty blocks therefore produce records with zero output tiles. CPU checks
+validate all expected records, task counts, timestamp order and output values.
+
+Entry is after `asc_init`. Completion is after the original body and an added
+`asc_sync()` to drain device pipelines; record publication occurs afterwards.
+An explicit data-cache flush publishes scalar GM records. A 1 GiB eviction
+precedes the one diagnostic call. There is no warmup, eager comparison, internal
+profiler or speedup claim. Instrumentation and the fence perturb execution;
+use this to examine mapping/order, not as replacement baseline timings.
+
+The raw core ID is preserved, with no assumption that it equals logical block
+ID or a dense 0..27 index. Ascend950's system counter is 1 GHz (1000 ticks/us),
+independent of the 1650 MHz compute frequency. Raw cycles are retained alongside
+relative microseconds; `--ticks-per-us` is available for explicit conversion.
+Reference: local asc-devkit docs for `asc_get_core_id` and
+`asc_get_system_cycle` under `docs/zh/api/SIMD-API/c_api/utils/sys_var/`.
+
+Requires the matching CANN/toolchain already used for these examples on 9579.
+Host checks and a local CANN scalar-record API compilation probe do not replace
+an on-board test of the full instrumented GEMM.
