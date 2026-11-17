@@ -5,6 +5,8 @@ It never edits a launch extent without also rebuilding the task enumeration.
 """
 from __future__ import annotations
 
+import json
+import os
 from tvm import arith, tirx
 from tvm.ir import structural_equal
 from tvm.tirx.stmt_functor import ir_transform, post_order_visit, pre_order_visit, substitute
@@ -382,11 +384,24 @@ def AutoBlocks():
     @prim_func_pass(opt_level=0, name="tl.ascend.AutoBlocks")
     def transform(func, mod, ctx):
         func = bind_block_policy(func)
+        def finish(result):
+            report = os.environ.get("TILELANG_ASCEND_AUTO_BLOCKS_REPORT")
+            if report:
+                def grids(body):
+                    return [_integer(node.value) for node in _nodes(body, tirx.AttrStmt)
+                            if node.attr_key == "thread_extent" and getattr(node.node, "thread_tag", "") == "blockIdx.x"]
+                before, after = grids(func.body), grids(result.body)
+                record = dict(kernel=str(func.attrs.get("global_symbol", "main")),
+                              enabled=bool(int(func.attrs.get("tl.ascend.auto_blocks", 0))),
+                              changed=before != after, before=before, after=after)
+                with open(report, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record) + "\n")
+            return result
         if not int(func.attrs.get("tl.ascend.auto_blocks", 0)):
-            return func
+            return finish(func)
         budgets = {unit: int(func.attrs.get(f"tl.ascend.{unit}_cores", 0)) for unit in ("aic", "aiv")}
         if not any(budgets.values()):
-            return func
+            return finish(func)
         # VF call bindings have semantic codegen roles; preserve them while
         # exposing only side-effect-free integer scheduling expressions.
         normalized = func.with_body(_inline_schedule_aliases(func.body))
@@ -399,5 +414,5 @@ def AutoBlocks():
                 return updated
             return None
         body = ir_transform(normalized.body, None, rewrite)
-        return normalized.with_body(body) if changed else func
+        return finish(normalized.with_body(body) if changed else func)
     return transform

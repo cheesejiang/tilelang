@@ -334,6 +334,31 @@ Host checks and a local CANN scalar-record API compilation probe do not replace
 an on-board test of the full instrumented GEMM.
 # Markdown 输出
 
+## 公共 AutoBlocks Pass 的全量性能验证
+
+```bash
+python examples/ascend/eager_baseline/compiler_blocks.py \
+  --profiles smoke full --rounds 3 --warmup 3 --samples 15 \
+  --output compiler-blocks-all
+```
+
+默认覆盖本目录全部 14 个用例，对比公共编译 Pass 的关闭/开启状态。
+不在 Python 中预先调整 blocks；每侧均先验证正确性，再使用现有 Profiler 协议计时。
+输出 `summary.md` 和 CSV，记录实际改写、blocks、耗时、相对关闭状态的收益和 eager S。
+未被优化的用例也保留在结果中。多 kernel 用例的 blocks 以列表记录。
+该验证模式关闭完整 kernel 编译缓存以取得实际 Pass 记录，编译不计入耗时。
+快速检查可改为 `--rounds 1 --samples 3`。
+
+也可以单独执行一侧，例如：
+
+```bash
+python examples/ascend/eager_baseline/compare.py \
+  --profile full --compiler-auto-blocks on --output compiler-on-full
+```
+
+`--compiler-auto-blocks` 不能与实验性 `--block-policy` 或 `--target-cores` 混用。
+详细口径见 `docs/compiler_internals/ascend_auto_blocks.md`。
+
 Attention forward 合法 blocks 对比（保持输入、tile 大小、tile 总数及原有 DSL 不变）：
 
 ```bash

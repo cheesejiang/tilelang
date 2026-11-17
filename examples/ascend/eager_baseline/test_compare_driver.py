@@ -120,6 +120,22 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(row["blocks"], "24")
             self.assertEqual(row["block_policy"], "auto")
 
+    def test_compiler_switch_and_observation_reach_csv(self):
+        with tempfile.TemporaryDirectory() as folder:
+            def callback(command):
+                self.assertEqual(command[command.index("--compiler-auto-blocks") + 1], "on")
+                destination = Path(command[command.index("--output") + 1])
+                (destination / "vecadd_simt.json").write_text(json.dumps(dict(
+                    case="vecadd_simt", status="passed", blocks=56,
+                    compiler_auto_blocks="on", compiler_changed="yes")))
+                return SimpleNamespace(returncode=0)
+            self.run_driver(Path(folder), callback, ["--compiler-auto-blocks", "on"])
+            with (Path(folder) / "results.csv").open() as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["compiler_auto_blocks"], "on")
+            self.assertEqual(row["compiler_changed"], "yes")
+            self.assertEqual(row["blocks"], "56")
+
     def test_crash_cannot_reuse_old_success(self):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder)

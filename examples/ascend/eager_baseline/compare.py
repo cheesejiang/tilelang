@@ -69,7 +69,8 @@ def fp8_scales(m, n, k, torch, device):
 def compile_kernel(func, args, tilelang, out_idx=-1, fast_math=False):
     # This driver measures explicit block policies, including the original
     # baseline. Do not let the production compiler policy override a candidate.
-    func = func.with_attr("tl.ascend.auto_blocks", 0)
+    if getattr(args, "compiler_auto_blocks", None) != "on":
+        func = func.with_attr("tl.ascend.auto_blocks", 0)
     cfg = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True} if fast_math else None
     kernel = tilelang.compile(func, target={"kind": "ascend", "arch": args.arch},
                               execution_backend="tvm_ffi", out_idx=out_idx, pass_configs=cfg)
@@ -78,6 +79,7 @@ def compile_kernel(func, args, tilelang, out_idx=-1, fast_math=False):
     number = len(list(directory.glob(f"{args.worker}_{args.profile}_*.asc")))
     source = directory / f"{args.worker}_{args.profile}_{number}.asc"
     source.write_text(kernel.get_kernel_source())
+    source.with_suffix(".host.cpp").write_text(kernel.get_host_source() or "")
     return kernel
 
 
@@ -339,6 +341,10 @@ def worker(args):
     os.environ["TILELANG_DEFAULT_TARGET"] = "ascend"
     os.environ["TILELANG_EXECUTION_BACKEND"] = "tvm_ffi"
     os.environ["ASCEND_NPU_ARCH"] = args.arch
+    compiler_mode = getattr(args, "compiler_auto_blocks", None)
+    if compiler_mode is not None:
+        os.environ["TILELANG_ASCEND_AUTO_BLOCKS"] = "1" if compiler_mode == "on" else "0"
+        os.environ["TILELANG_ASCEND_AUTO_BLOCKS_REPORT"] = str(args.output / "compiler-blocks.jsonl")
     examples = Path(__file__).resolve().parent.parent
     sys.path[:0] = [str(examples), str(examples / "flash_attention"), str(examples.parents[1])]
     row = {"case": args.worker, "status": "failed", "profile": args.profile, "timing": args.timing}
@@ -346,6 +352,10 @@ def worker(args):
         import torch
         import torch_npu
         import tilelang
+        if compiler_mode is not None:
+            # Exercise the compiler Pass even when a full-kernel disk cache
+            # exists. Compilation remains outside the measured windows.
+            tilelang.disable_cache()
         torch.npu.set_device(args.device)
         torch.manual_seed(args.seed)
         # Control reference FP32 math instead of silently comparing HF32 with FP32.
@@ -369,6 +379,14 @@ def worker(args):
         # no implicit substitution with another dtype, interface or device.
         reference = eager()
         actual = tl()
+        if compiler_mode is not None:
+            report = args.output / "compiler-blocks.jsonl"
+            records = [json.loads(line) for line in report.read_text().splitlines() if line.strip()] if report.exists() else []
+            row.update(compiler_auto_blocks=compiler_mode,
+                       compiler_changed="yes" if any(item["changed"] for item in records) else "no" if records else "unknown",
+                       compiler_launches=records)
+            launches = [item["after"] for item in records]
+            row["blocks"] = launches[0][0] if len(launches) == 1 and len(launches[0]) == 1 else launches or "unknown"
         torch.npu.synchronize()
         check_npu_outputs(reference, torch)
         check_npu_outputs(actual, torch)
@@ -462,7 +480,8 @@ def run_rounds(args):
         item = dict(case=case, device_name=";".join(device_names) or "unknown", rounds=args.rounds,
                     passed_rounds=sum(row["status"] == "passed" for row in rows))
         for key in ("profile", "shape", "dtype", "arch", "blocks", "block_policy", "original_blocks",
-                    "physical_cores", "target_cores", "core_unit", "task_tiles", "core_source", "configuration"):
+                    "physical_cores", "target_cores", "core_unit", "task_tiles", "core_source", "configuration",
+                    "compiler_auto_blocks", "compiler_changed", "compiler_launches"):
             values = {str(row[key]) for row in rows if row.get(key) is not None}
             if len(values) == 1:
                 item[key] = next(iter(values))
@@ -510,6 +529,8 @@ def main():
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--arch", default="dav-3510")
     parser.add_argument("--block-policy", choices=POLICIES, default="original")
+    parser.add_argument("--compiler-auto-blocks", choices=["off", "on"],
+                        help="Validate the public compiler Pass, with original DSL configurations")
     parser.add_argument("--target-cores", type=int, help="Explicit target core count for block experiments; does not emulate hardware")
     parser.add_argument("--timing", choices=["profiler", "event", "wall"], default="profiler")
     parser.add_argument("--rounds", type=int, default=3, help="Independent suite processes (default: 3)")
@@ -531,6 +552,8 @@ def main():
         parser.error("profiler timing requires --repeats 1: one call per profile window")
     if args.target_cores is not None and args.target_cores <= 0:
         parser.error("--target-cores must be positive")
+    if args.compiler_auto_blocks is not None and (args.block_policy != "original" or args.target_cores is not None):
+        parser.error("--compiler-auto-blocks requires --block-policy original and no --target-cores")
     if (args.block_policy != "original" or args.target_cores is not None) and any(case not in BLOCK_CASES for case in ([args.worker] if args.worker else args.cases)):
         parser.error("block experiments support VecAdd, ordinary GEMM and attention forward; select them with --cases")
     if args.block_policy not in ("original", "auto", "fixed-16") and any(
@@ -562,6 +585,7 @@ def main():
     (args.output / "environment.json").write_text(json.dumps(metadata, indent=2))
     fields = ["case", "device_name", "device", "arch", "status", "comparison_type", "eager_api", "profile", "shape", "dtype", "blocks",
               "block_policy", "original_blocks", "physical_cores", "target_cores", "core_unit", "task_tiles", "core_source", "configuration",
+              "compiler_auto_blocks", "compiler_changed", "compiler_launches",
               "timing", "protocol", "metric", "cache_policy", "flush_bytes", "warmup", "samples", "repeats",
               "tilelang_latency_us", "eager_latency_us", "tilelang_mean_us", "eager_mean_us",
               "tilelang_stdev_us", "eager_stdev_us", "tilelang_median_us", "eager_median_us", "speedup", "tilelang_min_us", "tilelang_max_us",
@@ -582,6 +606,8 @@ def main():
                        "--timing", args.timing, "--warmup", str(args.warmup), "--samples", str(args.samples),
                        "--repeats", str(args.repeats), "--seed", str(args.seed), "--output", str(run_dir),
                        "--attention-baseline", args.attention_baseline, "--block-policy", args.block_policy]
+            if args.compiler_auto_blocks is not None:
+                command.extend(["--compiler-auto-blocks", args.compiler_auto_blocks])
             if args.target_cores is not None:
                 command.extend(["--target-cores", str(args.target_cores)])
             print(f"Running {case} ...", flush=True)

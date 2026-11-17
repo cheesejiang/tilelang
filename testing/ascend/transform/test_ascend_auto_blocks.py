@@ -44,6 +44,18 @@ def test_budget_priority_and_unavailable_fallback():
         resolve_core_counts({"TILELANG_ASCEND_AIC_CORES": "0"}, lambda: (None, None))
 
 
+def test_compiler_report_records_actual_rewrite(monkeypatch, tmp_path):
+    import json
+    path = tmp_path / "compiler-blocks.jsonl"
+    monkeypatch.setenv("TILELANG_ASCEND_AUTO_BLOCKS_REPORT", str(path))
+    AutoBlocks()(materialize(example("vecadd").vector_add(2**20)))
+    record = json.loads(path.read_text())
+    assert record["enabled"] is True
+    assert record["changed"] is True
+    assert record["before"] == [64]
+    assert record["after"] == [56]
+
+
 @pytest.mark.parametrize("mode", ["simt", "simd"])
 @pytest.mark.parametrize("cores", [28, 56, 57, 200])
 def test_vector_coverage_with_new_tail(mode, cores):
