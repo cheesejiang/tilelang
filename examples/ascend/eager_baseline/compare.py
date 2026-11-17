@@ -18,6 +18,7 @@ import time
 import traceback
 
 from block_config import BLOCK_CASES, POLICIES, select_blocks
+from markdown_report import write_comparison_markdown
 
 
 CASES = [
@@ -482,11 +483,13 @@ def run_rounds(args):
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         writer.writerows(summary)
+    write_comparison_markdown(args.output / "summary.md", summary)
     (args.output / "rounds.json").write_text(json.dumps(dict(
         rounds=args.rounds, warmup=args.warmup, samples=args.samples, repeats=args.repeats,
         profile=args.profile, timing=args.timing, summary=summary), indent=2))
     print(f"Per-round results: {args.output / 'results.csv'}", flush=True)
     print(f"Independent-round summary: {args.output / 'summary.csv'}", flush=True)
+    print(f"Markdown: {args.output / 'summary.md'}", flush=True)
     if failed:
         raise SystemExit(1)
 
@@ -584,6 +587,9 @@ def main():
             counts[row["status"]] += 1
             print(f"{case}: {row['status']}" + (f", speedup={row['speedup']:.3f}x" if row.get("speedup") else ""), flush=True)
     print(f"Results: {args.output / 'results.csv'}")
+    with (args.output / "results.csv").open() as handle:
+        write_comparison_markdown(args.output / "summary.md", list(csv.DictReader(handle)))
+    print(f"Markdown: {args.output / 'summary.md'}")
     print(f"Summary: {dict(counts)}; baseline_unavailable is NOT a performance pass")
     if failed:
         raise SystemExit(1)

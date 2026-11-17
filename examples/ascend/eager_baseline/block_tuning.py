@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 
-from block_config import BLOCK_CASES, POLICIES
+from block_config import BLOCK_CASES, policies_for_case
 
 
 def summarize(rows):
@@ -49,6 +49,53 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def write_markdown(path, rows):
+    """Pair smoke/full measurements without treating missing or failed runs as passes."""
+    def cell(value):
+        return str(value).replace("|", "\\|").replace("\n", " ")
+
+    def number(row, key, suffix=""):
+        try:
+            value = float(row[key])
+            if math.isfinite(value) and value > 0:
+                return f"{value:.3f}{suffix}"
+        except (KeyError, TypeError, ValueError):
+            pass
+        return "—"
+
+    lines = ["# Block 策略性能对比", "",
+             "耗时单位：μs；收益 = original TileLang 耗时 / 当前 TileLang 耗时；"
+             "S = eager 耗时 / TileLang 耗时。blocks 为逻辑 block 数。", ""]
+    labels = {"c-1": "C−1", "c": "C", "c+1": "C+1", "2c": "2C"}
+    for case in dict.fromkeys(row["case"] for row in rows):
+        selected = [row for row in rows if row["case"] == case]
+        lookup = {(row["block_policy"], row["profile"]): row for row in selected}
+        devices = ", ".join(dict.fromkeys(str(row["device_name"]) for row in selected if row.get("device_name")))
+        lines.extend([f"## {cell(case)}", "", f"设备：{cell(devices or '未知')}。", "",
+                      "| **策略** | **blocks** | **smoke 耗时** | **smoke 收益** | **smoke S** | **full 耗时** | **full 收益** | **full S** |",
+                      "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |"])
+        policies = list(policies_for_case(case))
+        policies.extend(p for p, _ in lookup if p not in policies)
+        for policy in dict.fromkeys(policies):
+            if not any((policy, profile) in lookup for profile in ("smoke", "full")):
+                continue
+            pair = [lookup.get((policy, profile), {}) for profile in ("smoke", "full")]
+            blocks = [str(row.get("blocks", "—")) for row in pair]
+            block_text = blocks[0] if blocks[0] == blocks[1] else f"{blocks[0]} / {blocks[1]}"
+            values = [labels.get(policy, policy), block_text]
+            for row in pair:
+                if not row:
+                    values.extend(["未运行"] * 3)
+                elif row.get("status") != "passed":
+                    values.extend([cell(row.get("status", "失败")), "—", "—"])
+                else:
+                    gain = number(row, "speedup_vs_original", "×") if row.get("comparison_status") == "valid" else "不可比较"
+                    values.extend([number(row, "tilelang_latency_us"), gain, number(row, "speedup", "×")])
+            lines.append("| " + " | ".join(values) + " |")
+        lines.extend(["", "blocks 两侧不同时按 smoke / full 展示；未运行、失败及不可比较项不计为性能通过。", ""])
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", nargs="+", choices=BLOCK_CASES, default=list(BLOCK_CASES))
@@ -71,7 +118,7 @@ def main():
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     jobs = [(case, profile, policy) for case in dict.fromkeys(args.cases)
-            for profile in dict.fromkeys(args.profiles) for policy in POLICIES]
+            for profile in dict.fromkeys(args.profiles) for policy in policies_for_case(case)]
     random.Random(args.seed).shuffle(jobs)
     manifest = dict(arguments={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                     job_order=jobs, timing="profiler", repetitions_per_window=1,
@@ -105,7 +152,9 @@ def main():
         write_csv(args.output / "results.csv", rows)
     rows = summarize(rows)
     write_csv(args.output / "summary.csv", rows)
+    write_markdown(args.output / "summary.md", rows)
     print(f"Results: {args.output / 'summary.csv'}", flush=True)
+    print(f"Markdown: {args.output / 'summary.md'}", flush=True)
     if any(row.get("comparison_status") != "valid" for row in rows):
         raise SystemExit(1)
 

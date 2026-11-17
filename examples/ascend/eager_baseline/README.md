@@ -332,3 +332,11 @@ Reference: local asc-devkit docs for `asc_get_core_id` and
 Requires the matching CANN/toolchain already used for these examples on 9579.
 Host checks and a local CANN scalar-record API compilation probe do not replace
 an on-board test of the full instrumented GEMM.
+# Markdown 输出
+
+运行 `compare.py`（单轮或多轮）和 `block_tuning.py` 均会在输出目录自动生成
+`summary.md`，无需增加参数，CSV 输出继续保留。
+`compare.py` 汇总各算子的型号、规格、策略、blocks、状态、TileLang/eager 耗时和 S；
+`block_tuning.py` 按算子将 smoke/full 的各策略耗时、相对 original 收益及 S 并排展示，
+VecAdd 包含固定 28、32 blocks。失败或缺失项不会显示为有效性能收益。
+
