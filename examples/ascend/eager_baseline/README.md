@@ -334,6 +334,24 @@ Host checks and a local CANN scalar-record API compilation probe do not replace
 an on-board test of the full instrumented GEMM.
 # Markdown 输出
 
+Attention forward 合法 blocks 对比（保持输入、tile 大小、tile 总数及原有 DSL 不变）：
+
+```bash
+python examples/ascend/eager_baseline/block_tuning.py \
+  --cases mha_bf16 gqa gqa_manual --profiles smoke full \
+  --rounds 1 --samples 3 --output attention-blocks16
+```
+
+每个算子对比 `original`、`auto` 与合法的 `fixed-16`，结果自动写入 `summary.csv` 和 `summary.md`。
+Attention 的 auto 取不超过 `min(query tile 总数, 目标 Cube 核数)` 的最大因数，
+保证 query tile 总数能被 blocks 整除。这与 VecAdd/GEMM 的直接取 min 策略不同。
+9579 的 28 Cube 核下，smoke MHA 自动选 4 blocks，full MHA、smoke/full GQA/manual 自动选 16。
+full MHA 的 32 个 query tile 从每 block 1 个变为 2 个；full GQA/manual 的
+2048 个 query tile 从每 block 64 个变为 128 个。三者原始配置均为 32 blocks。
+smoke MHA 仅有 4 个 query tile，执行 original 和 auto，
+不执行不合法的 fixed-16，Markdown 对该项标记未运行。smoke GQA/manual 的 32 个
+query tile 可以执行 fixed-16。Backward 不参与本次扫描。
+
 运行 `compare.py`（单轮或多轮）和 `block_tuning.py` 均会在输出目录自动生成
 `summary.md`，无需增加参数，CSV 输出继续保留。
 `compare.py` 汇总各算子的型号、规格、策略、blocks、状态、TileLang/eager 耗时和 S；

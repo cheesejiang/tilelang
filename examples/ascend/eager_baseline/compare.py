@@ -17,7 +17,7 @@ import sys
 import time
 import traceback
 
-from block_config import BLOCK_CASES, POLICIES, select_blocks
+from block_config import ATTENTION_CASES, BLOCK_CASES, POLICIES, select_blocks, select_attention_blocks
 from markdown_report import write_comparison_markdown
 
 
@@ -97,7 +97,8 @@ def prepare(case, args, torch, torch_npu, tilelang):
         props = torch.npu.get_device_properties(args.device)
         physical = int(getattr(props, "vector_core_num" if unit == "aiv" else "cube_core_num"))
         target = args.target_cores if args.target_cores is not None else physical
-        blocks = select_blocks(args.block_policy, original, target, tasks)
+        selector = select_attention_blocks if case in ATTENTION_CASES else select_blocks
+        blocks = selector(args.block_policy, original, target, tasks)
         meta.update(blocks=blocks, block_policy=args.block_policy, original_blocks=original,
                     physical_cores=physical, target_cores=target, core_unit=unit, task_tiles=tasks,
                     core_source="explicit_target" if args.target_cores is not None else "device_query",
@@ -244,6 +245,10 @@ def prepare(case, args, torch, torch_npu, tilelang):
         ks, vs = k[None, None, ...], v[None, None, ...]
         scale = 1 / math.sqrt(d)
         blocks = qlen // 128 if case == "mha_bf16" else 32
+        if case in ATTENTION_CASES:
+            blocks = block_configuration(blocks, qlen // 128, "cube")
+            if (qlen // 128) % blocks:
+                raise ValueError(f"{qlen // 128} query tiles must be divisible by {blocks} blocks")
         meta.update(shape={"S1": s1, "G": heads, "S2": skv, "D": d}, dtype="bfloat16",
                     output_dtype="bfloat16", blocks=blocks, scale=scale,
                     note="MHA uses existing shared builder with BF16 output to match eager; original wrapper defaults to FP32")
@@ -524,7 +529,12 @@ def main():
     if args.target_cores is not None and args.target_cores <= 0:
         parser.error("--target-cores must be positive")
     if (args.block_policy != "original" or args.target_cores is not None) and any(case not in BLOCK_CASES for case in ([args.worker] if args.worker else args.cases)):
-        parser.error("block experiments support only VecAdd and ordinary GEMM; select them with --cases")
+        parser.error("block experiments support VecAdd, ordinary GEMM and attention forward; select them with --cases")
+    if args.block_policy not in ("original", "auto", "fixed-16") and any(
+            case in ATTENTION_CASES for case in ([args.worker] if args.worker else args.cases)):
+        parser.error("attention experiments currently support original, auto and fixed-16")
+    if args.profile == "smoke" and args.block_policy == "fixed-16" and "mha_bf16" in ([args.worker] if args.worker else args.cases):
+        parser.error("smoke MHA has only 4 query tiles; use --profile full for fixed-16")
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     if args.worker:

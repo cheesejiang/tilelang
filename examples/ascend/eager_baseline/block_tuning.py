@@ -118,7 +118,7 @@ def main():
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=True)
     jobs = [(case, profile, policy) for case in dict.fromkeys(args.cases)
-            for profile in dict.fromkeys(args.profiles) for policy in policies_for_case(case)]
+            for profile in dict.fromkeys(args.profiles) for policy in policies_for_case(case, profile)]
     random.Random(args.seed).shuffle(jobs)
     manifest = dict(arguments={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
                     job_order=jobs, timing="profiler", repetitions_per_window=1,

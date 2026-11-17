@@ -3,11 +3,25 @@ import unittest
 import tempfile
 from pathlib import Path
 
-from block_config import select_blocks
+from block_config import select_blocks, select_attention_blocks, policies_for_case
 from block_tuning import summarize, write_markdown
 
 
 class BlockConfigTests(unittest.TestCase):
+    def test_attention_uses_legal_fixed16_without_changing_tiles(self):
+        self.assertEqual(select_blocks("fixed-16", 32, 28, 32), 16)
+        self.assertEqual(policies_for_case("mha_bf16", "full"), ("original", "auto", "fixed-16"))
+        self.assertEqual(policies_for_case("mha_bf16", "smoke"), ("original", "auto"))
+        for tasks, expected in ((4, 4), (32, 16), (2048, 16), (56, 28), (31, 1)):
+            self.assertEqual(select_attention_blocks("auto", tasks, 28, tasks), expected)
+        self.assertEqual(select_attention_blocks("original", 32, 28, 32), 32)
+        with self.assertRaises(ValueError):
+            select_attention_blocks("fixed-16", 4, 28, 4)
+        for case in ("gqa", "gqa_manual"):
+            for profile, tasks in (("smoke", 32), ("full", 2048)):
+                self.assertEqual(tasks % 16, 0)
+                self.assertEqual(policies_for_case(case, profile), ("original", "auto", "fixed-16"))
+
     def test_markdown_pairs_profiles_and_preserves_failures(self):
         common = dict(case="vecadd_simt", device_name="9579", status="passed",
                       comparison_status="valid", speedup_vs_original=1.25, speedup=0.75)
