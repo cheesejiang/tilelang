@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import os
-from tvm import arith, tirx
+from tvm import DataType, arith, tirx
 from tvm.ir import structural_equal
 from tvm.tirx.stmt_functor import ir_transform, post_order_visit, pre_order_visit, substitute
 from tvm.tirx.transform import prim_func_pass
@@ -75,6 +75,30 @@ def _resource(stmt):
     return None
 
 
+def _unconditional_writes(stmt):
+    """Writes reached by every iteration, excluding conditional/nested loops."""
+    result = []
+
+    def visit(node):
+        if isinstance(node, tirx.IfThenElse):
+            # Even when both branches write, their regions may differ. Do not
+            # promote either branch to unconditional full-buffer coverage.
+            return False
+        if isinstance(node, tirx.For):
+            return False
+        if isinstance(node, tirx.SBlockRealize):
+            if _integer(node.predicate) != 1:
+                return False
+        if isinstance(node, tirx.BufferStore):
+            result.append(node)
+        elif isinstance(node, tirx.Call) and str(getattr(node.op, "name", "")) == "tl.simd.vsts":
+            result.append(node)
+        return True
+
+    pre_order_visit(stmt, visit)
+    return result
+
+
 def _fresh_task_state(stmt):
     """Require scratch reads to be initialized within this task, not a prior task."""
     analyzer = arith.Analyzer()
@@ -95,6 +119,23 @@ def _fresh_task_state(stmt):
             return load.buffer, list(load.indices), list(arg.args[2:]), _integer(arg.args[1])
         return None
 
+    def full_simd_store(call):
+        ptr, mask = call.args[0], call.args[2]
+        if isinstance(mask, tirx.Var):
+            mask = aliases.get(mask, mask)
+        if not (isinstance(ptr, tirx.Call) and str(getattr(ptr.op, "name", "")) == "tl.access_ptr"
+                and isinstance(mask, tirx.Call) and str(getattr(mask.op, "name", "")) == "tl.simd.pset"
+                and str(getattr(mask.args[1], "value", "")) == "PAT_ALL"):
+            return None
+        load, width = ptr.args[0], ptr.args[1]
+        if not isinstance(load, tirx.BufferLoad) or _integer(ptr.args[2]) != 2:
+            return None
+        bits = DataType(load.buffer.dtype).bits
+        if (_integer(mask.args[0]) != bits or len(call.args) < 4
+                or str(getattr(call.args[3], "value", "")) != f"NORM_B{bits}"):
+            return None
+        return load, width
+
     def expr(node):
         if isinstance(node, tirx.BufferLoad):
             if local(node.buffer) and node.buffer.data not in initialized:
@@ -103,6 +144,15 @@ def _fresh_task_state(stmt):
                 expr(index)
         elif isinstance(node, tirx.Call):
             name = str(getattr(node.op, "name", ""))
+            if name == "tl.simd.vsts":
+                for arg in node.args:
+                    expr(arg)
+                store = full_simd_store(node)
+                if store is not None:
+                    load, width = store
+                    if full(load.buffer, load.indices, [width]):
+                        initialized.add(load.buffer.data)
+                return
             if name == "tl.tileop.gemm":
                 for arg in node.args[:2]:
                     expr(arg)
@@ -127,7 +177,10 @@ def _fresh_task_state(stmt):
                     raise ValueError("unknown access mode")
                 if mode & 1 and local(buffer) and buffer.data not in initialized:
                     raise ValueError("scratch input is not reset for the task")
-                if mode & 2 and full(buffer, indices, extents):
+                # A pointer describes an access, it does not itself perform
+                # a write. In particular, masked SIMD stores may leave lanes
+                # untouched even when their pointer spans the whole buffer.
+                if name == "tl.region" and mode & 2 and full(buffer, indices, extents):
                     initialized.add(buffer.data)
                 return
             for arg in node.args:
@@ -157,29 +210,25 @@ def _fresh_task_state(stmt):
                 walk(node.else_case)
             initialized &= then
         elif isinstance(node, tirx.For):
-            if _integer(node.min) != 0 or not _integer(node.extent):
+            if (_integer(node.min) != 0 or (_integer(node.extent) or 0) <= 0
+                    or node.step is not None and _integer(node.step) != 1):
                 raise ValueError("unknown scratch loop bounds")
             # First iteration must work with fresh state; subsequent iterations
             # may consume state established within this same task (e.g. GEMM K).
             walk(substitute(node.body, {node.loop_var: node.min}))
             walk(node.body)
-            for store in _nodes(node.body, tirx.BufferStore):
+            definite = _unconditional_writes(node.body)
+            for store in (item for item in definite if isinstance(item, tirx.BufferStore)):
                 if (len(store.indices) == len(store.buffer.shape) == 1
                         and analyzer.can_prove_equal(store.indices[0], node.loop_var)
                         and analyzer.can_prove_equal(node.extent, store.buffer.shape[0])):
                     initialized.add(store.buffer.data)
             # Explicit SIMD contiguous vector stores covering the full buffer.
-            for call in _nodes(node.body, tirx.Call):
-                if str(getattr(call.op, "name", "")) != "tl.simd.vsts":
+            for call in (item for item in definite if isinstance(item, tirx.Call)):
+                store = full_simd_store(call)
+                if store is None:
                     continue
-                ptr, mask = call.args[0], call.args[2]
-                if isinstance(mask, tirx.Var):
-                    mask = aliases.get(mask, mask)
-                if not (isinstance(ptr, tirx.Call) and str(getattr(ptr.op, "name", "")) == "tl.access_ptr"
-                        and isinstance(mask, tirx.Call) and str(getattr(mask.op, "name", "")) == "tl.simd.pset"
-                        and str(getattr(mask.args[1], "value", "")) == "PAT_ALL"):
-                    continue
-                load, width = ptr.args[0], ptr.args[1]
+                load, width = store
                 if (isinstance(load, tirx.BufferLoad) and len(load.indices) == len(load.buffer.shape) == 1
                         and analyzer.can_prove_equal(load.indices[0], node.loop_var * width)
                         and analyzer.can_prove_equal(node.extent * width, load.buffer.shape[0])):
@@ -196,10 +245,16 @@ def _fresh_task_state(stmt):
             expr(node.value)
             aliases[node.var] = node.value
         elif isinstance(node, tirx.SBlockRealize):
+            expr(node.predicate)
+            before = set(initialized)
             walk(node.block)
+            if not analyzer.can_prove_equal(node.predicate, 1):
+                initialized &= before
         elif isinstance(node, tirx.SBlock):
             if node.init is not None:
-                walk(node.init)
+                # Reduction-block initialization has its own iteration epoch;
+                # it is not necessarily repeated for every task invocation.
+                raise ValueError("block initialization epoch is not modeled")
             walk(node.body)
         elif isinstance(node, tirx.AttrStmt):
             walk(node.body)
@@ -213,36 +268,11 @@ def _fresh_task_state(stmt):
         return False
 
 
-def _independent_regions(stmt, task, persistent):
-    """Reject GM feedback and unchecked stores; check canonical vector footprints.
+def _independent_regions(stmt, task, tasks):
+    """Require disjoint output regions and reject global feedback/opaque writes."""
+    from .task_regions import prove_disjoint_outputs
 
-    Persistent loops already express a task-domain schedule. For unannotated
-    loops require a 1-D nonoverlapping output region of exactly one task tile.
-    """
-    analyzer = arith.Analyzer()
     writes = set()
-    dependent = set()
-    dependent_vars = set()
-    def depends(expr):
-        return (_uses(expr, task) or any(var in dependent_vars for var in _nodes(expr, tirx.Var))
-                or any(load.buffer.data in dependent for load in _nodes(expr, tirx.BufferLoad)))
-    # Scalar scratch often carries swizzled tile coordinates. Track those
-    # definitions as well as direct uses of the task index.
-    stores = _nodes(stmt, tirx.BufferStore)
-    binds = _nodes(stmt, tirx.Bind)
-    for _ in range(len(stores) + len(binds) + 1):
-        before = len(dependent) + len(dependent_vars)
-        for store in stores:
-            if depends(store.value):
-                dependent.add(store.buffer.data)
-        for bind in binds:
-            if depends(bind.value):
-                dependent_vars.add(bind.var)
-        for branch in _nodes(stmt, tirx.IfThenElse):
-            if depends(branch.condition):
-                dependent.update(store.buffer.data for store in _nodes(branch, tirx.BufferStore))
-        if len(dependent) + len(dependent_vars) == before:
-            break
     for store in _nodes(stmt, tirx.BufferStore):
         if store.buffer.scope() in ("", "global"):
             return False
@@ -257,14 +287,6 @@ def _independent_regions(stmt, task, persistent):
         # Region BufferLoads denote addresses, not actual reads.
         if mode == 2:
             writes.add(load.buffer.data)
-            if persistent and not any(depends(index) for index in load.indices):
-                return False
-            if not persistent:
-                if len(load.indices) != 1 or len(call.args) != 3:
-                    return False
-                width = _integer(call.args[2])
-                if not width or not analyzer.can_prove_equal(load.indices[0], task * width):
-                    return False
         elif mode == 1:
             pass
         else:
@@ -282,7 +304,7 @@ def _independent_regions(stmt, task, persistent):
             actual_reads.add(node.buffer.data)
         return True
     pre_order_visit(stmt, visit)
-    return bool(writes) and not (writes & actual_reads)
+    return bool(writes) and not (writes & actual_reads) and prove_disjoint_outputs(stmt, task, tasks)
 
 
 def _rewrite_grid(grid, budgets):
@@ -348,7 +370,7 @@ def _rewrite_grid(grid, budgets):
             scheduled = tasks
             if (tasks + old - 1) // old != _integer(loop.extent):
                 continue
-        if not _independent_regions(abstract, task, persistent):
+        if not _independent_regions(abstract, task, tasks):
             continue
         if not _fresh_task_state(abstract):
             continue

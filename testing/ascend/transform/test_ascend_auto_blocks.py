@@ -85,11 +85,11 @@ def test_vector_coverage_with_new_tail(mode, cores):
     assert sorted(offsets) == list(range(0, 2**20, 8192))
 
 
-@pytest.mark.parametrize("size,expected", [(1024, 16), (8192, 28)])
+@pytest.mark.parametrize("size,cores,expected", [(1024, 28, 16), (8192, 28, 28), (8192, 14, 14), (8192, 56, 56)])
 @pytest.mark.parametrize("dtype,mixed", [("bfloat16", False), ("float32", False), ("float32", True)])
-def test_persistent_gemm_uses_cube_budget(size, expected, dtype, mixed):
+def test_persistent_gemm_uses_cube_budget(size, cores, expected, dtype, mixed):
     func = example("gemm").gemm(size, size, size, dtype=dtype, out_dtype=dtype, MIXED=mixed)
-    assert grids(AutoBlocks()(materialize(func))) == [expected]
+    assert grids(AutoBlocks()(materialize(func, aic=cores))) == [expected]
 
 
 def test_no_budget_and_disabled_preserve_original():
@@ -182,4 +182,88 @@ def test_cross_task_scratch_state_is_not_rewritten():
                         carry[i] = carry[i] + a[i]
                 T.copy(carry, B[task * 4:task * 4 + 4])
     before = materialize(recurrent, aiv=6)
+    assert tvm.ir.structural_equal(AutoBlocks()(before), before)
+
+
+def test_persistent_overlapping_task_outputs_are_not_rewritten():
+    @T.prim_func
+    def overlapping(A: T.Tensor((128,), "float32"), C: T.Tensor((32,), "float32")):
+        with T.Kernel(8) as bx:
+            a = T.alloc_shared((4,), "float32")
+            for task in T.Persistent([32], 8, bx, group_size=1):
+                T.copy(A[task * 4:task * 4 + 4], a)
+                with T.SimtVF(threads=4):
+                    for i in T.Parallel(4):
+                        a[i] = a[i] + 1
+                slot = task % 8
+                T.copy(a, C[slot * 4:slot * 4 + 4])
+    before = materialize(overlapping, aiv=6)
+    assert tvm.ir.structural_equal(AutoBlocks()(before), before)
+
+
+def test_conditional_partial_initialization_does_not_hide_task_recurrence():
+    @T.prim_func
+    def recurrent(A: T.Tensor((128,), "float32"), C: T.Tensor((128,), "float32")):
+        with T.Kernel(8) as bx:
+            a = T.alloc_shared((4,), "float32")
+            carry = T.alloc_shared((4,), "float32")
+            for step in T.serial(4):
+                task = step * 8 + bx
+                if task < 8:
+                    T.copy(A[0:4], carry)
+                T.copy(A[task * 4:task * 4 + 4], a)
+                with T.SimtVF(threads=4):
+                    for i in T.Parallel(4):
+                        if i < 2:
+                            carry[i] = a[i]
+                    for j in T.Parallel(4):
+                        carry[j] = carry[j] + a[j]
+                T.copy(carry, C[task * 4:task * 4 + 4])
+    before = materialize(recurrent, aiv=6)
+    assert tvm.ir.structural_equal(AutoBlocks()(before), before)
+
+
+def test_masked_simd_write_is_not_full_initialization():
+    @T.prim_func
+    def recurrent(A: T.Tensor((2048,), "float32"), C: T.Tensor((2048,), "float32")):
+        with T.Kernel(8) as bx:
+            a = T.alloc_shared((64,), "float32")
+            carry = T.alloc_shared((64,), "float32")
+            for step in T.serial(4):
+                task = step * 8 + bx
+                if task < 8:
+                    T.copy(A[0:64], carry)
+                T.copy(A[task * 64:task * 64 + 64], a)
+                with T.SimdVF():
+                    full = T.simd.pset(32)
+                    partial = T.simd.update_mask(32, 32)
+                    value = T.simd.vld(a[0])
+                    T.simd.vsts(carry[0], value, partial)
+                    previous = T.simd.vld(carry[0])
+                    result = T.simd.vadd(previous, value, full)
+                    T.simd.vsts(carry[0], result, full)
+                T.copy(carry, C[task * 64:task * 64 + 64])
+    before = materialize(recurrent, aiv=6)
+    assert tvm.ir.structural_equal(AutoBlocks()(before), before)
+
+
+@pytest.mark.parametrize("mode", ["simt", "simd"])
+def test_large_vector_domain_uses_symbolic_disjointness_proof(mode):
+    before = materialize(example("vecadd").vector_add(2**30, mode))
+    assert grids(AutoBlocks()(before)) == [56]
+
+
+def test_data_dependent_persistent_output_is_not_rewritten():
+    @T.prim_func
+    def indexed(A: T.Tensor((128,), "float32"), C: T.Tensor((128,), "float32"), Index: T.Tensor((32,), "int32")):
+        with T.Kernel(8) as bx:
+            a = T.alloc_shared((4,), "float32")
+            for task in T.Persistent([32], 8, bx, group_size=1):
+                T.copy(A[task * 4:task * 4 + 4], a)
+                with T.SimtVF(threads=4):
+                    for i in T.Parallel(4):
+                        a[i] = a[i] + 1
+                slot = Index[task]
+                T.copy(a, C[slot * 4:slot * 4 + 4])
+    before = materialize(indexed, aiv=6)
     assert tvm.ir.structural_equal(AutoBlocks()(before), before)
