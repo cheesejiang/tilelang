@@ -19,7 +19,7 @@ from typing import (
 from collections.abc import Callable
 from collections.abc import Iterable
 
-from tilelang import tvm as tvm
+from tilelang import tvm as tvm, env
 from tilelang.language.eager import PrimFunc, prim_func, JITFunc
 from tilelang.language.eager.builder import _make_jit_key
 from tvm.target import Target
@@ -534,6 +534,31 @@ class JITImpl(Generic[_P, _KP, _T, _Ret]):
                 "compile_flags": self.compile_flags,
             }
             return compile_args
+
+        # These in-memory caches precede the full-kernel cache. Refresh them
+        # when the selected Ascend device budget or policy changes as well.
+        target_hint = self.target if self.target is not None else env.get_default_target()
+        if target_hint == "auto":
+            try:
+                target_hint = determine_target(target_hint, return_object=True)
+            except (ValueError, RuntimeError):
+                # Preserve existing lazy/mock compilation behavior when no
+                # backend can be detected at this point.
+                pass
+        is_ascend = (isinstance(target_hint, Target) and target_hint.kind.name == "ascend" and "pto" not in target_hint.keys
+                     or isinstance(target_hint, str) and target_hint.strip() == "ascend"
+                     or isinstance(target_hint, dict) and target_hint.get("kind") == "ascend" and "pto" not in target_hint.get("keys", ()))
+        if is_ascend:
+            from tilelang.ascend.block_policy import resolve_core_counts
+            import os
+
+            enabled = os.environ.get("TILELANG_ASCEND_AUTO_BLOCKS", "1").lower() not in ("0", "false", "off")
+            fingerprint = (enabled, resolve_core_counts() if enabled else ())
+            if getattr(self, "_ascend_block_fingerprint", None) != fingerprint:
+                self._kernel_cache.clear()
+                self._call_form_cache = _CallFormCache()
+                self._tuner_cache.clear()
+                self._ascend_block_fingerprint = fingerprint
 
         has_tune_params = "__tune_params" in kwargs
         kwargs.update(kwargs.pop("__tune_params", {}))

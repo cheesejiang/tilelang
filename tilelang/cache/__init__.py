@@ -88,6 +88,10 @@ def cached(
     Caches and reuses compiled kernels (using KernelCache class).
     """
     cache, backend_context, verbose = _resolve_cache_dispatch(target, target_host, execution_backend, verbose)
+    if backend_context.module.name == "ascend":
+        from tilelang.ascend.block_policy import bind_block_policy
+
+        func = bind_block_policy(func)
     return cache.cached(
         func,
         out_idx,

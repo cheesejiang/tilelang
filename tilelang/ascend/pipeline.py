@@ -49,6 +49,10 @@ def AscendPassPipelineBody(mod: IRModule, target: Target) -> IRModule:
         unsupported_annotations=["cluster_dims"],
         launch_dim_tags=["cthread"],
     )(mod)
+    if "pto" not in target.keys:
+        from .transform.auto_blocks import AutoBlocks
+
+        mod = AutoBlocks()(mod)
     pass_ctx = tilelang.transform.get_pass_context()
     auto_schedule_enabled = allow_autoschedule(pass_ctx=pass_ctx)
     disable_reuse = should_disable_shared_memory_reuse(pass_ctx=pass_ctx)

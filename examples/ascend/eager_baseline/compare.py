@@ -67,6 +67,9 @@ def fp8_scales(m, n, k, torch, device):
 
 
 def compile_kernel(func, args, tilelang, out_idx=-1, fast_math=False):
+    # This driver measures explicit block policies, including the original
+    # baseline. Do not let the production compiler policy override a candidate.
+    func = func.with_attr("tl.ascend.auto_blocks", 0)
     cfg = {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True} if fast_math else None
     kernel = tilelang.compile(func, target={"kind": "ascend", "arch": args.arch},
                               execution_backend="tvm_ffi", out_idx=out_idx, pass_configs=cfg)

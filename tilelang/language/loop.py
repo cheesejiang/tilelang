@@ -104,8 +104,12 @@ def Persistent(
         The number of pipeline stages for double buffering.
         If 0, pipeline is disabled.
     """
-    if annotations is None:
-        annotations: dict[str, Any] = {}
+    annotations = dict(annotations or {})
+    # Preserve scheduling intent before constant folding. Consumers may change
+    # the worker count only when the surrounding task loop is proven eligible.
+    if len(domain) == 1:
+        annotations["tl.persistent_tasks"] = domain[0]
+        annotations["tl.persistent_stride"] = wave_size
     return _ffi_api.Persistent(domain, wave_size, index, group_size, num_stages, annotations)
 
 

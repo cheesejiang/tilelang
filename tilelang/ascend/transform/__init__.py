@@ -6,6 +6,13 @@ from tilelang.transform import _ffi_api
 from . import z3_scheduler  # noqa: F401
 
 
+def AutoBlocks():
+    """Adapt proven grid-stride task loops to the resolved device core budget."""
+    from .auto_blocks import AutoBlocks as make_pass
+
+    return make_pass()
+
+
 def InsertNd2Nz():
     """Rewrite layout-driven UB ND->UB NZ and UB->L1 ND->NZ copies."""
     return _ffi_api.InsertNd2Nz()  # type: ignore
@@ -223,6 +230,7 @@ def RewriteFlagToBuf():
 
 
 __all__ = [
+    "AutoBlocks",
     "NormalizeAscendFractalStorage",
     "AnnotateMultiBufferEligible",
     "AscendRemoveNoOp",
