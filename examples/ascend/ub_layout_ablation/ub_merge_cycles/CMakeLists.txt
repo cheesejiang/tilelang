@@ -16,9 +16,9 @@ set(CMAKE_ASC_ENABLE_SIMT ON)
 find_package(ASC REQUIRED)
 project(kernel_samples LANGUAGES ASC CXX)
 
-set(SCENARIO_NUM "0" CACHE STRING "Case type to run (0-7)")
-if(NOT SCENARIO_NUM MATCHES "^[0-7]$")
-    message(FATAL_ERROR "SCENARIO_NUM must be an integer from 0 to 7, but got ${SCENARIO_NUM}")
+set(SCENARIO_NUM "0" CACHE STRING "Case type to run (0-13)")
+if(NOT SCENARIO_NUM MATCHES "^([0-9]|1[0-3])$")
+    message(FATAL_ERROR "SCENARIO_NUM must be an integer from 0 to 13, but got ${SCENARIO_NUM}")
 endif()
 
 set(REPEAT_TIMES_CONFIG "100" CACHE STRING "Timed load/add iterations")
