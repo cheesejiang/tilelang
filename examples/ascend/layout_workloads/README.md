@@ -463,6 +463,12 @@ python examples/ascend/layout_workloads/run_workloads.py --summarize-only --outp
 每次调用重建本次选中的 case/mode 的总表，不自动追加其他实验；正常执行会覆盖
 相同 case/mode 的产物。只汇总不会给旧 JSON 补出原来未采集的指标。
 
+## 完整转置与短轴 padding 扫描
+
+新增 [PADDING_STUDY.md](PADDING_STUDY.md)：完整 FP32 batched transpose 的四模式对照、
+每行 +32B / +4 元素并计入重排的手工参考，以及固定行数和固定元素量的短轴扫描。
+入口为 `run_padding_study.py`；支持无需设备的 `--dry-run` 和历史报告补汇总。
+
 ## 总表指标
 
 `summary.md` 第一张表并排显示四模式的整体时延，单位为 us；未计时时显示

@@ -24,7 +24,9 @@ class ReportTests(unittest.TestCase):
             self.assertEqual((config["tl.ascend_enable_ub_ownership"], config["tl.ascend_enable_ub_padding"]), flags)
 
     def test_source_provenance(self):
-        self.assertEqual(sorted(Counter(c.category for c in CASES.values()).values()), [2, 2, 2, 2, 2])
+        self.assertEqual(CASES["transpose"].category, "full_transpose")
+        self.assertEqual(sorted(Counter(c.category for name, c in CASES.items()
+                                        if name != "transpose").values()), [2, 2, 2, 2, 2])
         root = Path(__file__).resolve().parents[3]
         for case in CASES.values():
             tree = ast.parse((root / case.source).read_text())
@@ -161,6 +163,10 @@ class ReferenceTests(unittest.TestCase):
         stats = np.array([[[0.5, 0.75, 0.9], [0.6, 0.8, 0.7], [1, 2, 3]]], dtype=np.float32)
         for case in CASES:
             actual = reference(case, a, b, stats)
+            if case == "transpose":
+                self.assertEqual(actual.shape, (1, 4, 3))
+                np.testing.assert_array_equal(actual, a.transpose(0, 2, 1))
+                continue
             if case == "flash_decode_qk_column_store":
                 expected = np.array([[[max(sum(float(a[0, r, d]) * float(b[0, k, n, d])
                                                for d in range(4)) for n in range(3))

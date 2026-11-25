@@ -38,13 +38,28 @@ def run_worker(args):
     report = {**asdict(source), "case": args.case, "mode": args.mode,
               "rows": args.rows, "columns": args.columns, "threads": args.threads, "blocks": args.blocks,
               "iterations": iteration_count(args.case, args.columns, args.updates),
-              "status": "compiling", "padding_applied": False}
+              "status": "compiling", "padding_applied": False, "seed": args.seed}
+    report["transpose_layout"] = args.transpose_layout
     source_path = Path(__file__).resolve().parents[3] / source.source
     report["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
     report["experiment_protocol"] = "identical-ir-pass-switches-v1"
     report["pass_configs"] = mode_configs(args.mode)
     report["baseline_partition"] = "common native layout inference; no mode-specific annotations"
     report["scope"] = "SIMT stage extract, not an end-to-end benchmark of the source kernel"
+    report["kernel_factory_sha256"] = hashlib.sha256(Path(__file__).with_name("kernels.py").read_bytes()).hexdigest()
+    if args.case == "transpose":
+        report.update(scope="complete FP32 batched transpose, native Ascend staging implementation",
+                      input_shape=[args.blocks, args.rows, args.columns],
+                      output_shape=[args.blocks, args.columns, args.rows],
+                      useful_gm_bytes=2 * args.blocks * args.rows * args.columns * 4,
+                      explicit_dense_repack=args.transpose_layout == "source4_repack")
+        if args.transpose_layout != "native":
+            report["experiment_protocol"] = f"manual-transpose-{args.transpose_layout}-v1"
+            report["baseline_partition"] = "native loop inference with explicit manual storage reference"
+            report["manual_padding_scheme"] = (
+                "transposed: every row +32B" if args.transpose_layout == "row32" else
+                "padded: every row +4 float32 (16B), explicit dense UB repack before DMA")
+            report["source_schedule_reproduced"] = False
 
     def save():
         path.write_text(json.dumps(report, indent=2))
@@ -96,7 +111,8 @@ def run_worker(args):
         name = "examples.layout_workloads.capture"
         register_pass_instrumentation_tool(name, CaptureTool)
         try:
-            func = make_kernel(args.case, args.rows, args.columns, args.threads, args.blocks, tiles)
+            func = make_kernel(args.case, args.rows, args.columns, args.threads, args.blocks, tiles,
+                               transpose_layout=args.transpose_layout)
             report["input_ir_structural_hash"] = str(tvm.ir.structural_hash(func, map_free_vars=True))
             (directory / f"{args.mode}.input.tir").write_text(str(func))
             compiled = tilelang.compile(func, target="ascend", out_idx=-1,
@@ -133,6 +149,16 @@ def run_worker(args):
                 r.get("padding_analysis_version", 0) >= 3 for r in records):
             raise RuntimeError("QK stage requires padding analysis version >=3; rebuild the TileLang library")
         report["loop_layouts"] = loops
+        lowered = snapshots.get("tl.AscendLowerTileOp")
+        if lowered is not None:
+            (directory / f"{args.mode}.lowered.tir").write_text(str(lowered))
+        from dma_audit import collect_dma_descriptors
+        report["dma_audit"] = collect_dma_descriptors(lowered)
+        if args.case in ("transpose", "gemm_scale", "attention_finalize"):
+            from column_store_audit import collect_column_store_audit
+            buffers = ("transposed", "padded") if args.case == "transpose" else ("work",)
+            report["ub_store_audits"] = {
+                buffer: collect_column_store_audit(lowered, buffer) for buffer in buffers}
         if args.case in FLASH_CASES:
             from column_store_audit import collect_column_store_audit
             lowered = snapshots.get("tl.AscendLowerTileOp")
@@ -144,8 +170,12 @@ def run_worker(args):
             if lowered is not None:
                 (directory / f"{args.mode}.lowered.tir").write_text(str(lowered))
         report.update(summary_fields(records))
-        report["padding_applied"] = any("padding_bytes" in b for r in records if r.get("stage") == "final" for b in r.get("buffers", []))
-        report["padding_policy"] = "rule_based_search" if report["pass_configs"]["tl.ascend_enable_ub_padding"] else "disabled"
+        report["padding_applied"] = (args.transpose_layout != "native" or
+                                     any("padding_bytes" in b for r in records if r.get("stage") == "final"
+                                         for b in r.get("buffers", [])))
+        report["padding_policy"] = ("manual_reference" if args.transpose_layout != "native" else
+                                    "rule_based_search" if report["pass_configs"]["tl.ascend_enable_ub_padding"]
+                                    else "disabled")
         allocated = snapshots.get("tl.MergeUBAllocations")
         if allocated is not None:
             report["final_ir_ub"] = collect_final_ub_allocations(allocated)
@@ -153,15 +183,19 @@ def run_worker(args):
         report.update(final_ir_fields(report))
         report["status"] = "compiled"
         save()
-        if not report["pass_configs"]["tl.ascend_enable_ub_padding"] and report["padding_applied"]:
+        if (args.transpose_layout == "native" and
+                not report["pass_configs"]["tl.ascend_enable_ub_padding"] and report["padding_applied"]):
             raise RuntimeError("Padding was applied despite its optimization switch being disabled")
         actual = compiled(*inputs)
         torch.npu.synchronize()
-        torch.testing.assert_close(actual.cpu(), expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(actual.cpu(), expected,
+                                   rtol=0 if args.case == "transpose" else 1e-4,
+                                   atol=0 if args.case == "transpose" else 1e-5)
         report["correctness_passed"] = True
         report["status"] = "correctness_passed"
         save()
-        print(f"{args.case}/{args.mode}: correctness passed (rtol=1e-4, atol=1e-5)", flush=True)
+        print(f"{args.case}/{args.mode}: correctness passed" +
+              (" (exact transpose)" if args.case == "transpose" else " (rtol=1e-4, atol=1e-5)"), flush=True)
         if args.bench:
             samples = [do_bench(lambda: compiled(*inputs), backend="msprof", _n_warmup=10, _n_repeat=30) * 1000
                        for _ in range(args.rounds)]
@@ -183,7 +217,7 @@ def summarize_reports(args, cases, reports_by_case):
             # Rebuilding a table must use the archived configuration, not
             # today's CLI defaults. Do not compare incompatible old runs.
             compatible = all(report.get(k) == baseline.get(k) for k in
-                             ("rows", "columns", "threads", "blocks", "iterations", "experiment_protocol"))
+                             ("rows", "columns", "threads", "blocks", "iterations", "experiment_protocol", "transpose_layout"))
             base = baseline if compatible else {}
             latency = report.get("latency_us", "")
             base_latency = base.get("latency_us")
@@ -196,7 +230,10 @@ def summarize_reports(args, cases, reports_by_case):
             if not args.summarize_only and path.exists():
                 report.update(final)
                 path.write_text(json.dumps(report, indent=2))
-            records.append({**config, **summary_fields(report.get("layout_diagnostics", [])), **final,
+            fields = summary_fields(report.get("layout_diagnostics", []))
+            if report.get("manual_padding_scheme"):
+                fields["padding_scheme"] = report["manual_padding_scheme"]
+            records.append({**config, **fields, **final,
                             "correctness_passed": report.get("correctness_passed", "unknown"),
                             "status": report.get("status", "failed"), "padding_applied": report.get("padding_applied", ""),
                             "latency_us": latency, "speedup_vs_baseline": base_latency / latency if base_latency and latency else "",
@@ -230,6 +267,8 @@ def main():
     parser.add_argument("--updates", type=int, default=4, help="different incoming tiles for attention_update cases; flash_decode_* cases use --columns instead")
     parser.add_argument("--rounds", type=int, default=3, help="independent benchmark batches; report their median")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--transpose-layout", choices=["native", "row32", "source4_repack"], default="native",
+                        help="manual references require --case transpose --mode baseline; use a separate output directory")
     parser.add_argument("--bench", action="store_true")
     parser.add_argument("--summarize-only", action="store_true", help="rebuild tables from existing JSON without compiling or running kernels")
     parser.add_argument("--output", type=Path, default=Path("layout-workload-results"))
@@ -237,10 +276,12 @@ def main():
     args = parser.parse_args()
     args.output = args.output.expanduser().resolve()
     try:
-        validate(args.rows, args.columns, args.threads, args.blocks, args.updates)
         selected_cases = CASES if args.case == "all" else (args.case,)
         for case in selected_cases:
-            validate(args.rows, args.columns, args.threads, args.blocks, args.updates, case=case)
+            validate(args.rows, args.columns, args.threads, args.blocks, args.updates,
+                     case=case, transpose_layout=args.transpose_layout)
+        if args.transpose_layout != "native" and (args.case != "transpose" or args.mode != "baseline"):
+            raise ValueError("manual transpose references require --case transpose --mode baseline")
         if args.rounds <= 0:
             raise ValueError("rounds must be positive")
     except ValueError as error:
@@ -274,6 +315,7 @@ def main():
                        "--rows", str(args.rows), "--columns", str(args.columns), "--threads", str(args.threads),
                        "--blocks", str(args.blocks), "--updates", str(args.updates), "--rounds", str(args.rounds),
                        "--seed", str(args.seed), "--output", str(args.output)]
+                cmd += ["--transpose-layout", args.transpose_layout]
                 if args.bench:
                     cmd.append("--bench")
                 result = subprocess.run(cmd, check=False)

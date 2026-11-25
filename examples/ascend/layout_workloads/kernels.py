@@ -8,7 +8,10 @@ else:
     from catalog import FLASH_KV_WIDTH, FLASH_QK_HEAD_DIM
 
 
-def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4):
+def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4,
+                transpose_layout="native"):
+    if case == "transpose":
+        return _make_transpose_kernel(rows, columns, threads, blocks, updates, transpose_layout)
     if case == "flash_decode_qk_column_store":
         return _make_flash_decode_qk_column_kernel(rows, columns, threads, blocks)
     if case == "flash_decode_column_store":
@@ -71,6 +74,49 @@ def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4):
                         for c, r in T.Parallel(columns, rows):
                             work[r, c] = work[r, c] / denominator[r]
             T.copy(work, C[block, :, :])
+
+    return main
+
+
+def _make_transpose_kernel(rows, columns, threads, blocks, updates, storage):
+    """Full tile transpose; each element is read, transposed and written once.
+
+    Four automatic modes use identical unannotated IR (storage='native').
+    row32 is a manual physical-layout reference. source4_repack preserves the
+    source algorithm's +4-element row pitch but adds an explicit dense repack
+    before DMA; it does not pretend to reproduce CUDA's microtile/rotation.
+    """
+    from tilelang.layout import Layout
+
+    @T.prim_func
+    def main(
+        A: T.Tensor((blocks, rows, columns), "float32"),
+        B: T.Tensor((blocks, updates, rows, columns), "float32"),
+        Stats: T.Tensor((blocks, updates + 1, rows), "float32"),
+        C: T.Tensor((blocks, columns, rows), "float32"),
+    ):
+        with T.Kernel(blocks) as block:
+            source = T.alloc_shared((rows, columns), "float32")
+            transposed = T.alloc_shared((columns, rows), "float32")
+            if storage == "row32":
+                T.annotate_layout({transposed: Layout(
+                    (columns, rows), lambda c, r: c * (rows + 8) + r)})
+            T.copy(A[block, :, :], source)
+            if storage == "source4_repack":
+                padded = T.alloc_shared((columns, rows + 4), "float32")
+                with T.SimtVF(threads=threads):
+                    for r, c in T.Parallel(rows, columns):
+                        padded[c, r] = source[r, c]
+                # A separate scheduled VF keeps the producer/consumer boundary
+                # explicit even when more than one warp participates.
+                with T.SimtVF(threads=threads):
+                    for c, r in T.Parallel(columns, rows):
+                        transposed[c, r] = padded[c, r]
+            else:
+                with T.SimtVF(threads=threads):
+                    for r, c in T.Parallel(rows, columns):
+                        transposed[c, r] = source[r, c]
+            T.copy(transposed, C[block, :, :])
 
     return main
 

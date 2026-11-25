@@ -2,6 +2,8 @@
 
 
 def reference(case, a, incoming, stats):
+    if case == "transpose":
+        return a.swapaxes(-1, -2)
     if case == "flash_decode_qk_column_store":
         # Quantized BF16 Q/K are converted back to FP32 before the reference
         # dot product, matching the device's FP32 accumulation input values.

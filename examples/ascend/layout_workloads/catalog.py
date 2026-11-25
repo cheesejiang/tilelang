@@ -12,6 +12,10 @@ class Case:
 
 
 CASES = {
+    "transpose": Case("full_transpose", "examples/ascend/layout_workloads/kernels.py", "_make_transpose_kernel",
+                      "Complete FP32 batched transpose using GM->UB, SIMT transpose and UB->GM. "
+                      "Algorithm reference: TileKernels/tile_kernels/transpose/batched_transpose_kernel.py; "
+                      "native Ascend staging, not a port of its register microtile/rotation schedule."),
     "gemm_scale": Case("cross_single_pass", "examples/ascend/deepgemm/kernels/epilogue.py", "apply_alpha",
                        "FP32 scaling stage rewritten from SIMD to column-major SIMT; omit BF16 packing and GEMM."),
     "attention_finalize": Case("cross_single_pass", "examples/ascend/flash_attention/core.py", "finalize_fp32",
@@ -61,11 +65,13 @@ def mode_configs(mode):
             "tl.ascend_enable_ub_padding": mode in ("padding", "auto")}
 
 
-def validate(rows, columns, threads, blocks, updates, case=None):
+def validate(rows, columns, threads, blocks, updates, case=None, transpose_layout="native"):
     if min(rows, columns, threads, blocks, updates) <= 0:
         raise ValueError("all dimensions, blocks and updates must be positive")
-    if threads % 32 or rows % threads:
+    if threads % 32 or (case != "transpose" and rows % threads):
         raise ValueError("threads must be a multiple of 32, and rows must be divisible by threads")
+    if case == "transpose" and (rows * columns) % threads:
+        raise ValueError("transpose tile elements must be divisible by threads")
     if rows % 8:
         raise ValueError("rows must be a multiple of 8")
     if case == "flash_decode_qk_column_store" and rows > 256:
@@ -73,3 +79,15 @@ def validate(rows, columns, threads, blocks, updates, case=None):
     # Work and incoming coexist; leave room for row statistics and allocator state.
     if (2 * rows * columns + 2 * rows + columns) * 4 > 208 * 1024:
         raise ValueError("tile exceeds the conservative example UB budget; reduce rows/columns")
+    if transpose_layout not in ("native", "row32", "source4_repack"):
+        raise ValueError("unknown transpose layout reference")
+    if transpose_layout != "native" and case != "transpose":
+        raise ValueError("manual transpose layouts require --case transpose")
+    if case == "transpose":
+        allocation = 2 * rows * columns * 4
+        if transpose_layout == "row32":
+            allocation += columns * 32  # conservative, includes final row hole
+        elif transpose_layout == "source4_repack":
+            allocation += columns * (rows + 4) * 4
+        if allocation > 208 * 1024:
+            raise ValueError("transpose reference exceeds the conservative UB budget")
