@@ -38,6 +38,8 @@ logical GM-to-UB bandwidth including input, positions and coefficient rows.
 assignment. `dma_bw` is the RoPE input/output bandwidth relative to that copy.
 Use `--dma-offset` to time both DMA copy schedules. The offset variant writes
 the previous tile and reads the next tile in the same loop iteration.
+Use `--dma-l2-read NOTALLOC_KEEP` to compare nonallocating input reads against
+the default `NORMAL_FV` policy in both DMA baselines.
 The benchmark uses `(600000, 56, 32)` FP16 data and `(4096, 32)` FP16
 coefficient tables. Each 128-lane FP16 vector handles four heads. The
 benchmark packs the cos and sin tables together before timing, so the

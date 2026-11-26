@@ -77,7 +77,7 @@ def bench_mte2_read(x, num_cores, tile_tokens, bench):
     return latency, x.numel() * FP16_BYTES / (latency * 1e6)
 
 
-def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False):
+def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False, l2_read="NORMAL_FV"):
     """Use the same tile assignment for a double-buffered device copy."""
     total_elems = total_k * TOKEN_ELEMS
     tile_elems = tile_tokens * TOKEN_ELEMS
@@ -97,7 +97,7 @@ def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False):
                     if step < iterations:
                         start = (step * blocks + core) * tile_elems
                         T.ascend_wait_flag("MTE3_MTE2", step % 2)
-                        T.copy(src[start : start + tile_elems], ub[step % 2, :])
+                        T.copy(src[start : start + tile_elems], ub[step % 2, :], l2_cache_ctrl=l2_read)
                         T.ascend_set_flag("MTE2_MTE3", step % 2)
                     if step > 0:
                         previous = ((step - 1) * blocks + core) * tile_elems
@@ -111,7 +111,7 @@ def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False):
                 T.annotate_buffer_versions({ub: 2})
                 for step in T.Pipelined(iterations, num_stages=2):
                     start = (step * blocks + core) * tile_elems
-                    T.copy(src[start : start + tile_elems], ub)
+                    T.copy(src[start : start + tile_elems], ub, l2_cache_ctrl=l2_read)
                     T.copy(ub, dst[start : start + tile_elems])
 
     if offset:
@@ -122,8 +122,8 @@ def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False):
     return main
 
 
-def bench_dma_copy(x, output, num_cores, tile_tokens, bench, *, offset=False):
-    kernel = tilelang.compile(dma_copy_baseline(x.shape[0], num_cores, tile_tokens, offset=offset), target="ascend")
+def bench_dma_copy(x, output, num_cores, tile_tokens, bench, *, offset=False, l2_read="NORMAL_FV"):
+    kernel = tilelang.compile(dma_copy_baseline(x.shape[0], num_cores, tile_tokens, offset=offset, l2_read=l2_read), target="ascend")
     output.fill_(float("nan"))
     kernel(x, output)
     torch.testing.assert_close(output[::tile_tokens, 0, 0], x[::tile_tokens, 0, 0], rtol=0, atol=0)
@@ -326,6 +326,10 @@ def main():
     )
     parser.add_argument("--mte2-baseline", action="store_true", help="measure a matched GM-to-UB read baseline per tile")
     parser.add_argument("--dma-baseline", action="store_true", help="measure a matched TileLang DMA copy per tile")
+    parser.add_argument(
+        "--dma-l2-read", choices=("NORMAL_FV", "NOTALLOC_KEEP"), default="NORMAL_FV",
+        help="input L2 policy for both TileLang DMA copy baselines",
+    )
     parser.add_argument("--dma-offset", action="store_true", help="also measure the offset schedule for the TileLang DMA copy")
     args = parser.parse_args()
     if args.iters <= 0 or (args.cores is not None and args.cores <= 0):
@@ -381,13 +385,13 @@ def main():
                     print(f"GM-to-UB baseline tile={tile_tokens:2}  {read_ms:.4f} ms  {read_gbps:.1f} GB/s")
             if args.dma_baseline or args.dma_offset:
                 for tile_tokens in tiles:
-                    dma_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench)
+                    dma_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench, l2_read=args.dma_l2_read)
                     dma_copy_times[tile_tokens] = dma_ms
-                    print(f"TileLang DMA copy tile={tile_tokens:2}  {dma_ms:.4f} ms  {io_bytes / (dma_ms * 1e6):.1f} GB/s")
+                    print(f"TileLang DMA copy l2={args.dma_l2_read} tile={tile_tokens:2}  {dma_ms:.4f} ms  {io_bytes / (dma_ms * 1e6):.1f} GB/s")
                     if args.dma_offset:
-                        offset_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench, offset=True)
+                        offset_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench, offset=True, l2_read=args.dma_l2_read)
                         print(
-                            f"TileLang DMA copy offset tile={tile_tokens:2}  {offset_ms:.4f} ms  "
+                            f"TileLang DMA copy offset l2={args.dma_l2_read} tile={tile_tokens:2}  {offset_ms:.4f} ms  "
                             f"{io_bytes / (offset_ms * 1e6):.1f} GB/s  speedup={dma_ms / offset_ms:.3f}x"
                         )
         timings = []
