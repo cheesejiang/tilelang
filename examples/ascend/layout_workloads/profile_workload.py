@@ -33,5 +33,7 @@ def capture(fn, directory, repeats=10):
               [str(p.relative_to(directory)) for p in sorted(directory.rglob("*")) if p.is_file()],
               "interpretation": "Raw metrics; utilization is not additive phase duration. "
                                 "Inspect kernel identity, VECTOR/MTE metrics and trace overlap."}
+    from profile_metrics import save
+    result["metrics"] = save(directory)
     (directory / "capture.json").write_text(json.dumps(result, indent=2))
     return result

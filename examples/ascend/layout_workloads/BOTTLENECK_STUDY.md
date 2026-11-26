@@ -25,6 +25,14 @@ PipeUtilization 报告，profile 不混入 benchmark 样本。warmup 在 capture
 输出包括顶层 `summary.md/csv`，各配置的日志、逐模式 JSON、输入/推导/最终分配 IR、
 生成的 `.cpp`、DMA 描述符，以及 `MODE.profile/<唯一编号>/` 下的原始 profiler 产物。
 JSON 的 `profile.directory` 给出准确路径，`capture.json` 保存文件清单。
+脚本自动读取 `op_summary*.csv`（优先）或 `kernel_details*.csv`，生成
+`profile_summary.md/csv`，汇总匹配 kernel 的记录耗时中位数、VECTOR/SCALAR/MTE
+利用率及导出文件明确提供的时间字段。比例统一为 0～1；原始字段及来源保存在
+各 profile 目录的 `metrics_summary.json` 中。没有 CSV 时，按本仓现有的 CANN 9.2
+`ffts_profile` 格式回退读取原始 AIV 指标；其他版本格式不保证兼容。
+多个同名导出表、未识别目标 kernel 或缺失字段均保留 unknown/status，不选猜测值。
+不通过利用率推导 VECTOR/MTE 时间，也不将重复 launch/core 的记录耗时相加。
+已有采集结果用同参数 `--summarize-only` 即可重新解析，无需重跑设备。
 查看 profiler 导出的算子明细、PipeUtilization 指标和 trace，定位对应 VF/kernel，
 比较 VECTOR/MTE 活动与等待/重叠；不同 CANN 版本可提供的字段不同。
 这些利用率不是可相加的阶段耗时，不能直接用总时间乘利用率得到准确 VF/DMA 时间。

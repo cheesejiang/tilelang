@@ -36,6 +36,22 @@ class BottleneckTests(unittest.TestCase):
             self.assertEqual(row['model_entries'], '2048')
             self.assertEqual(row['model_instructions'], 'unknown')
             self.assertEqual(row['profile_directory'], 'not_collected')
+            self.assertEqual(row['vector_ratio'], 'unknown')
+            profile = args.output / 'saved-profile'
+            profile.mkdir()
+            (profile / 'op_summary.csv').write_text(
+                'Kernel Name,Task Duration(us),aiv_vec_ratio\nmain_kernel,4.8,0.6\n')
+            report = json.loads(path.read_text())
+            report['profile'] = {'directory': str(profile)}
+            path.write_text(json.dumps(report))
+            study.summarize(args)
+            with (args.output / 'profile_summary.csv').open() as stream:
+                row, = csv.DictReader(stream)
+            self.assertEqual(row['profile_status'], 'parsed')
+            self.assertEqual(row['profile_kernel_us'], '4.8')
+            self.assertEqual(row['vector_ratio'], '0.6')
+            self.assertEqual(row['vector_time_us'], 'unknown')
+            self.assertTrue((profile / 'metrics_summary.json').exists())
 
 
 if __name__ == '__main__':

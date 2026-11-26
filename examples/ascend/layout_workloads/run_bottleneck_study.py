@@ -29,6 +29,7 @@ def command(args, variant):
 
 
 def summarize(args):
+    from profile_metrics import FIELDS, save as parse_profile
     rows = []
     for name, mode, period, vectorize in variants():
         path = args.output / name / "gemm_scale" / f"{mode}.json"
@@ -36,6 +37,7 @@ def summarize(args):
             continue
         r = json.loads(path.read_text())
         profile = r.get("profile", {})
+        metrics = (parse_profile(profile["directory"]) if profile.get("directory") else {})
         rows.append({"variant": name, "status": r.get("status", "unknown"),
                      "correctness": r.get("correctness_passed", False),
                      "period_rows": period, "vectorize": vectorize,
@@ -45,6 +47,8 @@ def summarize(args):
                      "model_requests": r.get("requests", "unknown"),
                      "model_entries": r.get("entries", "unknown"),
                      "ub_bytes": r.get("final_ir_ub_allocation_bytes", "unknown"),
+                     "profile_status": metrics.get("status", "not_collected"),
+                     **{key: metrics.get(key, "unknown") for key in FIELDS},
                      "profile_directory": profile.get("directory", "not_collected"),
                      "dma_descriptors": json.dumps(r.get("dma_audit", {}).get("descriptors", [])),
                      "report": str(path)})
@@ -61,6 +65,18 @@ def summarize(args):
              "| " + " | ".join(keys) + " |", "| " + " | ".join("---" for _ in keys) + " |"]
     lines += ["| " + " | ".join(str(r[k]) for k in keys) + " |" for r in rows]
     (args.output / "summary.md").write_text("\n".join(lines) + "\n")
+    profile_keys = ["variant", "kernel_time_us", "profile_status", *FIELDS]
+    with (args.output / "profile_summary.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=profile_keys, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    lines = ["# Profile comparison", "",
+             "Ratios are fractions (0.5 = 50%); times are microseconds. No phase time is inferred from utilization.",
+             "Kernel duration is median per matching record, not summed across repeated launches or cores.", "",
+             "| " + " | ".join(profile_keys) + " |", "| " + " | ".join("---" for _ in profile_keys) + " |"]
+    lines += ["| " + " | ".join(f"{r[k]:.4f}" if isinstance(r[k], float) else str(r[k])
+                                  for k in profile_keys) + " |" for r in rows]
+    (args.output / "profile_summary.md").write_text("\n".join(lines) + "\n")
 
 
 def main():
