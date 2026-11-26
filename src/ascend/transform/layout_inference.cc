@@ -1089,7 +1089,7 @@ private:
 
     // Track which buffers this op (infer_idx) touches for prioritization.
     // Avoid duplicates.
-    auto &vec = op_touched_buffers_[infer_idx];
+    auto &vec = op_touched_buffers_[infer_idx]; // 合法检查1：外层循环必须是串行或者展开循环，且边界表达式必须是线程统一表达式
     if (std::none_of(vec.begin(), vec.end(),
                      [&](const Buffer &b) { return b.same_as(buffer); })) {
       vec.push_back(buffer);
@@ -1818,7 +1818,9 @@ private:
   FindOwnershipEligibleOps(UnionFind<int> ownership_uf) {
     std::unordered_set<int> ownership_eligible;
     std::unordered_map<const VarNode *, int> first_user;
-    for (int i = 0; i < infer_list_stmt_.size(); ++i) {
+    // 建立空结果集合，一个底层存储 data 对应的第一个使用它的算子编号
+
+    for (int i = 0; i < infer_list_stmt_.size(); ++i) { // 遍历每个算子的IR
       PostOrderVisit(infer_list_stmt_[i], [&](const ObjectRef &node) {
         const VarNode *data = nullptr;
         if (const auto *load = node.as<BufferLoadNode>())
@@ -1826,11 +1828,12 @@ private:
         if (const auto *store = node.as<BufferStoreNode>())
           data = store->buffer->data.get();
         if (const auto *var = node.as<VarNode>(); var && var->dtype.is_handle())
-          data = var;
+          data = var; // handle类型的 Var
         if (data) {
           auto [it, inserted] = first_user.emplace(data, i);
-          if (!inserted)
-            ownership_uf.Union(it->second, i);
+          // it 指向对应key的迭代器，inserted表示是否插入成功
+          if (!inserted) // 插入失败，说明已经有算子使用了这个底层存储 data
+            ownership_uf.Union(it->second, i); // 将两个算子关联起来
         }
       });
     }
@@ -1838,7 +1841,7 @@ private:
     for (int i = 0; i < infer_list_.size(); ++i)
       ownership_groups[ownership_uf.Find(i)].push_back(i);
     for (const auto &[group, ops] : ownership_groups) {
-      if (CanChangeUbOwnership(ops))
+      if (CanChangeUbOwnership(ops)) // 逐组做合法性检查2：
         ownership_eligible.insert(ops.begin(), ops.end());
     }
     return ownership_eligible;
@@ -1856,12 +1859,14 @@ private:
       arith::Analyzer analyzer;
       PrimExpr slots = 1;
       for (const auto &extent : loop->GetLoopLayout()->OutputShape())
-        slots = slots * extent;
+        slots = slots * extent; // 初始化局部槽位数，OutputShape() 表示线程内索引空间的形状
       slots = analyzer.Simplify(slots);
+      // 化简乘积表达式，例如将 2 * 4 化简成整数 8
       if (const auto *count = slots.as<IntImmNode>()) {
+        // 只有结果是编译期整数常量时，才可以扩大max_width
         int width = 1;
         while (width <= count->value / 2 &&
-               width <= std::numeric_limits<int>::max() / 2)
+               width <= std::numeric_limits<int>::max() / 2) // 防止 int 溢出
           width *= 2;
         max_width = std::max(max_width, width);
       }
@@ -1879,22 +1884,26 @@ private:
       const LayoutMap &strict_layout_map,
       const std::vector<TileOperator> &native_ops,
       const LayoutMap &native_layouts, const LayoutCostModel &cost_model) {
+    // 定义一个评分函数，评价SIMT UB访问
     auto analyze = [&](const std::vector<TileOperator> &ops,
                        const LayoutMap &layouts) {
       return costmodel::simtvf::AnalyzeOwnershipEffect(
           ops, members, thread_bounds_vec_, layouts, ownership_outer_loops_);
     };
     auto best_effect = analyze(native_ops, native_layouts);
+    // 评价原始方案，作为比较基线
     RecordLayoutDiagnostic("ownership_before", members.front(), native_layouts,
                            best_effect);
+                           // 记录优化前的诊断信息
     // Unknown costs cannot justify changing the native plan. The model owns
     // latency composition and comparison; this pass owns attempts and adoption.
     if (!best_effect)
-      return std::nullopt;
+      return std::nullopt; // 原始方案无法分析，停止优化
     // A regular cross-row stride does not prohibit legal redistribution.
     // Evaluate ownership candidates before searching physical padding.
     std::optional<OwnershipSelection> best;
     int max_width = MaxOwnershipWidth(members, native_ops);
+    // 确定候选宽度上限，每个线程的slot数以内的最大的2的幂次方 
     for (int width = 1;; width *= 2) {
       for (int root : members) {
         if (!infer_list_[root].as<ParallelOpNode>())
@@ -1937,6 +1946,7 @@ private:
 
     // Group operators into connected components
     UnionFind<int> uf;
+    // 基于 相同 Buffer 对象进行合并
     for (int i = 0; i < infer_list_.size(); i++) {
       uf.MakeSet(i);
     }
@@ -1953,6 +1963,7 @@ private:
     // Additionally, union across buffers that share the same underlying
     // buffer->data (Var). This handles cases like reshape where multiple
     // Buffer objects alias the same storage.
+    // 根据 相同底层数据变量（data Var） 合并算子
     for (const auto &[var, buffers] : buffer_data_to_buffers_) {
       std::vector<int> merged;
       for (const auto &buf : buffers) {
@@ -1972,35 +1983,43 @@ private:
       }
     }
     auto ownership_eligible = FindOwnershipEligibleOps(uf);
+    // unordered_set<int> 保存允许尝试 Ownership 优化的算子编号
+    // uf 是并查集，表示哪些算子已经有关联，需要一起推导布局
+    // 在这里做了合法性检查2
 
     // (An epoch's update nests and its init/finalize ops now share the
     // reducer buffer in use_list_, so the union above already links them.)
 
     std::unordered_map<int, std::vector<int>> components;
-    for (int i = 0; i < infer_list_.size(); i++) {
+    // 建立并查集代表编号 和 该组的算子编号列表 的映射
+    for (int i = 0; i < infer_list_.size(); i++) { // 算子列表
       int root = uf.Find(i);
       components[root].push_back(i);
     }
+    // 例如 components[0] = [0, 1, 2]； components[3] = [3, 4]
+
     // Create a map from root to buffers
     std::unordered_map<int, std::vector<Buffer>> components_buffers;
+    // 建立并查集代表编号 和 该组的 Buffer 列表 的映射
     for (const auto &[buffer, infer_indices] : use_list_) {
       int root = uf.Find(infer_indices[0]);
       components_buffers[root].push_back(buffer);
     }
     // Keep components_buffers for debug purpose
-    (void)components_buffers;
+    (void)components_buffers; // 显式使用了该变量，避免未使用警告
 
     // For each component, try each op as root, and determine the least
     // replicated one
+    // 创建成本模型
     std::unique_ptr<LayoutCostModel> cost_model =
         LayoutCostModel::Create(tl_config::LayoutCostModelName(), target_);
     DLOG(INFO) << "[InferInFreeMode] cost model: " << cost_model->Name();
     for (auto &&[root, members] : components) {
       DLOG(INFO) << "======================= processing component " << root
                  << '\n';
-      std::vector<TileOperator> best_infer_list;
-      LayoutMap best_layout_map;
-      AttemptCost best_cost;
+      std::vector<TileOperator> best_infer_list; // 最佳算子布局状态
+      LayoutMap best_layout_map; // 最佳buffer布局映射
+      AttemptCost best_cost; // 最佳普通映射成本
       bool has_best = false;
       int best_infer_root = -1;
 
@@ -2010,19 +2029,20 @@ private:
         best_cost = outcome.cost;
         has_best = true;
         best_infer_root = attempt_root;
-      };
+      }; // 保存一个当前最佳方案
 
       // Try the native plan first, then a scalar alternative at eligible
       // reducer roots. Scalar ownership can avoid replicated accumulator
       // slots; the existing cost model decides whether that is worthwhile.
-      for (int attempt_infer_root : members) {
+      for (int attempt_infer_root : members) { // 依次让算子列表中的每个算子作为根节点尝试布局推导
         const auto *loop = infer_list_[attempt_infer_root].as<ParallelOpNode>();
+        // 判断是否是 ParallelOp，不是则为空
         bool try_scalar =
             cost_model->ExploreReducerScalarLayouts() && loop &&
             loop->HasReducerUpdates() && !loop->GetLoopLayout().defined() &&
             !loop->annotated_layout_unbound_.defined() &&
             !loop->GetRoot()->annotations.count(attr::kCoalescedWidth);
-        for (int candidate_vector_size_limit : {0, 1}) {
+        for (int candidate_vector_size_limit : {0, 1}) { // 0 不额外限制向量宽度；1 将候选向量宽度限制为1
           if (candidate_vector_size_limit != 0 && !try_scalar) {
             continue;
           }
@@ -2030,10 +2050,10 @@ private:
                      << attempt_infer_root << " members " << members.size()
                      << " candidate_vector_size_limit="
                      << candidate_vector_size_limit << '\n';
-          auto outcome = RunOneAttempt(
+          auto outcome = RunOneAttempt( // 从 attempt_infer_root 开始尝试推导布局
               attempt_infer_root, members, layout_map, strict_layout_map,
               /*seed_layouts=*/{}, *cost_model, candidate_vector_size_limit);
-          if (!outcome) {
+          if (!outcome) { // 推导失败则跳过
             continue;
           }
           DLOG(INFO) << "[InferInFreeMode] attempt root " << attempt_infer_root
@@ -2049,7 +2069,7 @@ private:
           }
         }
       }
-      if (!has_best) {
+      if (!has_best) { // 所有的推导全部失败
         // Reducer-only rescue (dst-steering): the verdict can be an induced
         // narrow layout no consumer ordering can live with (e.g. a consumer
         // also reads a strict-pinned conflicting source), killing every
@@ -2059,7 +2079,7 @@ private:
         // compiling wide one. Components without reservations get no seeds
         // and fall through unchanged; a component that fails even this is a
         // genuine inference failure.
-        auto seeds =
+        auto seeds = // 为相关 reducer 生成较宽、普遍可读的回退布局种子
             steering_.FallbackSeeds(members, infer_list_, thread_bounds_vec_);
         if (!seeds.empty()) {
           DLOG(INFO) << "[InferInFreeMode] all attempts failed; retrying with "
@@ -2073,6 +2093,7 @@ private:
       }
       ICHECK(has_best) << "no available layout found" << '\n';
       if (enable_ub_ownership && ownership_eligible.count(members.front())) {
+        // 为什么只检查 members.front()？因为前面资格是整组通过后一起加入集合；正常分量内的成员已经被纳入同一个 ownership 检查组，资格是一致的
         auto improved = TryImproveUbOwnership(
             members, layout_map, strict_layout_map, best_infer_list,
             best_layout_map, *cost_model);
@@ -2243,9 +2264,11 @@ private:
           legal = false;
         if (node.as<StmtNode>() && !node.as<ForNode>() &&
             !node.as<BufferStoreNode>() && !node.as<SeqStmtNode>())
+            // 语句节点必须是 For、BufferStore 或 SeqStmt，否则不合法 #1
           legal = false;
         if (const auto *nested = node.as<ForNode>();
             nested && nested->kind != ForKind::kParallel)
+            // for 循环必须是没有额外注解的 Parallel 循环，否则不合法 #1
           legal = false;
       });
       if (!legal)
@@ -2254,15 +2277,17 @@ private:
     return true;
   }
 
-  void TryImproveUbPadding(LayoutMap &layouts) {
+  void TryImproveUbPadding(LayoutMap &layouts) { // 输入是已经选定的Buffer布局表，这里可以修改
     // Cover the whole storage/fragment component. Score supported SIMT users;
     // candidate-specific isolation proves that omitted operators are unchanged.
     // Do not change the solved ownership here.
     UnionFind<int> uf;
     std::unordered_map<const VarNode *, int> first_user;
+    // 某块底层存储第一次被哪个算子使用
     for (int i = 0; i < infer_list_.size(); ++i) {
-      uf.MakeSet(i);
+      uf.MakeSet(i); // 每个算子独立作为一个集合
       PostOrderVisit(infer_list_stmt_[i], [&](const ObjectRef &node) {
+        // 遍历当前算子的原始IR，寻找底层存储
         const VarNode *data = nullptr;
         if (const auto *load = node.as<BufferLoadNode>())
           data = load->buffer->data.get();
@@ -2272,7 +2297,8 @@ private:
           data = var;
         if (data) {
           auto [it, inserted] = first_user.emplace(data, i);
-          if (!inserted)
+          // 尝试插入，如果从未插入过data，则插入成功，it指向新插入的元素，inserted为true
+          if (!inserted) // 如果同一存储被其他算子使用过，则将两个算子合并为一个集合
             uf.Union(i, it->second);
         }
       });
@@ -2281,35 +2307,37 @@ private:
     for (int i = 0; i < infer_list_.size(); ++i)
       components[uf.Find(i)].push_back(i);
     for (const auto &[root, members] : components) {
-      if (!CanChangeUbPadding(members))
+      if (!CanChangeUbPadding(members)) // 检查当前集合的所有算子是否都可以尝试 padding 优化
         continue;
       std::vector<int> scored;
       for (int member : members)
         if (IsPaddingScoredOp(member))
-          scored.push_back(member);
+          scored.push_back(member); // scored：模型支持并实际计入比较的 SIMT 算子?1
       if (scored.empty())
         continue;
       std::vector<costmodel::simtvf::SimtUbStride> strides;
       auto best = costmodel::simtvf::AnalyzeOwnershipEffect(
           infer_list_, scored, thread_bounds_vec_, layouts,
-          ownership_outer_loops_, &strides, true);
+          ownership_outer_loops_, &strides, true); // 1 建立一个基线 2 将相邻活跃 lane 之间的规则地址步长保存到 strides（元素数表示）
+          // true表示：在外层索引变化影响访问时，允许逐阶段枚举实际地址
       RecordLayoutDiagnostic("padding_before", root, layouts, best);
       if (!best) {
         RecordLayoutDiagnostic("padding_skipped", root, layouts, best, Buffer(),
                                0, "unknown_baseline_cost");
-        continue;
+        continue; // 成本未知直接跳过
       }
-      if (strides.empty())
+      if (strides.empty()) // 实际也跳过
         RecordLayoutDiagnostic("padding_skipped", root, layouts, best, Buffer(),
                                0, "no_regular_active_lane_stride");
-      const LayoutMap unpadded = layouts;
+      const LayoutMap unpadded = layouts; // 改变之前的布局
       std::vector<std::pair<const BufferNode *, int64_t>> tried;
       std::vector<std::pair<const BufferNode *, int64_t>> seen_hints;
+      // 两张去重表 seen_hints: 观察到的步长 tried: 候选周期=步长*n
       for (const auto &stride : strides) {
-        const Buffer &buffer = stride.buffer;
+        const Buffer &buffer = stride.buffer; // 取出准备修改的 Buffer
         auto hint = std::make_pair(buffer.get(), stride.elements);
         if (std::find(seen_hints.begin(), seen_hints.end(), hint) !=
-            seen_hints.end())
+            seen_hints.end()) // 重复的(buffer, 步长)组合，跳过
           continue;
         seen_hints.push_back(hint);
         RecordLayoutDiagnostic("padding_stride_hint", root, layouts, best,
@@ -2317,30 +2345,33 @@ private:
         // Omitted reduction/initialization/opaque operations are a common,
         // unchanged term, not a zero-cost estimate. Never pad their storage:
         // their UB/scratch lowering is not modeled by this comparison.
-        bool invariant = true;
+        bool invariant = true; // 确保未评分的算子不会受影响
         for (int member : members) {
           if (IsPaddingScoredOp(member) || IsPaddingGmUbCopy(member))
             continue;
-          invariant &= !PaddingOpTouches(member, buffer);
+          // 集合内的算子分为三类：支持评分的SIMT算子。GM<->UB拷贝算子。其他不支持评分的算子
+          invariant &= !PaddingOpTouches(member, buffer); // ?1
         }
-        if (!invariant) {
+        if (!invariant) { // 如果未建模的算子访问了该 buffer，则跳过
           RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
                                  buffer, 0,
                                  "unmodeled_operator_accesses_storage");
           continue;
         }
+        // 检查目标 Buffer 是否满足 padding 的要求
         const char *rejection = nullptr;
-        if (buffer->shape.size() < 2)
+        if (buffer->shape.size() < 2) // 至少是二维的 Buffer 才能做 padding
           rejection = "buffer_rank_less_than_two";
-        else if (unpadded.count(buffer))
+        else if (unpadded.count(buffer)) // padding 前已经有物理布局
           rejection = "existing_physical_layout";
-        else if (!CanChangeBufferOwnership(buffer))
+        else if (!CanChangeBufferOwnership(buffer)) // 不能修改 buffer 的布局
           rejection = "unsupported_metadata_alias_annotation_or_unknown_use";
-        else if (!buffer->strides.empty() || !is_zero(buffer->elem_offset))
+        else if (!buffer->strides.empty() || !is_zero(buffer->elem_offset)) // 有显式的 strides 或者 elem_offset 不为0
           rejection = "non_dense_or_nonzero_offset";
         else if (std::none_of(
                      padding_allocations_.begin(), padding_allocations_.end(),
                      [&](const Buffer &b) { return b.same_as(buffer); }))
+                     // 不在 padding_allocations_ 中
           rejection = "buffer_not_in_padding_allocations";
         if (rejection) {
           RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
@@ -2349,13 +2380,13 @@ private:
         }
         int64_t columns = buffer->shape.back().as<IntImmNode>()->value;
         if (columns <= 0 || stride.elements < columns ||
-            stride.elements % columns) {
+            stride.elements % columns) { // 步长必须是正整数行数的倍数
           RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
                                  buffer, 0,
                                  "stride_is_not_positive_whole_rows");
           continue;
         }
-        int bytes = buffer->dtype.bytes();
+        int bytes = buffer->dtype.bytes(); // 检查字节数
         if (bytes != 1 && bytes != 2 && bytes != 4 && bytes != 8) {
           RecordLayoutDiagnostic("padding_buffer_rejected", root, layouts, best,
                                  buffer, 0, "unsupported_element_width");
@@ -2368,18 +2399,19 @@ private:
           int64_t period = stride.elements * phases;
           auto key = std::make_pair(buffer.get(), period);
           if (std::find(tried.begin(), tried.end(), key) != tried.end())
-            continue;
+            continue; // 如果已经存在了该 Buffer 和 周期组合，则跳过
           tried.push_back(key);
           constexpr int64_t padding = 32;
           int64_t elements = 1;
-          for (const auto &extent : buffer->shape)
+          for (const auto &extent : buffer->shape) // 不同维度的元素个数相乘，得到总元素个数
             elements *= extent.as<IntImmNode>()->value;
-          if (period >= elements) {
+          if (period >= elements) { // 周期不能大于等于总元素个数，否则没有内部空洞
             RecordLayoutDiagnostic("padding_candidate", root, layouts, best,
                                    buffer, period, "rejected_no_internal_hole");
             continue;
           }
-          if (!PaddingFootprint(layouts)) {
+          if (!PaddingFootprint(layouts)) { // 当前布局的分配大小未知或者超出了容量约束则跳过
+            // 这里的 PaddingFootprint 返回 optional，`!` 检查的是“有没有有效结果”，不是简单判断占用是否为零
             RecordLayoutDiagnostic(
                 "padding_candidate", root, layouts, std::nullopt, buffer,
                 period, "rejected_unknown_or_excess_baseline_capacity");
@@ -2387,28 +2419,31 @@ private:
           }
           Array<IterVar> vars;
           PrimExpr linear = 0;
-          for (size_t dim = 0; dim < buffer->shape.size(); ++dim) {
+          for (size_t dim = 0; dim < buffer->shape.size(); ++dim) { // 逐维度遍历
             Var index("ub_padding_i" + std::to_string(dim));
             vars.push_back(IterVar(Range::FromMinExtent(0, buffer->shape[dim]),
                                    index, IterVarType::kDataPar));
             linear = linear * buffer->shape[dim] + index;
           }
           Layout candidate(vars, {linear + floordiv(linear, Integer(period)) *
-                                               Integer(padding / bytes)});
+                                               Integer(padding / bytes)}); // 构造布局，物理元素偏移=逻辑元素偏移+经过的周期数*每周期padding的元素数
           if (!candidate->DetectInjective()->errors.empty()) {
+            // 确保不同逻辑元素不会映射到同一个物理位置
             RecordLayoutDiagnostic("padding_candidate", root, layouts,
                                    std::nullopt, buffer, period,
                                    "rejected_noninjective");
             continue;
           }
-          LayoutMap trial = layouts;
-          trial.Set(buffer, candidate);
-          if (!PaddingFootprint(trial)) {
+          LayoutMap trial = layouts; // 复制当前的布局表
+          trial.Set(buffer, candidate); // 只替换目标 Buffer 的布局
+          if (!PaddingFootprint(trial)) { // 检查候选的 UB 分配是否可确定且不超限
             RecordLayoutDiagnostic("padding_candidate", root, trial,
                                    std::nullopt, buffer, period,
                                    "rejected_capacity_or_unknown_allocation");
             continue;
           }
+
+          // 检查DMA
           bool dma_legal = true;
           for (int member : members) {
             const auto *copy = infer_list_[member].as<CopyNode>();
@@ -2433,6 +2468,8 @@ private:
                                    "rejected_dma");
             continue;
           }
+
+          // 用新的物理布局重新评分
           auto effect = costmodel::simtvf::AnalyzeOwnershipEffect(
               infer_list_, scored, thread_bounds_vec_, trial,
               ownership_outer_loops_, nullptr, true);
@@ -2444,7 +2481,7 @@ private:
               effect &&
               (costmodel::simtvf::IsBetterOwnership(*effect, *best) ||
                (!costmodel::simtvf::IsBetterOwnership(*best, *effect) &&
-                smaller));
+                smaller)); // 候选成本严格更低；候选成本持平但是存储更小
           RecordLayoutDiagnostic(
               "padding_candidate", root, trial, effect, buffer, period,
               accepted ? "accepted_at_step" : "not_better_or_unknown_cost");
@@ -2496,7 +2533,7 @@ private:
         return false;
     if (ownership_unknown_uses_.count(buffer->data.get()))
       return false;
-    for (const auto &[annotated, layout] : annotated_layout_map_)
+    for (const auto &[annotated, layout] : annotated_layout_map_) // 检查底层data #1
       if (annotated->data.same_as(buffer->data))
         return false;
     if (auto views = buffer_data_to_buffers_.Get(buffer->data))
@@ -2571,14 +2608,14 @@ private:
         // Full-tile UB/fragment copies use the existing SIMT copy loop and
         // fragment propagation. Partial regions, casts and annotated copies
         // retain native inference until their contracts are supported.
-        if ((!IsFragmentBuffer(copy->src) && !IsFragmentBuffer(copy->dst)) ||
+        if ((!IsFragmentBuffer(copy->src) && !IsFragmentBuffer(copy->dst)) || // 要求SIMT Copy：同类型、同形状 #1
             !CanChangeBufferOwnership(copy->src) ||
             !CanChangeBufferOwnership(copy->dst) ||
             copy->src->dtype != copy->dst->dtype ||
             !ShapesEqual(copy->src->shape, copy->dst->shape, &analyzer))
           return false;
         for (const auto &[buffer, ranges] :
-             {std::make_pair(copy->src, copy->src_range),
+             {std::make_pair(copy->src, copy->src_range), // 要求完整区域 #1
               std::make_pair(copy->dst, copy->dst_range)}) {
           if (ranges.size() != buffer->shape.size())
             return false;
@@ -2594,9 +2631,9 @@ private:
       }
       if (!loop)
         return false;
-      if (loop->HasReducerUpdates() || loop->GetLoopLayout().defined() ||
-          loop->annotated_layout_unbound_.defined() ||
-          loop->GetRoot()->annotations.count(attr::kCoalescedWidth))
+      if (loop->HasReducerUpdates() || loop->GetLoopLayout().defined() || // 排除规约、算子对象已经有确定的循环布局 #1
+          loop->annotated_layout_unbound_.defined() ||  // 不能有显式loop布局 #1
+          loop->GetRoot()->annotations.count(attr::kCoalescedWidth)) // 已经有分组宽度约束 #1
         return false;
       const auto *count = thread_bounds_vec_[member]->extent.as<IntImmNode>();
       if (!count || count->value <= 0)
@@ -2666,7 +2703,7 @@ private:
         if (node.as<StmtNode>() && !node.as<ForNode>() &&
             !node.as<BufferStoreNode>() && !node.as<SeqStmtNode>())
           legal = false;
-        if (node.as<CallNode>())
+        if (node.as<CallNode>()) // 对循环体里的 CallNode 直接拒绝 #1
           legal = false;
         if (const auto *for_node = node.as<ForNode>()) {
           if (for_node->kind != ForKind::kParallel ||

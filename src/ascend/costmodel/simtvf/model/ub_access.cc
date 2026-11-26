@@ -69,29 +69,34 @@ AnalyzeSimtUbRequest(const SimtUbLaneAddresses &addresses, int bytes,
   // Process descending active lanes, ascending 2B elements
   // inside one lane's <=4B slice. Never concatenate independent slices.
   for (int lane = geometry.warp_size - 1; lane >= 0; --lane) {
+    // lane 31 → lane 30 → … → lane 0;   然后每个 lane 内，按地址从低到高处理 fragment
     if (!addresses[lane])
       continue;
     int64_t begin = *addresses[lane];
     for (int offset = 0; offset < bytes;) {
       int64_t address = begin + offset;
-      int count =
+      int count = // geometry.element_bytes=2，fragment按照2B边界对齐
           std::min(bytes - offset, geometry.element_bytes -
                                        int(address % geometry.element_bytes));
       int key = (address / geometry.line_bytes) % geometry.bank_keys;
       int group = key % geometry.virtual_groups;
       int64_t line = address & ~int64_t(geometry.line_bytes - 1);
       auto it = std::find_if(entries.begin(), entries.end(), [&](Entry &e) {
-        if (e.elements >= geometry.entry_elements)
+        // elements;   // 已计入多少个 fragment
+        // groups;     // 哪些 virtual group 已占用
+        // lines[key]; // 某个 key 对应的完整 line，初始为 -1
+        // masks[group]; // 已覆盖哪些字，供 store 检查使用 例如：mask=0b00001111，表示该 entry 的 group0-4 已覆盖
+        if (e.elements >= geometry.entry_elements) // 64 个 fragment 了，不能再加了
           return false;
         if (e.lines[key] != -1)
-          return e.lines[key] == line;
-        return !(e.groups & (1U << group)); // also bounds keys to 16
+          return e.lines[key] == line; // 该 key 已经存在时，必须匹配相同完整 line
+        return !(e.groups & (1U << group)); // also bounds keys to 16 key 尚不存在时，要求对应 group 未被其他 key 占据。
       });
-      if (it == entries.end()) {
+      if (it == entries.end()) { // 如果没有找到合适的 entry，就新建一个 entry
         entries.emplace_back();
         it = entries.end() - 1;
       }
-      ++it->elements;
+      ++it->elements; // 更新 entry 的 fragment 数量
       it->lines[key] = line;
       it->groups |= 1U << group;
       it->masks[group] |= ((1U << count) - 1)
@@ -113,7 +118,7 @@ AnalyzeSimtUbRequest(const SimtUbLaneAddresses &addresses, int bytes,
           int coverage = (mask >> shift) & word_mask;
           partial |= coverage != 0 && coverage != word_mask;
         }
-      cost.partial += partial;
+      cost.partial += partial; // 统计的是存在 Partial Word 的 Entry 数量，而不是 Partial Word 的总数量
     }
   }
   return cost;
@@ -134,16 +139,16 @@ AnalyzeSimtUbInstruction(const SimtUbLaneAddresses &addresses, int bytes,
                     *address > std::numeric_limits<int64_t>::max() - bytes))
       return std::nullopt;
   }
-  for (int offset = 0; offset < bytes; offset += geometry.request_bytes) {
-    auto slice = addresses;
+  for (int offset = 0; offset < bytes; offset += geometry.request_bytes) {// 若byte=8，那么offset=0,4，分别计算两次请求
+    auto slice = addresses; // 复制一份地址数组
     for (auto &address : slice)
       if (address)
-        *address += offset;
-    auto part = AnalyzeSimtUbRequest(
+        *address += offset; // 每个 lane 的地址加上偏移量，得到每个 lane 的请求地址(也是拆分成多个请求的地址)
+    auto part = AnalyzeSimtUbRequest( // 当前片段的每个Lane的访存地址，当前片段实际的字节宽度
         slice, std::min(geometry.request_bytes, bytes - offset), store);
     if (!part)
       return std::nullopt;
-    result.entries += part->entries;
+    result.entries += part->entries; // 累加分析结果
     result.partial += part->partial;
     result.requests += part->requests;
   }
@@ -171,13 +176,16 @@ EstimateSimtUbInstructionLatency(const SimtUbLaneAddresses &addresses,
   // Preserve geometry while leaving the unmodeled RMW latency unknown.
   if (features->partial != 0)
     return result;
+  // 对于活跃 load 或无 partial 的 store
   const auto &instruction = store ? kDav3510StsCost : kDav3510LdsCost;
   // The base includes the first entry; charge only additional entry issues.
-  double publish_cycles = (features->entries - 1) * kDav3510UbEntryIssueCycles;
-  result.service_cycles =
+  // 基础指令成本已经包含第一个 Entry 的发布成本。所以只需要额外计算剩余 Entry 的发布成本
+  double publish_cycles = (features->entries - 1) * kDav3510UbEntryIssueCycles; 
+  result.service_cycles = // 所有entry的发布占用 entry总数*发布间隔
       double(features->entries) * kDav3510UbEntryIssueCycles;
   result.estimated_latency =
       AddCycles(EstimateInstructionCycles(instruction, 1), publish_cycles);
+      // 估计指令周期 + 额外的 entry 发布占用
   return result;
 }
 
@@ -187,20 +195,25 @@ EstimateSimtUbInstructionLatency(const SimtUbLaneAddresses &addresses,
 // to complete. Track the publisher separately from the latest completion.
 // No concurrency divisor or fitted queue penalty is needed. Missing cost or
 // arithmetic overflow makes the batch unknown.
-std::optional<SimtUbAccessCost> EstimateSimtUbAccessLatency(
+// SimtUbInstructionAccess { 数据包含
+//     addresses,   // 32 个 lane 各自的起始字节地址，空值代表 inactive
+//     bytes,        // 每个 lane 读取/写入多少字节
+//     repetitions  // 这类独立指令实例重复多少次
+// }
+std::optional<SimtUbAccessCost> EstimateSimtUbAccessLatency( // 接收一组同方向的独立指令，计算它们的总延迟
     const std::vector<SimtUbInstructionAccess> &instructions, bool store) {
   SimtUbAccessCost total;
   total.estimated_latency = 0;
   total.service_cycles = 0;
-  for (const auto &instruction : instructions) {
+  for (const auto &instruction : instructions) { // 遍历每条指令，得到每条指令的单次执行成本
     auto cost = EstimateSimtUbInstructionLatency(instruction.addresses,
                                                  instruction.bytes, store);
     if (!cost || !cost->estimated_latency || !cost->service_cycles ||
         instruction.repetitions <= 0)
       return std::nullopt;
-    auto accumulate = [&](int64_t &sum, int64_t count) {
+    auto accumulate = [&](int64_t &sum, int64_t count) { // 局部函数，在后面被调用
       if (count >
-          (std::numeric_limits<int64_t>::max() - sum) / instruction.repetitions)
+          (std::numeric_limits<int64_t>::max() - sum) / instruction.repetitions) // 判断是否溢出
         return false;
       sum += count * instruction.repetitions;
       return true;
@@ -214,18 +227,22 @@ std::optional<SimtUbAccessCost> EstimateSimtUbAccessLatency(
     if (cost->requests == 0)
       continue;
     auto last_start =
-        AddCycles(total.service_cycles,
+        AddCycles(total.service_cycles, // P + (n - 1) × S
                   EstimateInstructionCycles({cost->service_cycles},
                                             instruction.repetitions - 1));
     auto completion = AddCycles(last_start, cost->estimated_latency);
+    // 这一类指令的完成时间 = P + (n - 1) × S + L
+
+    // 更新发布所需时间 P + n × S                
     total.service_cycles =
         AddCycles(total.service_cycles,
                   EstimateInstructionCycles({cost->service_cycles},
                                             instruction.repetitions));
     if (!completion || !total.service_cycles)
-      return std::nullopt;
+      return std::nullopt; 
     total.estimated_latency = std::max(*total.estimated_latency, *completion);
-  }
+    // 更新整个 batch 的最晚完成时间
+  } 
   return total;
 }
 

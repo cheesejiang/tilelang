@@ -38,7 +38,10 @@ case 0～7、10～13 使用 `float`，每 lane 每轮读取 4B；case 8～9 使�
 相差 8B，不是以 4B 步长读取重叠的 8B 范围。8B 输入的高低 32 位均有非零
 数据，输出按完整 64 位累加结果精确校验。
 
-所有 case 的输入值均非零，使用 volatile UB 指针保留重复读取。
+所有 case 的输入值均非零，使用不带 `volatile` 的普通 UB 指针，以观察正常优化下的指令选择。
+重复读取的地址不变，编译器可能将读取外提、合并或消除；必须检查最终设备代码中的
+动态读取次数，不能直接将 cycles/N 当作每次 UB 读取成本。旧版带 `volatile` 的结果
+应单独保存，不与当前版本直接混合比较；去掉该修饰符不保证一定生成 LDS。
 计时区域与上游样例一致：clock() 包围重复读取及累加；UB 初始化在前、
 输出写回在后。保留上游 CANN Open Software License 声明。
 来源：工作区 asc-devkit 的 examples/03_simt_api/02_features/01_api_features/
@@ -176,7 +179,8 @@ rg -n -i 'bank_conflict|lds|sts|clock|timestamp' "$ub_case_build/disasm/device.a
    完全展开时，计时区间应有 N 次对应的读取；若保留循环，则按“循环体内
    读取数 × 实际循环次数 + 尾部读取数”计算。不能只用全文 `rg -c lds`
    当作动态指令数，因为它可能包含初始化、别的函数，或忽略循环次数。
-   `#pragma unroll` 和 `volatile` 是源码意图，最终是否满足仍以指令为准。
+   当前不使用 `volatile`，`#pragma unroll` 也不保证每轮实际执行读取。
+   如果读取被移到计时区间外，或动态次数少于 N，该结果不能用于验证 N 次重复访问的合并成本。
 3. **核对访问类型、宽度和活跃线程。** 检查是 UB load（可能显示为 LDS 类
    指令），每 lane 读 4B，且 32 个 lane 的执行掩码一致。b32 是 32 bit，
    即每 lane 4B；不要误读为每 lane 32B。若某组变成更宽的读取、其他存储空间

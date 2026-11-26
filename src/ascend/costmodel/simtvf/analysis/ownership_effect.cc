@@ -91,9 +91,14 @@ public:
     thread_min_ = minimum->value;
     thread_count_ = extent->value;
     analyzer_.Bind(tx, threads);
-    Stmt lowered = LowerParallelLoop(
-        op->GetRoot(), op->GetLoopLayout(), tx, &analyzer_, layouts,
+    Stmt lowered = LowerParallelLoop( // 转换成以tx为线程索引的IR
+        op->GetRoot(), op->GetLoopLayout(), tx, &analyzer_, layouts, // op->GetRoot()原始Parallel循环, op->GetLoopLayout()当前候选的ownership布局, layouts为当前Buffer存储布局
         op->GetPredicate(tx), true, op->LoopLayoutRequiresPaddingGuard());
+        // 这里复用正式 lowering 的循环划分过程，生成：
+        // - 哪些元素分给哪个线程；
+        // - 每线程还有哪些局部串行迭代；
+        // - 哪些元素组成向量化循环；
+        // - 尾部补齐时，哪些线程或元素需要 guard。
     lowered = Substitute(lowered, bindings);
     // Warp index is an ordinary serial coordinate for period compression.
     Var warp("ub_access_warp");
@@ -102,7 +107,7 @@ public:
         warp, 0,
         Integer((thread_count_ + geometry.warp_size - 1) / geometry.warp_size),
         ForKind::kSerial, Evaluate(0)));
-    VisitStmt(lowered);
+    VisitStmt(lowered); // 遍历IR
     return valid_
                ? std::optional<std::vector<SimtUbAccess>>(std::move(accesses_))
                : std::nullopt;
@@ -134,10 +139,10 @@ private:
       }
       vector_loop_ = loop;
       VisitStmt(op->body);
-      vector_loop_ = Optional<For>();
+      vector_loop_ = Optional<For>(); // 向量化循环
     } else {
       loops_.push_back(loop);
-      VisitStmt(op->body);
+      VisitStmt(op->body); // 串行循环
       loops_.pop_back();
     }
   }
@@ -149,7 +154,7 @@ private:
     predicate_ = saved && op->condition;
     VisitStmt(op->then_case);
     if (op->else_case.defined()) {
-      predicate_ = saved && !op->condition;
+      predicate_ = saved && !op->condition; // 当前执行条件
       VisitStmt(op->else_case.value());
     }
     predicate_ = saved;
@@ -211,7 +216,7 @@ private:
   void Access(const Buffer &buffer, const Array<PrimExpr> &indices,
               bool store) {
     if (!valid_ ||
-        (buffer.scope() != "shared" && buffer.scope() != "shared.dyn"))
+        (buffer.scope() != "shared" && buffer.scope() != "shared.dyn")) // 只分析UB访问
       return;
     if (buffer->dtype.lanes() != 1 || buffer->dtype.bits() < 8) {
       valid_ = false;
@@ -232,15 +237,15 @@ private:
     auto physical_shape = buffer->shape;
     bool remapped = layouts_.count(buffer);
     if (remapped) {
-      physical_indices = layouts_[buffer]->Forward(indices);
+      physical_indices = layouts_[buffer]->Forward(indices); // 应用存储布局
       physical_shape = layouts_[buffer]->OutputShape();
     }
     for (size_t i = 0; i < physical_indices.size(); ++i)
-      address = remapped || buffer->strides.empty()
+      address = remapped || buffer->strides.empty() // 展开物理索引
                     ? address * physical_shape[i] + physical_indices[i]
                     : address + buffer->strides[i] * physical_indices[i];
     int bytes = buffer->dtype.bytes();
-    address = analyzer_.Simplify((address + buffer->elem_offset) * bytes);
+    address = analyzer_.Simplify((address + buffer->elem_offset) * bytes); // 转成字节地址
     // A common 8B-aligned base translation does not change packing. Known
     // elem_offset/stride low bits remain part of the relative byte address.
     SimtUbAccess access{store, {}};
@@ -262,7 +267,7 @@ private:
           return;
         }
         int64_t period = 1;
-        while (period < *extent && !Repeats(address, depth, period))
+        while (period < *extent && !Repeats(address, depth, period)) // Repeats 检查某个周期是否具有相同访问结构，可以复用分析
           period = period > *extent / 2 ? *extent : period * 2;
         for (int64_t i = 0; i < std::min(period, *extent); ++i) {
           values.Set(loop->loop_var, Integer(*min + i));
@@ -336,8 +341,11 @@ private:
           }
           previous = address;
         }
+
         if (regular && delta && *delta > bytes && *delta % bytes == 0)
           strides_->push_back({buffer, *delta / bytes});
+
+
       }
       // Instruction organization: a repeated-address vector load collapses
       // to a scalar load; otherwise vector elements must be contiguous within
@@ -355,10 +363,14 @@ private:
           if (first) {
             broadcast &= *next == *first;
             contiguous &= *next == *first + v * bytes;
+            // 检查如何组织访存
+            //要求同一 lane 的各向量元素具有一致的活跃状态。支持两种情况：
+            // - 重复地址 load：同一 lane 的多个向量元素读取同一地址，模型按一次标量读取组织。
+            // - 连续访问：同一 lane 的向量元素地址连续，按总字节数切成估计机器指令。
           }
         }
       if (!broadcast && !contiguous) {
-        valid_ = false;
+        valid_ = false; // 两者都不满足
         return;
       }
       int64_t vector_bytes = bytes * (broadcast ? 1 : width);
@@ -368,7 +380,7 @@ private:
       // For example, f16x4 becomes two b32 instructions, while f32x2 becomes
       // one b64 instruction. Each emitted slice retains its own lane starts
       // and repetition count for independent pricing by the UB model.
-      int instruction_bytes = bytes < 4 ? 4 : 8;
+      int instruction_bytes = bytes < 4 ? 4 : 8;// 切成估计指令，保留每条指令的lane起始地址
       for (int64_t slice = 0; slice < vector_bytes;
            slice += instruction_bytes) {
         auto request = addresses[0];
@@ -406,8 +418,9 @@ private:
       // Consecutive loads (or stores) feed one pipeline. A direction change
       // drains the preceding batch, conservatively preserving read/write
       // ordering even when different buffers could overlap in machine code.
+      // 将提取出来的指令组织成连续的批次，便于后续计算延迟。按照读写方向组织
       if (!accesses_.empty() && accesses_.back().store == store) {
-        auto &batch = accesses_.back().instructions;
+        auto &batch = accesses_.back().instructions; // 前一个 batch 的 store 标志与当前相同
         batch.insert(batch.end(), access.instructions.begin(),
                      access.instructions.end());
       } else {
@@ -417,6 +430,15 @@ private:
   }
 };
 
+// 例如：
+// load A
+// load B
+// store C
+// load D
+// 组织成：
+// batch 0：load A、load B
+// batch 1：store C
+// batch 2：load D
 } // namespace
 
 // Candidate aggregation: the UB model overlaps independent instructions in a
@@ -511,17 +533,17 @@ std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
     }
     for (const auto &bindings : phases) {
       auto accesses = SimtUbAccessCollector().Collect(
-          loop, thread_bounds[member], layouts, strides, bindings);
+          loop, thread_bounds[member], layouts, strides, bindings); // thread_bounds 线程范围
       if (!accesses)
         return std::nullopt;
       for (const auto &access : *accesses) {
-        auto cost =
+        auto cost = // access 是其中的一个 batch
             EstimateSimtUbAccessLatency(access.instructions, access.store);
         if (!cost || !cost->estimated_latency || !cost->service_cycles)
           return std::nullopt;
         total.ub_access.estimated_latency = AddCycles(
             total.ub_access.estimated_latency,
-            EstimateInstructionCycles({cost->estimated_latency}, *invocations));
+            EstimateInstructionCycles({cost->estimated_latency}, *invocations)); // invocations 外层调用次数
         total.ub_access.service_cycles = AddCycles(
             total.ub_access.service_cycles,
             EstimateInstructionCycles({cost->service_cycles}, *invocations));
@@ -530,7 +552,7 @@ std::optional<OwnershipEffect> AnalyzeOwnershipEffect(
           return std::nullopt;
         auto accumulate = [&](int64_t &sum, int64_t count) {
           if (count >
-              (std::numeric_limits<int64_t>::max() - sum) / *invocations)
+              (std::numeric_limits<int64_t>::max() - sum) / *invocations) // int 溢出判断
             return false;
           sum += count * *invocations;
           return true;

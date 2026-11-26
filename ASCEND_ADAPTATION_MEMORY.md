@@ -1,11 +1,11 @@
 # Ascend950 多型号适配、优化与测试：会话记忆
 
-更新时间：2026-11-16。本文记录需求、讨论结论、已有代码及证据边界，供后续工作接续；不代表所有结论都已在所有型号上实测。
+更新时间：2026-11-18。本文记录需求、讨论结论、已有代码及证据边界，供后续工作接续；不代表所有结论都已在所有型号上实测。
 
 ## 1. 用户需求及工作约束
 
 - 目标：让当前 TileLang Ascend 后端在指定的 31 个 Ascend950 具体型号上可用，借鉴 Triton 的通用架构/规格建模思路，并设计正确性转测与性能对照方案。
-- 当前只有 Ascend950PR_9579 可执行上板实验；用户在另一台机器运行代码并反馈结果。不要自行猜测 SSH 地址或连接 950DT；应提供代码和运行命令。
+- Ascend950PR_9579 由用户上板验证。用户另已授权通过 SSH 别名 `950DT` 访问共享服务器，宿主机已完成 Ascend950DT_9592 实测。登录、共享锁和工具链见第 16 节。
 - 用户希望先讲清方案，明确要求修改后再改代码；不要将讨论中的优化建议直接当作已实现功能。
 - 重点区分：功能可用、数值正确、性能可接受、性能无退化。这些不是同一个结论。
 - 当前不考虑 GM 自动拆分；优化讨论集中于逻辑 blocks 数与 L2 数据复用/遍历分组。
@@ -223,3 +223,44 @@ torch_npu.npu_quant_matmul(
 ## 15. 9579 blocks优化实验实现
 
 用户授权开始代码。新增eager_baseline/block_config.py与block_tuning.py，扩展compare.py的--block-policy（默认original不变）及--target-cores。支持VecAdd SIMT/SIMD、普通GEMM BF16/FP32/mixedFP32；original=64/32，auto=min(目标AIV或Cube核数,任务tile数)，以及C-1/C/C+1/2C候选。构造DSL前决定B，并传给已有num_blocks参数，无框架Pass或原算子默认改动。block_tuning默认smoke+full、每配置三轮profiler，随机化配置顺序、同seed相同输入；保留正确性/原始trace/环境。summary记录actual physical_cores、target_cores、blocks、policy等，speedup_vs_original=原TL耗时/候选TL耗时，原speedup仍是eager/TL。失败不丢弃或生成有效优化收益。显式目标核数只验证配置逻辑，不模拟其他SKU，也不是已实现无卡离线编译。主机测试后上板待用户完成。
+
+## 16. 950DT_9592 共享服务器使用记录
+
+- 用户提供的 SSH 入口为 `ssh 950DT`，经现有 SSH 跳板配置连接。宿主机名为 `aa`，登录账号为 `jyw`。如果当前会话未继承 SSH agent，请让用户在其终端加载密钥并提供当次 `SSH_AUTH_SOCK` 路径。不要把临时 socket 路径写进长期记录。
+- 服务器只有一张共享卡。先用 `npu-guard status --json` 查询设备和锁。所有访问设备的任务都用 `npu-guard run --owner jyw/任务名 --wait 3600 --timeout 3600 -- 命令` 包住完整前台程序，包括 NPU 相关导入、初始化、编译、测试和 profiling。不要在取锁前初始化设备，不让设备子进程后台脱离 guard，不删除锁文件或终止其他用户的进程。任务中断后，核对日志更新时间、远程进程和队列，再判断是否需要重提。实时输出保存到 `/home/jyw/gather-results`，用 `tail -f` 查看。
+- 宿主机已实测 `Ascend950DT_9592`，上报 72 个 AIV。宿主机 `jyw` 默认不在设备组，直接打开 `/dev/davinci0` 会被拒绝。用现有 sudo 权限启动 guard，在锁内通过 `runuser` 让测试以 `jyw` 身份和附加设备组 `HwHiAiUser` 执行。设备节点打开、属性查询和最小加法均已验证。缺少 `npu-smi` 可执行文件时，可用 guard 查询状态，用锁内的 `torch_npu` 探针查询设备属性。
+- TileOPs 的远端仓库为 `https://github.com/yyttt6/TileOPs.git`，默认分支 `ascend950-v0.1.0`。服务器检出目录 `/home/jyw/workspace/TileOPs`，本轮验证提交 `393a84eb`。宿主机解释器为 `/opt/tileops-ci/runtime/venv/bin/python`，令 `PYTHONPATH` 包含检出的 `src`。运行仓库 pytest 时，在锁内显式导入 `torch_npu, tileops._kernels.ascend`，并用 `--tileops-device=npu:0 --tileops-target=detect` 选择已注册的 Ascend 实现。pytest 默认 `builtin` 时曾无法分发到这些实现。
+
+### 宿主机测试命令模板
+
+以下命令在 950DT 宿主机执行。替换最后的 pytest 参数即可选其他用例。CANN 9.3 路径已在本轮验证，复用前检查该副本仍存在。
+
+```bash
+set -o pipefail
+log="/home/jyw/gather-results/bmm-cann93-$(date +%Y%m%d-%H%M%S).log"
+sudo -n /usr/local/bin/npu-guard run \
+  --owner jyw/950dt-bmm-cann93 --wait 3600 --timeout 3600 \
+  -- /usr/sbin/runuser -u jyw -g jyw -G HwHiAiUser -- /bin/bash -c '
+    set -e
+    cd /home/jyw/workspace/TileOPs
+    sdk=/home/jyw/gather-cache/cann93-host.lt1tQL/cann-9.3.0
+    source <(sed "s|/opt/Ascend/cann-9.3.0|$sdk|g" "$sdk/set_env.sh")
+    export BISHENG_HOME="$sdk/x86_64-linux" PATH="$sdk/x86_64-linux/bin:$PATH"
+    export LD_LIBRARY_PATH="/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64/common:$sdk/x86_64-linux/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+    export PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1
+    command -v bisheng
+    bisheng --version
+    exec /opt/tileops-ci/runtime/venv/bin/python -u -c \
+      "import torch_npu, tileops._kernels.ascend, pytest; raise SystemExit(pytest.main())" \
+      -v --tb=short -p no:cacheprovider --tileops-device=npu:0 --tileops-target=detect \
+      "tests/ops/test_bmm.py::test_bmm[smoke-fp16-b4-128]" \
+      "tests/ops/test_bmm.py::test_bmm[smoke-bf16-b4-128]"
+  ' 2>&1 | tee "$log"
+```
+
+- 宿主机默认 `/usr/local/Ascend/ascend-toolkit/set_env.sh` 指向 CANN `9.2.0-beta.2`。该工具链可跑已验证的向量类用例，但 BMM 的 Cube 数据搬运 API 签名与当前 TileLang 生成代码不兼容。宿主机 `/opt/Ascend/cann-9.3.0` 指向 `/home/hzs/cann-9.3.0`，`jyw` 无法读取。已从个人容器复制完整 9.3 工具链到上述 `gather-cache` 路径，约 12 GB。复制版 `set_env.sh` 含原安装绝对路径，使用上面命令在进程内替换。宿主机默认工具链未改动。
+- Docker 个人容器为 `jyw-950dt`，基础镜像 `onboard-950dt:20261026-cann20260916`。设备映射包括 `/dev/davinci0`、`/dev/davinci_manager` 和 `/dev/hisi_hdc`。必须挂载宿主机完整的 `/run/lock/ascend-npu` 和观察入口 `/run/npu-guard`，并使用容器版 guard 及辅助程序。容器以 `sleep infinity` 待命，上板任务需在锁内用 `/opt/onboard/entrypoint.sh /opt/conda/bin/python` 加载 CANN 环境。数字 UID/GID 为 `1004:1005`，附加组 `1001`。现有个人容器已经补齐名称映射，新容器需要重新配置。
+- 容器可以取锁，但普通及特权对照均未跑通 NPU。直接创建张量时 `aclInit` 报 `507899 Resource_Busy`，临时对照容器的跟踪显示打开 `/dev/davinci0` 返回 `EBUSY`。宿主机已成功，日常转测用宿主机。原 `hzy-tileops-dev` 看不到观察 socket，保持其文件和配置不动。用其镜像另起临时对照后能取锁，但仍有 HAL 枚举错误。
+- 已有日志位于 `/home/jyw/gather-results`。 `paged-gather-blocks-20261118.log` 记录 paged cache gather 自动 72、固定 64、固定 80 各四项，全部与 CPU 参考逐元素一致。`ops-ascend-20261118-073401.log` 记录 RoPE 6 项、Softmax 6 项、融合 RMSNorm 量化 3 项通过，BMM 两项在 9.2 编译失败。`bmm-cann93-20261118.log` 记录相同 BMM FP16/BF16 两项在 9.3 上编译、执行和精度都通过。
+- 结论限定在 `Ascend950DT_9592` 宿主机、已测算子和对应工具链。64 和 80 是同一张 72 AIV 卡上的逻辑 blocks 对照。其他 SKU 需用原版自动核数验证设备枚举、编译、执行和精度，性能需要另外测量。
