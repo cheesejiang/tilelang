@@ -31,10 +31,10 @@ and dtype. Both measurements count one input read and one output write.
 RoPE's `launch` accepts `(..., heads, head_dim)` with an even head dimension,
 one position per token, and cosine and sine caches of shape `(max_seq, head_dim)`.
 The output keeps the input shape and dtype. The two caches can use different dtypes.
-Use `--mode all --tune` to compare SIMT and explicit SIMD on the same inputs
-and copy baseline. SIMD uses contiguous DMA for aligned head halves. For
-unaligned halves it uses strided DMA to pad rows in UB and writes back only
-the valid elements. The GM tensors keep their original shapes.
+RoPE uses explicit SIMD. With `head_dim=32`, one FP32 vector handles two
+heads and uses a register permutation to rotate their halves. For unaligned
+halves, strided DMA pads rows in UB and writes back only the valid elements.
+The GM tensors keep their original shapes.
 
 Examples use the configured default target. Set `TILELANG_DEFAULT_TARGET=ascend`
 to select AscendC or `TILELANG_DEFAULT_TARGET=pto` to select PTO.
@@ -52,7 +52,6 @@ python examples/ascend/example_per_token_cast_to_fp8.py
 python examples/ascend/example_per_token_cast_to_fp8.py --mode simd
 python examples/ascend/example_rmsnorm.py --no-bench
 python examples/ascend/example_fused_rope.py --tune
-python examples/ascend/example_fused_rope.py --mode all --tune
 python examples/ascend/example_fused_rope.py --total-k 8192 --heads 16 --head-dim 64 --dtype float16 --cache-dtype float32
 python -m pytest examples/ascend/test_rmsnorm.py -q
 ```
