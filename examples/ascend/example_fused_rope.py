@@ -24,18 +24,24 @@ def tile_limit(heads, dim, dtype, cos_dtype, sin_dtype, mode="simt", position_dt
     data_size, cos_size, sin_size, position_size = (
         torch.empty((), dtype=t).element_size() for t in (dtype, cos_dtype, sin_dtype, position_dtype)
     )
-    data_bytes = 4 * heads * dim * data_size
-    table_bytes = dim * (cos_size + sin_size)
+    data_half = cos_half = sin_half = dim // 2
     reserve = 6 * 32
     if mode == "simd":
-        # SIMD loads read a full vector even when only a prefix participates.
+        data_half = aligned_half(dim, data_size)
+        cos_half = aligned_half(dim, cos_size)
+        sin_half = aligned_half(dim, sin_size)
+        # Full vector loads can extend beyond the final half row.
         reserve += 2 * FP32_LANES * (data_size + cos_size + sin_size) + 6 * 32
+    data_bytes = 8 * heads * data_half * data_size
+    table_bytes = 2 * (cos_half * cos_size + sin_half * sin_size)
+    if mode == "simd":
         table_bytes = 2 * (table_bytes + position_size)
     return (UB_BYTES - reserve) // (data_bytes + table_bytes)
 
 
-def simd_aligned(dim, *dtypes):
-    return all((dim // 2) * torch.empty((), dtype=dtype).element_size() % 32 == 0 for dtype in dtypes)
+def aligned_half(dim, element_size):
+    alignment = 32 // element_size
+    return tilelang.cdiv(dim // 2, alignment) * alignment
 
 
 def fused_rope(
@@ -64,12 +70,15 @@ def fused_rope(
     if mode not in ("simt", "simd"):
         raise ValueError("mode must be simt or simd")
     limit = tile_limit(heads, dim, dtype, cos_dtype, sin_dtype, mode, position_dtype)
-    if mode == "simd" and (limit == 0 or not simd_aligned(dim, dtype, cos_dtype, sin_dtype)):
-        raise ValueError("SIMD requires 32-byte-aligned head halves and one token fitting in UB")
+    if mode == "simd" and limit == 0:
+        raise ValueError("SIMD requires one token fitting in UB")
     if tile_tokens is None:
         tile_tokens = min(tilelang.cdiv(total_k, num_cores), max(1, (limit + 1) // 2))
     if not 1 <= tile_tokens <= max(1, limit):
         raise ValueError(f"tile_tokens must be between 1 and {max(1, limit)}")
+    data_half, cos_half, sin_half = (
+        aligned_half(dim, torch.empty((), dtype=t).element_size()) for t in (dtype, cos_dtype, sin_dtype)
+    )
     dtype, cos_dtype, sin_dtype, position_dtype = (
         str(t).removeprefix("torch.") for t in (dtype, cos_dtype, sin_dtype, position_dtype)
     )
@@ -114,9 +123,9 @@ def fused_rope(
                 store_pair(y, token, head, lane, lo, hi, c_lo, c_hi, s_lo, s_hi)
         T.copy(y, Y[begin : begin + tile_tokens, :, :])
 
-    row_elems = heads * dim
-    tile_elems = tile_tokens * row_elems
-    coeff_elems = tile_tokens * dim
+    tile_rows = tile_tokens * heads * 2
+    tile_elems = tile_rows * half
+    coeff_rows = tile_tokens * 2
     chunks = tilelang.cdiv(half, FP32_LANES)
 
     @T.macro
@@ -129,35 +138,52 @@ def fused_rope(
 
     @T.macro
     def rotate_simd_tile(X, Pos, Cos, Sin, Y, x, y, cos, sin, pos_ub, begin, valid):
-        base = begin * row_elems
-        T.copy(X[base : base + tile_elems], x[:tile_elems])
+        # Pad each half independently so aligned vector accesses can start at either half.
+        first_row = begin * heads * 2
+        if data_half == half:
+            first_elem = first_row * half
+            T.copy(X[first_elem : first_elem + tile_elems], x[:tile_elems])
+        else:
+            x_rows = T.Tensor((tile_rows, data_half), dtype, x.data)
+            T.copy(X[first_row : first_row + tile_rows, :], x_rows[:, :half], pad_value=0)
         T.copy(Pos[begin : begin + tile_tokens], pos_ub[:tile_tokens])
+
+        if cos_half != half:
+            cos_rows = T.Tensor((coeff_rows, cos_half), cos_dtype, cos.data)
+        if sin_half != half:
+            sin_rows = T.Tensor((coeff_rows, sin_half), sin_dtype, sin.data)
         for cache_token in T.serial(valid):
             pos = T.Cast("int32", T.min(pos_ub[cache_token], T.Cast(position_dtype, max_seq - 1)))
-            offset = cache_token * dim
-            T.copy(Cos[pos, :], cos[offset : offset + dim])
-            T.copy(Sin[pos, :], sin[offset : offset + dim])
+            if cos_half == half:
+                T.copy(Cos[pos, :], cos[cache_token * dim : (cache_token + 1) * dim])
+            else:
+                T.copy(Cos[2 * pos : 2 * pos + 2, :], cos_rows[2 * cache_token : 2 * cache_token + 2, :half], pad_value=0)
+            if sin_half == half:
+                T.copy(Sin[pos, :], sin[cache_token * dim : (cache_token + 1) * dim])
+            else:
+                T.copy(Sin[2 * pos : 2 * pos + 2, :], sin_rows[2 * cache_token : 2 * cache_token + 2, :half], pad_value=0)
 
         with T.SimdVF():
             for token in range(valid):
                 for chunk in range(chunks):
                     lanes = T.min(FP32_LANES, half - chunk * FP32_LANES)
                     mask = S.update_mask(lanes)
-                    coeff = token * dim + chunk * FP32_LANES
+                    cos_index = token * 2 * cos_half + chunk * FP32_LANES
+                    sin_index = token * 2 * sin_half + chunk * FP32_LANES
                     c_lo = T.alloc_local((1,), "float32x64")
                     c_hi = T.alloc_local((1,), "float32x64")
                     s_lo = T.alloc_local((1,), "float32x64")
                     s_hi = T.alloc_local((1,), "float32x64")
-                    load_f32(cos, coeff, cos_dtype, mask, c_lo)
-                    load_f32(cos, coeff + half, cos_dtype, mask, c_hi)
-                    load_f32(sin, coeff, sin_dtype, mask, s_lo)
-                    load_f32(sin, coeff + half, sin_dtype, mask, s_hi)
+                    load_f32(cos, cos_index, cos_dtype, mask, c_lo)
+                    load_f32(cos, cos_index + cos_half, cos_dtype, mask, c_hi)
+                    load_f32(sin, sin_index, sin_dtype, mask, s_lo)
+                    load_f32(sin, sin_index + sin_half, sin_dtype, mask, s_hi)
                     for head in range(heads):
-                        index = token * row_elems + head * dim + chunk * FP32_LANES
+                        index = (token * heads + head) * 2 * data_half + chunk * FP32_LANES
                         lo = T.alloc_local((1,), "float32x64")
                         hi = T.alloc_local((1,), "float32x64")
                         load_f32(x, index, dtype, mask, lo)
-                        load_f32(x, index + half, dtype, mask, hi)
+                        load_f32(x, index + data_half, dtype, mask, hi)
                         diag_lo = S.vmul(lo[0], c_lo[0], mask)
                         diag_hi = S.vmul(hi[0], c_hi[0], mask)
                         if backward:
@@ -168,11 +194,15 @@ def fused_rope(
                             out_hi = S.vadd(diag_hi, S.vmul(lo[0], s_hi[0], mask), mask)
                         if dtype == "float32":
                             S.vsts(y[index], out_lo, mask, extent=lanes)
-                            S.vsts(y[index + half], out_hi, mask, extent=lanes)
+                            S.vsts(y[index + data_half], out_hi, mask, extent=lanes)
                         else:
                             S.vsts(y[index], S.vcvt(out_lo, dtype, mask, sat=False), mask, "PK_B32", extent=lanes)
-                            S.vsts(y[index + half], S.vcvt(out_hi, dtype, mask, sat=False), mask, "PK_B32", extent=lanes)
-        T.copy(y[:tile_elems], Y[base : base + tile_elems])
+                            S.vsts(y[index + data_half], S.vcvt(out_hi, dtype, mask, sat=False), mask, "PK_B32", extent=lanes)
+        if data_half == half:
+            T.copy(y[:tile_elems], Y[first_elem : first_elem + tile_elems])
+        else:
+            y_rows = T.Tensor((tile_rows, data_half), dtype, y.data)
+            T.copy(y_rows[:, :half], Y[first_row : first_row + tile_rows, :])
 
     @T.prim_func
     def main(
@@ -184,17 +214,30 @@ def fused_rope(
     ):
         with T.Kernel(blocks) as core:
             if mode == "simd":
-                x_flat = T.Tensor((total_k * row_elems,), dtype, X.data)
-                y_flat = T.Tensor((total_k * row_elems,), dtype, Y.data)
-                x = T.alloc_shared((tile_elems + FP32_LANES,), dtype)
-                y = T.alloc_shared((tile_elems,), dtype)
-                cos = T.alloc_shared((coeff_elems + FP32_LANES,), cos_dtype)
-                sin = T.alloc_shared((coeff_elems + FP32_LANES,), sin_dtype)
+                if data_half == half:
+                    x_view = T.Tensor((total_k * heads * dim,), dtype, X.data)
+                    y_view = T.Tensor((total_k * heads * dim,), dtype, Y.data)
+                else:
+                    x_view = T.Tensor((total_k * heads * 2, half), dtype, X.data)
+                    y_view = T.Tensor((total_k * heads * 2, half), dtype, Y.data)
+                if cos_half == half:
+                    cos_view = Cos
+                else:
+                    cos_view = T.Tensor((max_seq * 2, half), cos_dtype, Cos.data)
+                if sin_half == half:
+                    sin_view = Sin
+                else:
+                    sin_view = T.Tensor((max_seq * 2, half), sin_dtype, Sin.data)
+                x = T.alloc_shared((tile_rows * data_half + FP32_LANES,), dtype)
+                y = T.alloc_shared((tile_rows * data_half,), dtype)
+                cos = T.alloc_shared((coeff_rows * cos_half + FP32_LANES,), cos_dtype)
+                sin = T.alloc_shared((coeff_rows * sin_half + FP32_LANES,), sin_dtype)
                 pos_ub = T.alloc_shared((tile_tokens,), position_dtype)
                 iterations = groups + T.Cast("int32", core < tail_tiles)
                 for step in T.Pipelined(iterations, num_stages=2):
                     begin = (step * blocks + core) * tile_tokens
-                    rotate_simd_tile(x_flat, Pos, Cos, Sin, y_flat, x, y, cos, sin, pos_ub, begin, T.min(tile_tokens, total_k - begin))
+                    valid = T.min(tile_tokens, total_k - begin)
+                    rotate_simd_tile(x_view, Pos, cos_view, sin_view, y_view, x, y, cos, sin, pos_ub, begin, valid)
             elif limit == 0:
                 # A single very wide token exceeds the double-buffer budget.
                 # Stream pairs through registers directly in that case.
@@ -336,8 +379,8 @@ def main():
     cache_dtype = FLOAT_DTYPES[args.cache_dtype or args.dtype]
     modes = ("simt", "simd") if args.mode == "all" else (args.mode,)
     limits = {mode: tile_limit(args.heads, args.head_dim, dtype, cache_dtype, cache_dtype, mode) for mode in modes}
-    if "simd" in modes and (limits["simd"] == 0 or not simd_aligned(args.head_dim, dtype, cache_dtype)):
-        parser.error("SIMD requires 32-byte-aligned head halves and one token fitting in UB")
+    if "simd" in modes and limits["simd"] == 0:
+        parser.error("SIMD requires one token fitting in UB")
     if args.tile_tokens is not None and not 1 <= args.tile_tokens <= max(1, min(limits.values())):
         parser.error(f"tile-tokens must be between 1 and {max(1, min(limits.values()))}")
     if not hasattr(torch, "npu") or not torch.npu.is_available():

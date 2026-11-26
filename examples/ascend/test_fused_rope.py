@@ -17,6 +17,8 @@ from example_fused_rope import launch, reference
         ("simt", (43, 5, 64), torch.float32, torch.float16, torch.bfloat16, torch.int64),
         ("simt", (3, 224, 128), torch.float32, torch.float32, torch.float32, torch.int32),
         ("simd", (43, 56, 32), torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.int64),
+        ("simd", (43, 56, 30), torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.int64),
+        ("simd", (2, 21, 3, 30), torch.float16, torch.float32, torch.float16, torch.int32),
         ("simd", (43, 5, 160), torch.float32, torch.float16, torch.bfloat16, torch.int32),
     ],
 )

@@ -32,8 +32,9 @@ RoPE's `launch` accepts `(..., heads, head_dim)` with an even head dimension,
 one position per token, and cosine and sine caches of shape `(max_seq, head_dim)`.
 The output keeps the input shape and dtype. The two caches can use different dtypes.
 Use `--mode all --tune` to compare SIMT and explicit SIMD on the same inputs
-and copy baseline. The SIMD path requires each head half to occupy a multiple
-of 32 bytes in the input and both caches.
+and copy baseline. SIMD uses contiguous DMA for aligned head halves. For
+unaligned halves it uses strided DMA to pad rows in UB and writes back only
+the valid elements. The GM tensors keep their original shapes.
 
 Examples use the configured default target. Set `TILELANG_DEFAULT_TARGET=ascend`
 to select AscendC or `TILELANG_DEFAULT_TARGET=pto` to select PTO.
