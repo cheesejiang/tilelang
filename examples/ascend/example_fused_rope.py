@@ -111,7 +111,7 @@ def bench_dma_copy(x, output, num_cores, tile_tokens, bench):
     return latency
 
 
-def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=True):
+def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=True, position_prefetch=True):
     """Build the 56-head, 32-element FP16 kernel."""
     limit = tile_limit()
     if min(total_k, num_cores) <= 0:
@@ -126,6 +126,45 @@ def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=Tr
     coeff_elems = tile_tokens * CACHE_ROW
     coeff_guard = FP16_LANES - CACHE_ROW
     schedule = {"enable_offset": True} if prefetch else {}
+
+    @T.macro
+    def load_coefficients(Cache, pos_ub, coeff_ub, valid):
+        for i in T.serial(valid):
+            pos = T.Cast("int32", T.min(pos_ub[i], T.int64(MAX_SEQ - 1)))
+            T.copy(Cache[pos, :], coeff_ub[i * CACHE_ROW : (i + 1) * CACHE_ROW])
+
+    @T.macro
+    def rotate(x, y, coeff_ub, valid):
+        with T.SimdVF():
+            mask = S.pset(16)
+            lane = S.vci(0, "int16")
+            coeff_index = S.vand(lane, S.vdup(HEAD_DIM - 1, "int16"), mask)
+            partner = S.vxor(lane, S.vdup(HEAD_DIM // 2, "int16"), mask)
+            low_half = S.vcmps(coeff_index, HEAD_DIM // 2, mask, op="lt")
+            # Flip the FP16 sign bit without widening the coefficient.
+            sign_bit = S.vdup(0x8000, "uint16")
+            zero = S.vdup(0, "uint16")
+            if backward:
+                sin_index = S.vxor(coeff_index, S.vdup(HEAD_DIM + HEAD_DIM // 2, "int16"), mask)
+                sign = S.vsel(zero, sign_bit, low_half)
+            else:
+                sin_index = S.vxor(coeff_index, S.vdup(HEAD_DIM, "int16"), mask)
+                sign = S.vsel(sign_bit, zero, low_half)
+            for token in range(valid):
+                coeff_bits = T.reinterpret(S.vld(coeff_ub[token * CACHE_ROW]), "uint16x128")
+                c_bits = S.vselr(coeff_bits, coeff_index)
+                s_bits = S.vselr(coeff_bits, sin_index)
+                c = T.reinterpret(c_bits, "float16x128")
+                signed_s = T.reinterpret(S.vxor(s_bits, sign, mask), "float16x128")
+                for group in range(TOKEN_ELEMS // FP16_LANES):
+                    index = token * TOKEN_ELEMS + group * FP16_LANES
+                    values = S.vld(x[index])
+                    rotated_bits = S.vselr(T.reinterpret(values, "uint16x128"), partner)
+                    rotated = T.reinterpret(rotated_bits, "float16x128")
+                    diag = S.vmul(values, c, mask)
+                    cross = S.vmul(rotated, signed_s, mask)
+                    result = S.vadd(diag, cross, mask)
+                    S.vsts(y[index], result, mask, "NORM_B16")
 
     @T.prim_func
     def main(
@@ -148,48 +187,30 @@ def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=Tr
                 begin = (step * blocks + core) * tile_tokens
                 valid = T.min(tile_tokens, total_k - begin)
                 base = begin * TOKEN_ELEMS
-                T.copy(src[base : base + tile_elems], x)
-                T.copy(Pos[begin : begin + tile_tokens], pos_ub)
-                for i in T.serial(valid):
-                    pos = T.Cast("int32", T.min(pos_ub[i], T.int64(MAX_SEQ - 1)))
-                    T.copy(Cache[pos, :], coeff_ub[i * CACHE_ROW : (i + 1) * CACHE_ROW])
-
-                with T.SimdVF():
-                    mask = S.pset(16)
-                    lane = S.vci(0, "int16")
-                    coeff_index = S.vand(lane, S.vdup(HEAD_DIM - 1, "int16"), mask)
-                    partner = S.vxor(lane, S.vdup(HEAD_DIM // 2, "int16"), mask)
-                    low_half = S.vcmps(coeff_index, HEAD_DIM // 2, mask, op="lt")
-                    # Flip the FP16 sign bit without widening the coefficient.
-                    sign_bit = S.vdup(0x8000, "uint16")
-                    zero = S.vdup(0, "uint16")
-                    if backward:
-                        sin_index = S.vxor(coeff_index, S.vdup(HEAD_DIM + HEAD_DIM // 2, "int16"), mask)
-                        sign = S.vsel(zero, sign_bit, low_half)
-                    else:
-                        sin_index = S.vxor(coeff_index, S.vdup(HEAD_DIM, "int16"), mask)
-                        sign = S.vsel(sign_bit, zero, low_half)
-                    for token in range(valid):
-                        coeff_bits = T.reinterpret(S.vld(coeff_ub[token * CACHE_ROW]), "uint16x128")
-                        c_bits = S.vselr(coeff_bits, coeff_index)
-                        s_bits = S.vselr(coeff_bits, sin_index)
-                        c = T.reinterpret(c_bits, "float16x128")
-                        signed_s = T.reinterpret(S.vxor(s_bits, sign, mask), "float16x128")
-                        for group in range(TOKEN_ELEMS // FP16_LANES):
-                            index = token * TOKEN_ELEMS + group * FP16_LANES
-                            values = S.vld(x[index])
-                            rotated_bits = S.vselr(T.reinterpret(values, "uint16x128"), partner)
-                            rotated = T.reinterpret(rotated_bits, "float16x128")
-                            diag = S.vmul(values, c, mask)
-                            cross = S.vmul(rotated, signed_s, mask)
-                            result = S.vadd(diag, cross, mask)
-                            S.vsts(y[index], result, mask, "NORM_B16")
-                T.copy(y, dst[base : base + tile_elems])
+                if position_prefetch and prefetch:
+                    # Fetch positions one tile ahead of the scalar coefficient lookup.
+                    with T.Stage(0):
+                        T.copy(Pos[begin : begin + tile_tokens], pos_ub)
+                    with T.Stage(1):
+                        T.copy(src[base : base + tile_elems], x)
+                        load_coefficients(Cache, pos_ub, coeff_ub, valid)
+                    with T.Stage(2):
+                        rotate(x, y, coeff_ub, valid)
+                    with T.Stage(3):
+                        T.copy(y, dst[base : base + tile_elems])
+                else:
+                    T.copy(src[base : base + tile_elems], x)
+                    T.copy(Pos[begin : begin + tile_tokens], pos_ub)
+                    load_coefficients(Cache, pos_ub, coeff_ub, valid)
+                    rotate(x, y, coeff_ub, valid)
+                    T.copy(y, dst[base : base + tile_elems])
 
     return main
 
 
-def compile_rope(x, positions, cache, *, backward=False, num_cores=None, tile_tokens=None, prefetch=True):
+def compile_rope(
+    x, positions, cache, *, backward=False, num_cores=None, tile_tokens=None, prefetch=True, position_prefetch=True
+):
     """Compile FP16 RoPE with each cache row laid out as [cos, sin]."""
     if x.ndim != 3 or x.shape[1:] != (HEADS, HEAD_DIM) or x.dtype != torch.float16:
         raise ValueError("Input must be FP16 with shape (tokens, 56, 32)")
@@ -202,7 +223,9 @@ def compile_rope(x, positions, cache, *, backward=False, num_cores=None, tile_to
     if num_cores is None:
         num_cores = get_num_vector_cores(x.device.index or 0)
     return tilelang.compile(
-        fused_rope(x.shape[0], num_cores, tile_tokens, backward=backward, prefetch=prefetch),
+        fused_rope(
+            x.shape[0], num_cores, tile_tokens, backward=backward, prefetch=prefetch, position_prefetch=position_prefetch
+        ),
         target="ascend",
     )
 
@@ -271,6 +294,10 @@ def main():
     parser.add_argument("--tile-tokens", type=int)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True, help="overlap DMA and SIMD across tiles")
+    parser.add_argument(
+        "--position-prefetch", action=argparse.BooleanOptionalAction, default=True,
+        help="prefetch the next position tile before reading the current one",
+    )
     parser.add_argument("--mte2-baseline", action="store_true", help="measure a matched GM-to-UB read baseline per tile")
     parser.add_argument("--dma-baseline", action="store_true", help="measure a matched TileLang DMA copy per tile")
     args = parser.parse_args()
@@ -333,7 +360,8 @@ def main():
         timings = []
         for tile_tokens in tiles:
             kernel = compile_rope(
-                x, *tables, num_cores=num_cores, tile_tokens=tile_tokens, backward=backward, prefetch=args.prefetch
+                x, *tables, num_cores=num_cores, tile_tokens=tile_tokens, backward=backward,
+                prefetch=args.prefetch, position_prefetch=args.position_prefetch,
             )
             kernel(x, *tables, output)
             max_error, rel_l2 = check_accuracy(output, x, positions, cos, sin, backward)

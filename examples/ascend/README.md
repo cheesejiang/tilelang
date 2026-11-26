@@ -41,7 +41,9 @@ coefficient tables. Each 128-lane FP16 vector handles four heads. The
 benchmark packs the cos and sin tables together before timing, so the
 kernel fetches both coefficient rows with one DMA per token.
 RoPE uses an offset pipeline and double-buffered inputs and outputs by default.
-Add `--no-prefetch` to compare against the previous schedule at the same tile size.
+Positions are fetched one tile before the scalar coefficient lookup.
+Add `--no-position-prefetch` to compare with the previous double-buffered
+schedule, or `--no-prefetch` to disable the offset pipeline.
 
 Examples use the configured default target. Set `TILELANG_DEFAULT_TARGET=ascend`
 to select AscendC or `TILELANG_DEFAULT_TARGET=pto` to select PTO.
