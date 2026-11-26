@@ -55,6 +55,39 @@ JSON 的 `profile.directory` 给出准确路径，`capture.json` 保存文件清
 “一条指令等于多少 entry”。本实验不自动解析 ISA，不声称已经确定流水线瓶颈。
 强制串行/独立度实验以及空 VF 的 DMA 对照不在这次真实 kernel 对照中。
 
+## 对指定配置反汇编
+
+不重新执行 kernel，原样重新编译已保存的实际 `.cpp`（不添加 volatile），再反汇编：
+
+```bash
+python examples/ascend/layout_workloads/disassemble_workload.py \
+  --root /tmp/ub-bottleneck-study --variants p8 p8-scalar
+```
+
+可选择 baseline、baseline-scalar、ownership、padding-search、p1/p2/p4/p8/p16 等。
+也可直接指定文件，或指定已提取的设备 ELF 来跳过编译：
+
+```bash
+python examples/ascend/layout_workloads/disassemble_workload.py \
+  --source /tmp/ub-bottleneck-study/p8/gemm_scale/baseline.cpp \
+  --objdump /实际路径/llvm-objdump
+```
+
+默认使用与本仓相同的 -O2 / C++20 / dav-3510 / dcpreload=false 配置，并加入本仓
+src 头文件目录。原实测有额外参数时用 `--compile-arg=-FLAG` 逐项追加；可用
+`--compiler`、`--arch`、`-I` 指定原工具链与头文件。原有 `.cpp` 不会被修改。
+重编译不等于证明与实测二进制逐字节一致；manifest 明确记录这一限制。
+
+结果保存在 `ROOT/isa/<唯一编号>/配置名/`，包括 `device.asm`、`isa_hints.txt`、
+`device.info.txt`、编译日志、`review.md` 和带源码/目标文件 SHA256 与完整命令的
+`manifest.json`。`--output` 可替换 ROOT/isa 这个输出父目录。
+必须使用支持 dav-3510 的反汇编器；出现 unknown/not available 会返回失败状态，
+而不是当作有效 ISA。当前脚本直接处理设备 ELF；host ELF 需要先用 msobjdump 提取设备代码。
+
+定位 `main_kernel_simt_vf_0`，核对默认 p8 的 64 LDS.b64 + 64 STS.b64，和 scalar
+版本是否真的为 128 LDS.b32 + 128 STS.b32。还要检查循环次数、lane 掩码、每 lane
+地址覆盖以及 IADD、FMUL 和等待指令。文本行数只是静态计数，脚本不会自动认定动态数量。
+
 也可单独对任意原 case 采集 profile：
 
 ```bash
