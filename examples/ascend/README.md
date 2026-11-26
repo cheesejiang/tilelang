@@ -10,7 +10,7 @@ RoPE computes its reference on the CPU. The other examples below run their refer
 | [GEMM](example_gemm.py) | Persistent matrix multiplication with swizzling, precision modes and a mixed-core epilogue |
 | [Split-K GEMM](example_gemm_splitk.py) | Atomic or deterministic reduction across K partitions |
 | [Vector addition](example_vecadd.py) | SIMT and explicit SIMD with pipelined data movement |
-| [Fused RoPE](example_fused_rope.py) | Native BF16 rotate-half forward and input gradient for the 56-head workload |
+| [Fused RoPE](example_fused_rope.py) | Native FP16 rotate-half forward and input gradient for the 56-head workload |
 | [RMSNorm](example_rmsnorm.py) | SIMT fragments, reduction and pipelined row processing |
 | [FP8 quantization](example_per_token_cast_to_fp8.py) | The same group-wise quantization in SIMT and explicit SIMD |
 
@@ -36,9 +36,12 @@ logical GM-to-UB bandwidth including input, positions and coefficient rows.
 `mte2_bw` divides that number by the input-only stream bandwidth.
 `--dma-baseline` also times a double-buffered TileLang copy with the same tile
 assignment. `dma_bw` is the RoPE input/output bandwidth relative to that copy.
-The benchmark uses `(600000, 56, 32)` BF16 data and `(4096, 32)` BF16
-coefficient tables. Each 128-lane BF16 vector handles four heads, with BF16
-multiplication and addition matching the rounding points of the CPU reference.
+The benchmark uses `(600000, 56, 32)` FP16 data and `(4096, 32)` FP16
+coefficient tables. Each 128-lane FP16 vector handles four heads. The
+benchmark packs the cos and sin tables together before timing, so the
+kernel fetches both coefficient rows with one DMA per token.
+RoPE uses an offset pipeline and double-buffered inputs and outputs by default.
+Add `--no-prefetch` to compare against the previous schedule at the same tile size.
 
 Examples use the configured default target. Set `TILELANG_DEFAULT_TARGET=ascend`
 to select AscendC or `TILELANG_DEFAULT_TARGET=pto` to select PTO.
