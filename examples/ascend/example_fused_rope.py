@@ -87,6 +87,43 @@ def bench_mte2_read(x, num_cores, tile_tokens, bench):
     return latency, x.numel() * x.element_size() / (latency * 1e6)
 
 
+def dma_copy_baseline(total_k, heads, dim, dtype, num_cores, tile_tokens):
+    """Use the aligned RoPE tile assignment for a double-buffered device copy."""
+    dtype = str(dtype).removeprefix("torch.")
+    total_elems = total_k * heads * dim
+    tile_elems = tile_tokens * heads * dim
+    num_tiles = tilelang.cdiv(total_k, tile_tokens)
+    blocks = min(num_cores, num_tiles)
+    groups, tail_tiles = divmod(num_tiles, blocks)
+
+    @T.prim_func
+    def main(X: T.Tensor((total_k, heads, dim), dtype), Y: T.Tensor((total_k, heads, dim), dtype)):
+        with T.Kernel(blocks) as core:
+            src = T.Tensor((total_elems,), dtype, X.data)
+            dst = T.Tensor((total_elems,), dtype, Y.data)
+            ub = T.alloc_shared((tile_elems,), dtype)
+            T.annotate_buffer_versions({ub: 2})
+            iterations = groups + T.Cast("int32", core < tail_tiles)
+            for step in T.Pipelined(iterations, num_stages=2):
+                start = (step * blocks + core) * tile_elems
+                T.copy(src[start : start + tile_elems], ub)
+                T.copy(ub, dst[start : start + tile_elems])
+
+    return main
+
+
+def bench_dma_copy(x, output, num_cores, tile_tokens, bench):
+    kernel = tilelang.compile(dma_copy_baseline(*x.shape, x.dtype, num_cores, tile_tokens), target="ascend")
+    output.fill_(float("nan"))
+    kernel(x, output)
+    torch.testing.assert_close(output[::tile_tokens, 0, 0], x[::tile_tokens, 0, 0], rtol=0, atol=0)
+    torch.testing.assert_close(output[-1], x[-1], rtol=0, atol=0)
+    latency = bench(lambda: kernel(x, output))
+    if latency <= 0:
+        raise RuntimeError("Device timer did not resolve the TileLang DMA copy baseline")
+    return latency
+
+
 def fused_rope(
     total_k,
     max_seq,
@@ -336,16 +373,33 @@ def launch(x, positions, cos, sin, *, backward=False, **config):
     return output
 
 
+def torch_ref(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cached: torch.Tensor,
+    sin_cached: torch.Tensor,
+) -> torch.Tensor:
+    max_seq = cos_cached.shape[0]
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    positions = torch.clamp(positions, max=max_seq - 1)
+    cos = cos_cached[positions].unsqueeze(1)
+    sin = sin_cached[positions].unsqueeze(1)
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    rotate_half = torch.cat([-x2, x1], dim=-1)
+    return x * cos.to(x.dtype) + rotate_half * sin.to(x.dtype)
+
+
 def reference(x, positions, cos, sin, backward=False):
-    positions = positions.clamp(max=cos.shape[0] - 1)
-    cos = cos[positions, None].float()
-    sin = sin[positions, None].float()
-    lo, hi = x.float().chunk(2, dim=-1)
-    c_lo, c_hi = cos.chunk(2, dim=-1)
-    s_lo, s_hi = sin.chunk(2, dim=-1)
-    if backward:
-        return torch.cat((lo * c_lo + hi * s_hi, hi * c_hi - lo * s_lo), dim=-1).to(x.dtype)
-    return torch.cat((lo * c_lo - hi * s_lo, hi * c_hi + lo * s_hi), dim=-1).to(x.dtype)
+    if not backward:
+        return torch_ref(x, positions, cos, sin)
+    with torch.enable_grad():
+        # RoPE is linear in x, so the input gradient is independent of the forward input.
+        x_req = x.detach().clone().requires_grad_(True)
+        golden_out = torch_ref(x_req, positions, cos, sin)
+        (golden_dx,) = torch.autograd.grad(golden_out, x_req, x)
+    return golden_dx
 
 
 def check_accuracy(output, x, positions, cos, sin, backward):
@@ -379,6 +433,7 @@ def main():
     parser.add_argument("--tile-tokens", type=int)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--mte2-baseline", action="store_true", help="measure a matched GM-to-UB read baseline per tile")
+    parser.add_argument("--dma-baseline", action="store_true", help="measure a matched TileLang DMA copy per tile")
     args = parser.parse_args()
     if min(args.total_k, args.max_seq, args.iters, args.heads, args.head_dim) <= 0 or args.head_dim % 2:
         parser.error("sizes and iterations must be positive, and head-dim must be even")
@@ -386,6 +441,8 @@ def main():
         parser.error("cores must be positive")
     dtype = FLOAT_DTYPES[args.dtype]
     cache_dtype = FLOAT_DTYPES[args.cache_dtype or args.dtype]
+    if args.dma_baseline and args.head_dim != 32:
+        parser.error("--dma-baseline currently compares the head-dim=32 path")
     limit = tile_limit(args.heads, args.head_dim, dtype, cache_dtype, cache_dtype)
     if limit == 0:
         parser.error("SIMD requires one token fitting in UB")
@@ -420,6 +477,7 @@ def main():
         positions.element_size() + args.head_dim * (cos.element_size() + sin.element_size())
     )
     read_baselines = {}
+    dma_copy_times = {}
 
     for backward in (False, True):
         label = "backward" if backward else "forward"
@@ -435,6 +493,11 @@ def main():
                     read_ms, read_gbps = bench_mte2_read(x, num_cores, tile_tokens, bench)
                     read_baselines[tile_tokens] = read_gbps
                     print(f"GM-to-UB baseline tile={tile_tokens:2}  {read_ms:.4f} ms  {read_gbps:.1f} GB/s")
+            if args.dma_baseline:
+                for tile_tokens in tiles:
+                    dma_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench)
+                    dma_copy_times[tile_tokens] = dma_ms
+                    print(f"TileLang DMA copy tile={tile_tokens:2}  {dma_ms:.4f} ms  {io_bytes / (dma_ms * 1e6):.1f} GB/s")
         timings = []
         for tile_tokens in tiles:
             kernel = compile_rope(x, *tables, num_cores=num_cores, tile_tokens=tile_tokens, backward=backward)
@@ -446,10 +509,11 @@ def main():
             if args.mte2_baseline:
                 read_gbps = read_bytes / (latency * 1e6)
                 mte2 = f" mte2_read={read_gbps:.1f} GB/s mte2_bw={read_gbps / read_baselines[tile_tokens]:.1%}"
+            dma = f" dma_bw={dma_copy_times[tile_tokens] / latency:.1%}" if args.dma_baseline else ""
             timings.append((latency, tile_tokens))
             print(
                 f"{label:8} simd tile={tile_tokens:2}  {latency:.4f} ms  {gbps:.1f} GB/s (input/output)  "
-                f"copy_bw={copy_ms / latency:.1%}{mte2}  max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}"
+                f"copy_bw={copy_ms / latency:.1%}{dma}{mte2}  max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}"
             )
         if args.tune:
             latency, tile_tokens = min(timings)

@@ -34,6 +34,9 @@ geometry, reuses one UB tile per core, and writes one 32-byte sink per core.
 `mte2_read` estimates RoPE's
 logical GM-to-UB bandwidth including input, positions and coefficient rows.
 `mte2_bw` divides that number by the input-only stream bandwidth.
+For `head_dim=32`, `--dma-baseline` also times a double-buffered TileLang copy
+with the same tile assignment. `dma_bw` is the RoPE input/output bandwidth
+relative to that copy.
 RoPE's `launch` accepts `(..., heads, head_dim)` with an even head dimension,
 one position per token, and cosine and sine caches of shape `(max_seq, head_dim)`.
 The output keeps the input shape and dtype. The two caches can use different dtypes.
@@ -59,6 +62,7 @@ python examples/ascend/example_per_token_cast_to_fp8.py --mode simd
 python examples/ascend/example_rmsnorm.py --no-bench
 python examples/ascend/example_fused_rope.py --tune
 python examples/ascend/example_fused_rope.py --tile-tokens 7 --mte2-baseline
+python examples/ascend/example_fused_rope.py --tile-tokens 7 --dma-baseline
 python examples/ascend/example_fused_rope.py --total-k 8192 --heads 16 --head-dim 64 --dtype float16 --cache-dtype float32
 python -m pytest examples/ascend/test_rmsnorm.py -q
 ```
