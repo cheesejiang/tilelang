@@ -77,11 +77,12 @@ def bench_mte2_read(x, num_cores, tile_tokens, bench):
     return latency, x.numel() * FP16_BYTES / (latency * 1e6)
 
 
-def dma_copy_baseline(total_k, num_cores, tile_tokens):
+def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False):
     """Use the same tile assignment for a double-buffered device copy."""
     total_elems = total_k * TOKEN_ELEMS
     tile_elems = tile_tokens * TOKEN_ELEMS
     blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
+    schedule = {"enable_offset": True} if offset else {}
 
     @T.prim_func
     def main(X: T.Tensor((total_k, HEADS, HEAD_DIM), FP16), Y: T.Tensor((total_k, HEADS, HEAD_DIM), FP16)):
@@ -91,16 +92,22 @@ def dma_copy_baseline(total_k, num_cores, tile_tokens):
             ub = T.alloc_shared((tile_elems,), FP16)
             T.annotate_buffer_versions({ub: 2})
             iterations = groups + T.Cast("int32", core < tail_tiles)
-            for step in T.Pipelined(iterations, num_stages=2):
+            for step in T.Pipelined(iterations, num_stages=2, annotations=schedule):
                 start = (step * blocks + core) * tile_elems
-                T.copy(src[start : start + tile_elems], ub)
-                T.copy(ub, dst[start : start + tile_elems])
+                if offset:
+                    with T.Stage(0):
+                        T.copy(src[start : start + tile_elems], ub)
+                    with T.Stage(1):
+                        T.copy(ub, dst[start : start + tile_elems])
+                else:
+                    T.copy(src[start : start + tile_elems], ub)
+                    T.copy(ub, dst[start : start + tile_elems])
 
     return main
 
 
-def bench_dma_copy(x, output, num_cores, tile_tokens, bench):
-    kernel = tilelang.compile(dma_copy_baseline(x.shape[0], num_cores, tile_tokens), target="ascend")
+def bench_dma_copy(x, output, num_cores, tile_tokens, bench, *, offset=False):
+    kernel = tilelang.compile(dma_copy_baseline(x.shape[0], num_cores, tile_tokens, offset=offset), target="ascend")
     output.fill_(float("nan"))
     kernel(x, output)
     torch.testing.assert_close(output[::tile_tokens, 0, 0], x[::tile_tokens, 0, 0], rtol=0, atol=0)
@@ -111,7 +118,7 @@ def bench_dma_copy(x, output, num_cores, tile_tokens, bench):
     return latency
 
 
-def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=True, position_prefetch=True):
+def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=False, position_prefetch=False):
     """Build the 56-head, 32-element FP16 kernel."""
     limit = tile_limit()
     if min(total_k, num_cores) <= 0:
@@ -125,6 +132,7 @@ def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=Tr
     tile_elems = tile_tokens * TOKEN_ELEMS
     coeff_elems = tile_tokens * CACHE_ROW
     coeff_guard = FP16_LANES - CACHE_ROW
+    prefetch = prefetch or position_prefetch
     schedule = {"enable_offset": True} if prefetch else {}
 
     @T.macro
@@ -187,7 +195,7 @@ def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=Tr
                 begin = (step * blocks + core) * tile_tokens
                 valid = T.min(tile_tokens, total_k - begin)
                 base = begin * TOKEN_ELEMS
-                if position_prefetch and prefetch:
+                if position_prefetch:
                     # Fetch positions one tile ahead of the scalar coefficient lookup.
                     with T.Stage(0):
                         T.copy(Pos[begin : begin + tile_tokens], pos_ub)
@@ -209,7 +217,7 @@ def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=Tr
 
 
 def compile_rope(
-    x, positions, cache, *, backward=False, num_cores=None, tile_tokens=None, prefetch=True, position_prefetch=True
+    x, positions, cache, *, backward=False, num_cores=None, tile_tokens=None, prefetch=False, position_prefetch=False
 ):
     """Compile FP16 RoPE with each cache row laid out as [cos, sin]."""
     if x.ndim != 3 or x.shape[1:] != (HEADS, HEAD_DIM) or x.dtype != torch.float16:
@@ -293,13 +301,16 @@ def main():
     parser.add_argument("--cores", type=int, help="override the device vector core count")
     parser.add_argument("--tile-tokens", type=int)
     parser.add_argument("--tune", action="store_true")
-    parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True, help="overlap DMA and SIMD across tiles")
     parser.add_argument(
-        "--position-prefetch", action=argparse.BooleanOptionalAction, default=True,
+        "--prefetch", action=argparse.BooleanOptionalAction, default=False, help="try an offset DMA/SIMD pipeline"
+    )
+    parser.add_argument(
+        "--position-prefetch", action=argparse.BooleanOptionalAction, default=False,
         help="prefetch the next position tile before reading the current one",
     )
     parser.add_argument("--mte2-baseline", action="store_true", help="measure a matched GM-to-UB read baseline per tile")
     parser.add_argument("--dma-baseline", action="store_true", help="measure a matched TileLang DMA copy per tile")
+    parser.add_argument("--dma-offset", action="store_true", help="also measure the offset schedule for the TileLang DMA copy")
     args = parser.parse_args()
     if args.iters <= 0 or (args.cores is not None and args.cores <= 0):
         parser.error("iterations and cores must be positive")
@@ -352,11 +363,17 @@ def main():
                     read_ms, read_gbps = bench_mte2_read(x, num_cores, tile_tokens, bench)
                     read_baselines[tile_tokens] = read_gbps
                     print(f"GM-to-UB baseline tile={tile_tokens:2}  {read_ms:.4f} ms  {read_gbps:.1f} GB/s")
-            if args.dma_baseline:
+            if args.dma_baseline or args.dma_offset:
                 for tile_tokens in tiles:
                     dma_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench)
                     dma_copy_times[tile_tokens] = dma_ms
                     print(f"TileLang DMA copy tile={tile_tokens:2}  {dma_ms:.4f} ms  {io_bytes / (dma_ms * 1e6):.1f} GB/s")
+                    if args.dma_offset:
+                        offset_ms = bench_dma_copy(x, output, num_cores, tile_tokens, bench, offset=True)
+                        print(
+                            f"TileLang DMA copy offset tile={tile_tokens:2}  {offset_ms:.4f} ms  "
+                            f"{io_bytes / (offset_ms * 1e6):.1f} GB/s  speedup={dma_ms / offset_ms:.3f}x"
+                        )
         timings = []
         for tile_tokens in tiles:
             kernel = compile_rope(
@@ -371,7 +388,7 @@ def main():
             if args.mte2_baseline:
                 read_gbps = read_bytes / (latency * 1e6)
                 mte2 = f" mte2_read={read_gbps:.1f} GB/s mte2_bw={read_gbps / read_baselines[tile_tokens]:.1%}"
-            dma = f" dma_bw={dma_copy_times[tile_tokens] / latency:.1%}" if args.dma_baseline else ""
+            dma = f" dma_bw={dma_copy_times[tile_tokens] / latency:.1%}" if tile_tokens in dma_copy_times else ""
             timings.append((latency, tile_tokens))
             print(
                 f"{label:8} simd tile={tile_tokens:2}  {latency:.4f} ms  {gbps:.1f} GB/s (input/output)  "

@@ -36,14 +36,15 @@ logical GM-to-UB bandwidth including input, positions and coefficient rows.
 `mte2_bw` divides that number by the input-only stream bandwidth.
 `--dma-baseline` also times a double-buffered TileLang copy with the same tile
 assignment. `dma_bw` is the RoPE input/output bandwidth relative to that copy.
+Use `--dma-offset` to time both DMA copy schedules. The offset variant writes
+the previous tile and reads the next tile in the same loop iteration.
 The benchmark uses `(600000, 56, 32)` FP16 data and `(4096, 32)` FP16
 coefficient tables. Each 128-lane FP16 vector handles four heads. The
 benchmark packs the cos and sin tables together before timing, so the
 kernel fetches both coefficient rows with one DMA per token.
-RoPE uses an offset pipeline and double-buffered inputs and outputs by default.
-Positions are fetched one tile before the scalar coefficient lookup.
-Add `--no-position-prefetch` to compare with the previous double-buffered
-schedule, or `--no-prefetch` to disable the offset pipeline.
+RoPE defaults to the original packed FP16 schedule. Use `--prefetch` to try
+the offset DMA/SIMD pipeline, or `--position-prefetch` to also fetch positions
+one tile before the scalar coefficient lookup.
 
 Examples use the configured default target. Set `TILELANG_DEFAULT_TARGET=ascend`
 to select AscendC or `TILELANG_DEFAULT_TARGET=pto` to select PTO.
