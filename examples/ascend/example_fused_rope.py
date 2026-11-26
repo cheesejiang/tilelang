@@ -5,6 +5,7 @@ several tile configurations on the current device with `--tune`.
 """
 
 import argparse
+from functools import partial
 from itertools import product
 
 import torch
@@ -263,10 +264,20 @@ def main():
     default_tile = min(tokens_per_core, max(1, (limit + 1) // 2))
     tiles = sorted({min(tokens_per_core, max(1, tile)) for tile in (limit // 4, default_tile, 3 * limit // 4, limit)})
     configs = list(product(tiles, (256, 512, 1024))) if args.tune else [(args.tile_tokens or default_tile, args.threads)]
+    bench = partial(
+        do_bench, backend="event", device=device, return_mode="median", _n_warmup=10, _n_repeat=args.iters
+    )
+    io_bytes = 2 * output.numel() * output.element_size()
 
     for backward in (False, True):
         label = "backward" if backward else "forward"
         x = torch.randn(shape, device=device, dtype=dtype)
+        if not backward:
+            # Reuse the preallocated RoPE buffers for the same-device copy.
+            copy_ms = bench(lambda: output.copy_(x))
+            if copy_ms <= 0:
+                raise RuntimeError("Device timer did not resolve the copy baseline")
+            print(f"copy baseline (torch.Tensor.copy_)  {copy_ms:.4f} ms  {io_bytes / (copy_ms * 1e6):.1f} GB/s")
         timings = []
         for tile_tokens, threads in configs:
             kernel = compile_rope(
@@ -274,24 +285,18 @@ def main():
             )
             kernel(x, *tables, output)
             max_error, rel_l2 = check_accuracy(output, x, positions, cos, sin, backward)
-            latency = do_bench(
-                lambda: kernel(x, *tables, output),
-                backend="event",
-                device=device,
-                return_mode="median",
-                _n_warmup=10,
-                _n_repeat=args.iters,
-            )
-            gbps = 2 * x.numel() * x.element_size() / (latency * 1e6)
+            latency = bench(lambda: kernel(x, *tables, output))
+            gbps = io_bytes / (latency * 1e6)
             timings.append((latency, tile_tokens, threads))
             print(
                 f"{label:8} tile={tile_tokens:2} threads={threads:4} "
                 f"{latency:.4f} ms  {gbps:.1f} GB/s (input/output)  "
+                f"copy_bw={copy_ms / latency:.1%}  "
                 f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}"
             )
         if args.tune:
             latency, tile_tokens, threads = min(timings)
-            print(f"{label:8} best tile={tile_tokens} threads={threads}  {latency:.4f} ms")
+            print(f"{label:8} best tile={tile_tokens} threads={threads}  {latency:.4f} ms  copy_bw={copy_ms / latency:.1%}")
         del x
     print("ACCURACY: PASS")
 

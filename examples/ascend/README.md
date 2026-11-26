@@ -25,6 +25,9 @@ auxiliary outputs such as FP8 scales and RMSNorm RSTD.
 GEMM throughput uses `2 * M * N * K` operations, including for Split-K.
 RoPE reports input/output bandwidth and selects the fastest measured configuration
 for each direction with `--tune`. Use `--no-bench` where supported to run only correctness checks.
+RoPE's `copy_bw` is its input/output bandwidth divided by the measured bandwidth
+of a same-device `torch.Tensor.copy_` between contiguous tensors of the same shape
+and dtype. Both measurements count one input read and one output write.
 RoPE's `launch` accepts `(..., heads, head_dim)` with an even head dimension,
 one position per token, and cosine and sine caches of shape `(max_seq, head_dim)`.
 The output keeps the input shape and dtype. The two caches can use different dtypes.
