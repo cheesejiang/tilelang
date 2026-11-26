@@ -82,27 +82,43 @@ def dma_copy_baseline(total_k, num_cores, tile_tokens, *, offset=False):
     total_elems = total_k * TOKEN_ELEMS
     tile_elems = tile_tokens * TOKEN_ELEMS
     blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
-    schedule = {"enable_offset": True} if offset else {}
 
     @T.prim_func
     def main(X: T.Tensor((total_k, HEADS, HEAD_DIM), FP16), Y: T.Tensor((total_k, HEADS, HEAD_DIM), FP16)):
         with T.Kernel(blocks) as core:
             src = T.Tensor((total_elems,), FP16, X.data)
             dst = T.Tensor((total_elems,), FP16, Y.data)
-            ub = T.alloc_shared((tile_elems,), FP16)
-            T.annotate_buffer_versions({ub: 2})
             iterations = groups + T.Cast("int32", core < tail_tiles)
-            for step in T.Pipelined(iterations, num_stages=2, annotations=schedule):
-                start = (step * blocks + core) * tile_elems
-                if offset:
-                    with T.Stage(0):
-                        T.copy(src[start : start + tile_elems], ub)
-                    with T.Stage(1):
-                        T.copy(ub, dst[start : start + tile_elems])
-                else:
+            if offset:
+                ub = T.alloc_shared((2, tile_elems), FP16)
+                T.ascend_set_flag("MTE3_MTE2", 0)
+                T.ascend_set_flag("MTE3_MTE2", 1)
+                for step in T.serial(iterations + 1):
+                    if step < iterations:
+                        start = (step * blocks + core) * tile_elems
+                        T.ascend_wait_flag("MTE3_MTE2", step % 2)
+                        T.copy(src[start : start + tile_elems], ub[step % 2, :])
+                        T.ascend_set_flag("MTE2_MTE3", step % 2)
+                    if step > 0:
+                        previous = ((step - 1) * blocks + core) * tile_elems
+                        T.ascend_wait_flag("MTE2_MTE3", (step - 1) % 2)
+                        T.copy(ub[(step - 1) % 2, :], dst[previous : previous + tile_elems])
+                        T.ascend_set_flag("MTE3_MTE2", (step - 1) % 2)
+                T.ascend_wait_flag("MTE3_MTE2", 0)
+                T.ascend_wait_flag("MTE3_MTE2", 1)
+            else:
+                ub = T.alloc_shared((tile_elems,), FP16)
+                T.annotate_buffer_versions({ub: 2})
+                for step in T.Pipelined(iterations, num_stages=2):
+                    start = (step * blocks + core) * tile_elems
                     T.copy(src[start : start + tile_elems], ub)
                     T.copy(ub, dst[start : start + tile_elems])
 
+    if offset:
+        main = main.with_attr("tilelang_pass_configs", {
+            "tl.enable_auto_schedule": False,
+            "tl.disable_thread_storage_sync": True,
+        })
     return main
 
 
