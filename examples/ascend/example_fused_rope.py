@@ -13,70 +13,59 @@ import tilelang.ascend.language as T
 from tilelang.carver.arch.driver.ascend_driver import get_num_vector_cores
 from tilelang.profiler import do_bench
 
-FLOAT_DTYPES = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+TOTAL_K = 600_000
+HEADS = 56
+HEAD_DIM = 32
+MAX_SEQ = 4096
+BF16 = "bfloat16"
+BF16_BYTES = 2
+BF16_LANES = 128
 UB_BYTES = 208 * 1024
-FP32_LANES = 64
+TOKEN_ELEMS = HEADS * HEAD_DIM
 S = T.simd
 
 
-def tile_limit(heads, dim, dtype, cos_dtype, sin_dtype, position_dtype=torch.int64):
-    data_size, cos_size, sin_size, position_size = (
-        torch.empty((), dtype=t).element_size() for t in (dtype, cos_dtype, sin_dtype, position_dtype)
-    )
-    data_half = aligned_half(dim, data_size)
-    cos_half = aligned_half(dim, cos_size)
-    sin_half = aligned_half(dim, sin_size)
-    # Reserve space for two versions of each buffer, their alignment, and vector overreads.
-    reserve = 12 * 32 + 2 * FP32_LANES * (data_size + cos_size + sin_size)
-    data_bytes = 8 * heads * data_half * data_size
-    table_bytes = 4 * (cos_half * cos_size + sin_half * sin_size) + 2 * position_size
-    return (UB_BYTES - reserve) // (data_bytes + table_bytes)
+def tile_limit():
+    # Two versions of input, output, both coefficient tiles, and positions.
+    coeff_guard = BF16_LANES - HEAD_DIM
+    reserve = 12 * 32 + 4 * coeff_guard * BF16_BYTES
+    bytes_per_token = 4 * (TOKEN_ELEMS + HEAD_DIM) * BF16_BYTES + 2 * 8
+    return (UB_BYTES - reserve) // bytes_per_token
 
 
-def aligned_half(dim, element_size):
-    alignment = 32 // element_size
-    return tilelang.cdiv(dim // 2, alignment) * alignment
-
-
-def mte2_read_baseline(total_k, heads, dim, dtype, num_cores, tile_tokens):
-    """Stream the same input DMA tiles and write one 32-byte sink per core."""
-    element_size = torch.empty((), dtype=dtype).element_size()
-    sink_width = 32 // element_size
-    dtype = str(dtype).removeprefix("torch.")
-    half = dim // 2
-    padded_half = aligned_half(dim, element_size)
-    tile_rows = tile_tokens * heads * 2
-    tile_elems = tile_rows * half
+def tile_grid(total_k, num_cores, tile_tokens):
     num_tiles = tilelang.cdiv(total_k, tile_tokens)
     blocks = min(num_cores, num_tiles)
     groups, tail_tiles = divmod(num_tiles, blocks)
+    return blocks, groups, tail_tiles
+
+
+def mte2_read_baseline(total_k, num_cores, tile_tokens):
+    """Stream RoPE input DMA tiles and write one 32-byte sink per core."""
+    sink_width = 32 // BF16_BYTES
+    total_elems = total_k * TOKEN_ELEMS
+    tile_elems = tile_tokens * TOKEN_ELEMS
+    blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
 
     @T.prim_func
-    def main(X: T.Tensor((total_k, heads, dim), dtype), Sink: T.Tensor((blocks, sink_width), dtype)):
+    def main(X: T.Tensor((total_k, HEADS, HEAD_DIM), BF16), Sink: T.Tensor((blocks, sink_width), BF16)):
         with T.Kernel(blocks) as core:
+            src = T.Tensor((total_elems,), BF16, X.data)
+            ub = T.alloc_shared((tile_elems,), BF16)
             iterations = groups + T.Cast("int32", core < tail_tiles)
-            ub = T.alloc_shared((tile_rows * padded_half,), dtype)
-            if padded_half == half:
-                flat = T.Tensor((total_k * heads * dim,), dtype, X.data)
-                for step in T.serial(iterations):
-                    start = (step * blocks + core) * tile_elems
-                    T.copy(flat[start : start + tile_elems], ub)
-            else:
-                rows = T.Tensor((total_k * heads * 2, half), dtype, X.data)
-                ub_rows = T.Tensor((tile_rows, padded_half), dtype, ub.data)
-                for step in T.serial(iterations):
-                    first_row = (step * blocks + core) * tile_rows
-                    T.copy(rows[first_row : first_row + tile_rows, :], ub_rows[:, :half], pad_value=0)
+            for step in T.serial(iterations):
+                start = (step * blocks + core) * tile_elems
+                T.copy(src[start : start + tile_elems], ub)
             T.copy(ub[:sink_width], Sink[core, :])
 
     return main
 
 
 def bench_mte2_read(x, num_cores, tile_tokens, bench):
-    total_k, heads, dim = x.shape
-    blocks = min(num_cores, tilelang.cdiv(total_k, tile_tokens))
-    sink = x.new_empty((blocks, 32 // x.element_size()))
-    kernel = tilelang.compile(mte2_read_baseline(total_k, heads, dim, x.dtype, num_cores, tile_tokens), target="ascend")
+    total_k = x.shape[0]
+    blocks, _, _ = tile_grid(total_k, num_cores, tile_tokens)
+    sink = x.new_empty((blocks, 32 // BF16_BYTES))
+    kernel = tilelang.compile(mte2_read_baseline(total_k, num_cores, tile_tokens), target="ascend")
     kernel(x, sink)
     core = torch.arange(blocks, device=x.device)
     last_tile = core + ((tilelang.cdiv(total_k, tile_tokens) - 1 - core) // blocks) * blocks
@@ -84,24 +73,21 @@ def bench_mte2_read(x, num_cores, tile_tokens, bench):
     latency = bench(lambda: kernel(x, sink))
     if latency <= 0:
         raise RuntimeError("Device timer did not resolve the GM-to-UB baseline")
-    return latency, x.numel() * x.element_size() / (latency * 1e6)
+    return latency, x.numel() * BF16_BYTES / (latency * 1e6)
 
 
-def dma_copy_baseline(total_k, heads, dim, dtype, num_cores, tile_tokens):
-    """Use the aligned RoPE tile assignment for a double-buffered device copy."""
-    dtype = str(dtype).removeprefix("torch.")
-    total_elems = total_k * heads * dim
-    tile_elems = tile_tokens * heads * dim
-    num_tiles = tilelang.cdiv(total_k, tile_tokens)
-    blocks = min(num_cores, num_tiles)
-    groups, tail_tiles = divmod(num_tiles, blocks)
+def dma_copy_baseline(total_k, num_cores, tile_tokens):
+    """Use the same tile assignment for a double-buffered device copy."""
+    total_elems = total_k * TOKEN_ELEMS
+    tile_elems = tile_tokens * TOKEN_ELEMS
+    blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
 
     @T.prim_func
-    def main(X: T.Tensor((total_k, heads, dim), dtype), Y: T.Tensor((total_k, heads, dim), dtype)):
+    def main(X: T.Tensor((total_k, HEADS, HEAD_DIM), BF16), Y: T.Tensor((total_k, HEADS, HEAD_DIM), BF16)):
         with T.Kernel(blocks) as core:
-            src = T.Tensor((total_elems,), dtype, X.data)
-            dst = T.Tensor((total_elems,), dtype, Y.data)
-            ub = T.alloc_shared((tile_elems,), dtype)
+            src = T.Tensor((total_elems,), BF16, X.data)
+            dst = T.Tensor((total_elems,), BF16, Y.data)
+            ub = T.alloc_shared((tile_elems,), BF16)
             T.annotate_buffer_versions({ub: 2})
             iterations = groups + T.Cast("int32", core < tail_tiles)
             for step in T.Pipelined(iterations, num_stages=2):
@@ -113,7 +99,7 @@ def dma_copy_baseline(total_k, heads, dim, dtype, num_cores, tile_tokens):
 
 
 def bench_dma_copy(x, output, num_cores, tile_tokens, bench):
-    kernel = tilelang.compile(dma_copy_baseline(*x.shape, x.dtype, num_cores, tile_tokens), target="ascend")
+    kernel = tilelang.compile(dma_copy_baseline(x.shape[0], num_cores, tile_tokens), target="ascend")
     output.fill_(float("nan"))
     kernel(x, output)
     torch.testing.assert_close(output[::tile_tokens, 0, 0], x[::tile_tokens, 0, 0], rtol=0, atol=0)
@@ -124,252 +110,103 @@ def bench_dma_copy(x, output, num_cores, tile_tokens, bench):
     return latency
 
 
-def fused_rope(
-    total_k,
-    max_seq,
-    num_cores,
-    heads,
-    dim,
-    dtype,
-    cos_dtype,
-    sin_dtype,
-    position_dtype,
-    tile_tokens=None,
-    backward=False,
-):
-    """Build a specialization for flattened token batches and nonnegative positions."""
-    if min(total_k, max_seq, num_cores, heads, dim) <= 0 or dim % 2:
-        raise ValueError("Expected positive sizes and an even head dimension")
-    supported = FLOAT_DTYPES.values()
-    if any(t not in supported for t in (dtype, cos_dtype, sin_dtype)):
-        raise TypeError("RoPE data and caches support BF16, FP16 and FP32")
-    if position_dtype not in (torch.int32, torch.int64):
-        raise TypeError("Positions must be int32 or int64")
-    limit = tile_limit(heads, dim, dtype, cos_dtype, sin_dtype, position_dtype)
-    if limit == 0:
-        raise ValueError("SIMD requires one token fitting in UB")
+def fused_rope(total_k, num_cores, tile_tokens=None, backward=False):
+    """Build the 56-head, 32-element BF16 kernel."""
+    limit = tile_limit()
+    if min(total_k, num_cores) <= 0:
+        raise ValueError("Expected positive token and core counts")
     if tile_tokens is None:
-        tile_tokens = min(tilelang.cdiv(total_k, num_cores), max(1, (limit + 1) // 2))
+        tile_tokens = min(tilelang.cdiv(total_k, num_cores), (limit + 1) // 2)
     if not 1 <= tile_tokens <= limit:
         raise ValueError(f"tile_tokens must be between 1 and {limit}")
-    data_half, cos_half, sin_half = (
-        aligned_half(dim, torch.empty((), dtype=t).element_size()) for t in (dtype, cos_dtype, sin_dtype)
-    )
-    dtype, cos_dtype, sin_dtype, position_dtype = (
-        str(t).removeprefix("torch.") for t in (dtype, cos_dtype, sin_dtype, position_dtype)
-    )
-    half = dim // 2
-    blocks = min(num_cores, tilelang.cdiv(total_k, tile_tokens))
-    groups, tail_tiles = divmod(tilelang.cdiv(total_k, tile_tokens), blocks)
-
-    tile_rows = tile_tokens * heads * 2
-    tile_elems = tile_rows * half
-    coeff_rows = tile_tokens * 2
-    chunks = tilelang.cdiv(half, FP32_LANES)
-
-    @T.macro
-    def load_f32(buf, offset, storage_dtype, mask, value):
-        if storage_dtype == "float32":
-            value[0] = S.vld(buf[offset])
-        else:
-            raw = S.vld(buf[offset], "UNPK_B16")
-            value[0] = S.vcvt(raw, "float32", mask, part=0)
-
-    @T.macro
-    def rotate_heads(x, y, index, c, signed_s, partner, mask, lanes):
-        values = T.alloc_local((1,), "float32x64")
-        load_f32(x, index, dtype, mask, values)
-        rotated = S.vselr(values[0], partner)
-        result = S.vadd(S.vmul(values[0], c, mask), S.vmul(rotated, signed_s, mask), mask)
-        if dtype == "float32":
-            S.vsts(y[index], result, mask, extent=lanes)
-        else:
-            S.vsts(y[index], S.vcvt(result, dtype, mask, sat=False), mask, "PK_B32", extent=lanes)
-
-    @T.macro
-    def rotate_dim32(x, y, cos, sin, valid):
-        full = S.pset(32)
-        one_head = S.update_mask(dim)
-        # CANN's arange provides signed integer registers. vselr reinterprets
-        # these nonnegative indices as unsigned before selecting lanes.
-        lane = S.vci(0, "int32")
-        coeff_index = S.vand(lane, S.vdup(dim - 1, "int32"), full)
-        partner = S.vxor(lane, S.vdup(half, "int32"), full)
-        low_half = S.vcmps(coeff_index, half, full, op="lt")
-        for token in range(valid):
-            c_raw = T.alloc_local((1,), "float32x64")
-            s_raw = T.alloc_local((1,), "float32x64")
-            load_f32(cos, token * dim, cos_dtype, one_head, c_raw)
-            load_f32(sin, token * dim, sin_dtype, one_head, s_raw)
-            c = S.vselr(c_raw[0], coeff_index)
-            s = S.vselr(s_raw[0], coeff_index)
-            # Each lane keeps its original output position. Swapping bit 4 of
-            # the lane index exchanges the halves inside each 32-element head.
-            if backward:
-                swapped_s = S.vselr(s, partner)
-                signed_s = S.vsel(swapped_s, S.vneg(swapped_s, full), low_half)
-            else:
-                signed_s = S.vsel(S.vneg(s, full), s, low_half)
-            for head_pair in range(heads // 2):
-                index = (token * heads + head_pair * 2) * dim
-                rotate_heads(x, y, index, c, signed_s, partner, full, FP32_LANES)
-            if heads % 2:
-                tail_index = (token * heads + heads - 1) * dim
-                rotate_heads(x, y, tail_index, c, signed_s, partner, one_head, dim)
-
-    @T.macro
-    def rotate_simd_tile(X, Pos, Cos, Sin, Y, x, y, cos, sin, pos_ub, begin, valid):
-        # Pad each half independently so aligned vector accesses can start at either half.
-        first_row = begin * heads * 2
-        if data_half == half:
-            first_elem = first_row * half
-            T.copy(X[first_elem : first_elem + tile_elems], x[:tile_elems])
-        else:
-            x_rows = T.Tensor((tile_rows, data_half), dtype, x.data)
-            T.copy(X[first_row : first_row + tile_rows, :], x_rows[:, :half], pad_value=0)
-        T.copy(Pos[begin : begin + tile_tokens], pos_ub[:tile_tokens])
-
-        if cos_half != half:
-            cos_rows = T.Tensor((coeff_rows, cos_half), cos_dtype, cos.data)
-        if sin_half != half:
-            sin_rows = T.Tensor((coeff_rows, sin_half), sin_dtype, sin.data)
-        for cache_token in T.serial(valid):
-            pos = T.Cast("int32", T.min(pos_ub[cache_token], T.Cast(position_dtype, max_seq - 1)))
-            if cos_half == half:
-                T.copy(Cos[pos, :], cos[cache_token * dim : (cache_token + 1) * dim])
-            else:
-                T.copy(Cos[2 * pos : 2 * pos + 2, :], cos_rows[2 * cache_token : 2 * cache_token + 2, :half], pad_value=0)
-            if sin_half == half:
-                T.copy(Sin[pos, :], sin[cache_token * dim : (cache_token + 1) * dim])
-            else:
-                T.copy(Sin[2 * pos : 2 * pos + 2, :], sin_rows[2 * cache_token : 2 * cache_token + 2, :half], pad_value=0)
-
-        with T.SimdVF():
-            if dim * 2 == FP32_LANES:
-                rotate_dim32(x, y, cos, sin, valid)
-            else:
-                for token in range(valid):
-                    for chunk in range(chunks):
-                        lanes = T.min(FP32_LANES, half - chunk * FP32_LANES)
-                        mask = S.update_mask(lanes)
-                        cos_index = token * 2 * cos_half + chunk * FP32_LANES
-                        sin_index = token * 2 * sin_half + chunk * FP32_LANES
-                        c_lo = T.alloc_local((1,), "float32x64")
-                        c_hi = T.alloc_local((1,), "float32x64")
-                        s_lo = T.alloc_local((1,), "float32x64")
-                        s_hi = T.alloc_local((1,), "float32x64")
-                        load_f32(cos, cos_index, cos_dtype, mask, c_lo)
-                        load_f32(cos, cos_index + cos_half, cos_dtype, mask, c_hi)
-                        load_f32(sin, sin_index, sin_dtype, mask, s_lo)
-                        load_f32(sin, sin_index + sin_half, sin_dtype, mask, s_hi)
-                        for head in range(heads):
-                            index = (token * heads + head) * 2 * data_half + chunk * FP32_LANES
-                            lo = T.alloc_local((1,), "float32x64")
-                            hi = T.alloc_local((1,), "float32x64")
-                            load_f32(x, index, dtype, mask, lo)
-                            load_f32(x, index + data_half, dtype, mask, hi)
-                            diag_lo = S.vmul(lo[0], c_lo[0], mask)
-                            diag_hi = S.vmul(hi[0], c_hi[0], mask)
-                            if backward:
-                                out_lo = S.vadd(diag_lo, S.vmul(hi[0], s_hi[0], mask), mask)
-                                out_hi = S.vsub(diag_hi, S.vmul(lo[0], s_lo[0], mask), mask)
-                            else:
-                                out_lo = S.vsub(diag_lo, S.vmul(hi[0], s_lo[0], mask), mask)
-                                out_hi = S.vadd(diag_hi, S.vmul(lo[0], s_hi[0], mask), mask)
-                            if dtype == "float32":
-                                S.vsts(y[index], out_lo, mask, extent=lanes)
-                                S.vsts(y[index + data_half], out_hi, mask, extent=lanes)
-                            else:
-                                S.vsts(y[index], S.vcvt(out_lo, dtype, mask, sat=False), mask, "PK_B32", extent=lanes)
-                                S.vsts(y[index + data_half], S.vcvt(out_hi, dtype, mask, sat=False), mask, "PK_B32", extent=lanes)
-        if data_half == half:
-            T.copy(y[:tile_elems], Y[first_elem : first_elem + tile_elems])
-        else:
-            y_rows = T.Tensor((tile_rows, data_half), dtype, y.data)
-            T.copy(y_rows[:, :half], Y[first_row : first_row + tile_rows, :])
+    blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
+    total_elems = total_k * TOKEN_ELEMS
+    tile_elems = tile_tokens * TOKEN_ELEMS
+    coeff_elems = tile_tokens * HEAD_DIM
+    coeff_guard = BF16_LANES - HEAD_DIM
 
     @T.prim_func
     def main(
-        X: T.Tensor((total_k, heads, dim), dtype),
-        Pos: T.Tensor((total_k,), position_dtype),
-        Cos: T.Tensor((max_seq, dim), cos_dtype),
-        Sin: T.Tensor((max_seq, dim), sin_dtype),
-        Y: T.Tensor((total_k, heads, dim), dtype),
+        X: T.Tensor((total_k, HEADS, HEAD_DIM), BF16),
+        Pos: T.Tensor((total_k,), "int64"),
+        Cos: T.Tensor((MAX_SEQ, HEAD_DIM), BF16),
+        Sin: T.Tensor((MAX_SEQ, HEAD_DIM), BF16),
+        Y: T.Tensor((total_k, HEADS, HEAD_DIM), BF16),
     ):
         with T.Kernel(blocks) as core:
-            if data_half == half:
-                x_view = T.Tensor((total_k * heads * dim,), dtype, X.data)
-                y_view = T.Tensor((total_k * heads * dim,), dtype, Y.data)
-            else:
-                x_view = T.Tensor((total_k * heads * 2, half), dtype, X.data)
-                y_view = T.Tensor((total_k * heads * 2, half), dtype, Y.data)
-            if cos_half == half:
-                cos_view = Cos
-            else:
-                cos_view = T.Tensor((max_seq * 2, half), cos_dtype, Cos.data)
-            if sin_half == half:
-                sin_view = Sin
-            else:
-                sin_view = T.Tensor((max_seq * 2, half), sin_dtype, Sin.data)
-            x = T.alloc_shared((tile_rows * data_half + FP32_LANES,), dtype)
-            y = T.alloc_shared((tile_rows * data_half,), dtype)
-            cos = T.alloc_shared((coeff_rows * cos_half + FP32_LANES,), cos_dtype)
-            sin = T.alloc_shared((coeff_rows * sin_half + FP32_LANES,), sin_dtype)
-            pos_ub = T.alloc_shared((tile_tokens,), position_dtype)
+            src = T.Tensor((total_elems,), BF16, X.data)
+            dst = T.Tensor((total_elems,), BF16, Y.data)
+            x = T.alloc_shared((tile_elems,), BF16)
+            y = T.alloc_shared((tile_elems,), BF16)
+            cos = T.alloc_shared((coeff_elems + coeff_guard,), BF16)
+            sin = T.alloc_shared((coeff_elems + coeff_guard,), BF16)
+            pos_ub = T.alloc_shared((tile_tokens,), "int64")
             iterations = groups + T.Cast("int32", core < tail_tiles)
             for step in T.Pipelined(iterations, num_stages=2):
                 begin = (step * blocks + core) * tile_tokens
                 valid = T.min(tile_tokens, total_k - begin)
-                rotate_simd_tile(x_view, Pos, cos_view, sin_view, y_view, x, y, cos, sin, pos_ub, begin, valid)
+                base = begin * TOKEN_ELEMS
+                T.copy(src[base : base + tile_elems], x)
+                T.copy(Pos[begin : begin + tile_tokens], pos_ub)
+                for i in T.serial(valid):
+                    pos = T.Cast("int32", T.min(pos_ub[i], T.int64(MAX_SEQ - 1)))
+                    T.copy(Cos[pos, :], cos[i * HEAD_DIM : (i + 1) * HEAD_DIM])
+                    T.copy(Sin[pos, :], sin[i * HEAD_DIM : (i + 1) * HEAD_DIM])
+
+                with T.SimdVF():
+                    mask = S.pset(16)
+                    lane = S.vci(0, "int16")
+                    coeff_index = S.vand(lane, S.vdup(HEAD_DIM - 1, "int16"), mask)
+                    partner = S.vxor(lane, S.vdup(HEAD_DIM // 2, "int16"), mask)
+                    low_half = S.vcmps(coeff_index, HEAD_DIM // 2, mask, op="lt")
+                    # Flip the BF16 sign bit without widening the coefficient.
+                    sign_bit = S.vdup(0x8000, "uint16")
+                    zero = S.vdup(0, "uint16")
+                    if backward:
+                        sin_index = S.vxor(coeff_index, S.vdup(HEAD_DIM // 2, "int16"), mask)
+                        sign = S.vsel(zero, sign_bit, low_half)
+                    else:
+                        sin_index = coeff_index
+                        sign = S.vsel(sign_bit, zero, low_half)
+                    for token in range(valid):
+                        c_bits = S.vselr(T.reinterpret(S.vld(cos[token * HEAD_DIM]), "uint16x128"), coeff_index)
+                        s_bits = S.vselr(T.reinterpret(S.vld(sin[token * HEAD_DIM]), "uint16x128"), sin_index)
+                        c = T.reinterpret(c_bits, "bfloat16x128")
+                        signed_s = T.reinterpret(S.vxor(s_bits, sign, mask), "bfloat16x128")
+                        for group in range(TOKEN_ELEMS // BF16_LANES):
+                            index = token * TOKEN_ELEMS + group * BF16_LANES
+                            values = S.vld(x[index])
+                            rotated_bits = S.vselr(T.reinterpret(values, "uint16x128"), partner)
+                            rotated = T.reinterpret(rotated_bits, "bfloat16x128")
+                            diag = S.vmul(values, c, mask)
+                            cross = S.vmul(rotated, signed_s, mask)
+                            result = S.vadd(diag, cross, mask)
+                            S.vsts(y[index], result, mask, "NORM_B16")
+                T.copy(y, dst[base : base + tile_elems])
 
     return main
 
 
 def compile_rope(x, positions, cos, sin, *, backward=False, num_cores=None, tile_tokens=None):
-    """Compile a kernel for contiguous flattened views of the supplied tensors."""
-    if x.ndim < 2:
-        raise ValueError("Input must end in (heads, head_dim)")
-    heads, dim = x.shape[-2:]
-    if min(heads, dim) <= 0 or cos.ndim != 2 or cos.shape != sin.shape or cos.shape[1] != dim:
-        raise ValueError("cos and sin must have shape (max_seq, head_dim)")
-    tokens = x.numel() // (heads * dim)
-    if positions.numel() != tokens:
-        raise ValueError("Expected one position per token")
+    """Compile the BF16 RoPE layout for the supplied token batch."""
+    if x.ndim != 3 or x.shape[1:] != (HEADS, HEAD_DIM) or x.dtype != torch.bfloat16:
+        raise ValueError("Input must be BF16 with shape (tokens, 56, 32)")
+    if positions.shape != (x.shape[0],) or positions.dtype != torch.int64:
+        raise ValueError("Expected one int64 position per token")
+    if any(t.shape != (MAX_SEQ, HEAD_DIM) or t.dtype != torch.bfloat16 for t in (cos, sin)):
+        raise ValueError("Expected BF16 coefficient tables with shape (4096, 32)")
     if any(t.device != x.device for t in (positions, cos, sin)):
         raise ValueError("All RoPE inputs must be on the same device")
     if num_cores is None:
         num_cores = get_num_vector_cores(x.device.index or 0)
-    return tilelang.compile(
-        fused_rope(
-            tokens,
-            cos.shape[0],
-            num_cores,
-            heads,
-            dim,
-            x.dtype,
-            cos.dtype,
-            sin.dtype,
-            positions.dtype,
-            tile_tokens=tile_tokens,
-            backward=backward,
-        ),
-        target="ascend",
-    )
+    return tilelang.compile(fused_rope(x.shape[0], num_cores, tile_tokens, backward), target="ascend")
 
 
 def launch(x, positions, cos, sin, *, backward=False, **config):
-    """Apply RoPE or its input gradient with shape (..., heads, head_dim)."""
-    if x.ndim >= 3 and 0 in x.shape[:-2] and positions.numel() == 0:
-        return torch.empty_like(x)
+    """Apply the BF16 RoPE forward or input-gradient kernel."""
     kernel = compile_rope(x, positions, cos, sin, backward=backward, **config)
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
-    kernel(
-        x.contiguous().view(-1, *x.shape[-2:]),
-        positions.contiguous().view(-1),
-        cos.contiguous(),
-        sin.contiguous(),
-        output.view(-1, *x.shape[-2:]),
-    )
+    kernel(x.contiguous(), positions.contiguous(), cos.contiguous(), sin.contiguous(), output)
     return output
 
 
@@ -405,47 +242,32 @@ def reference(x, positions, cos, sin, backward=False):
 def check_accuracy(output, x, positions, cos, sin, backward):
     # Keep peak CPU memory bounded even at 600,000 tokens.
     squared_error = squared_reference = max_error = 0.0
-    tolerance = 1e-6 if x.dtype == torch.float32 else 1e-2
     for begin in range(0, x.shape[0], 4096):
         chunk = slice(begin, begin + 4096)
         expected = reference(x[chunk].cpu(), positions[chunk], cos, sin, backward)
         actual = output[chunk].cpu()
-        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
-        error = actual.float() - expected.float()
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        error = actual.to(torch.float64) - expected.to(torch.float64)
         max_error = max(max_error, error.abs().max().item())
         squared_error += error.square().sum().item()
-        squared_reference += expected.float().square().sum().item()
+        squared_reference += expected.to(torch.float64).square().sum().item()
     return max_error, (squared_error / max(squared_reference, 1e-12)) ** 0.5
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--total-k", type=int, default=600_000)
-    parser.add_argument("--max-seq", type=int, default=4096)
     parser.add_argument("--iters", type=int, default=50)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--heads", type=int, default=56)
-    parser.add_argument("--head-dim", type=int, default=32)
-    parser.add_argument("--dtype", choices=FLOAT_DTYPES, default="bfloat16")
-    parser.add_argument("--cache-dtype", choices=FLOAT_DTYPES)
     parser.add_argument("--cores", type=int, help="override the device vector core count")
     parser.add_argument("--tile-tokens", type=int)
     parser.add_argument("--tune", action="store_true")
     parser.add_argument("--mte2-baseline", action="store_true", help="measure a matched GM-to-UB read baseline per tile")
     parser.add_argument("--dma-baseline", action="store_true", help="measure a matched TileLang DMA copy per tile")
     args = parser.parse_args()
-    if min(args.total_k, args.max_seq, args.iters, args.heads, args.head_dim) <= 0 or args.head_dim % 2:
-        parser.error("sizes and iterations must be positive, and head-dim must be even")
-    if args.cores is not None and args.cores <= 0:
-        parser.error("cores must be positive")
-    dtype = FLOAT_DTYPES[args.dtype]
-    cache_dtype = FLOAT_DTYPES[args.cache_dtype or args.dtype]
-    if args.dma_baseline and args.head_dim != 32:
-        parser.error("--dma-baseline currently compares the head-dim=32 path")
-    limit = tile_limit(args.heads, args.head_dim, dtype, cache_dtype, cache_dtype)
-    if limit == 0:
-        parser.error("SIMD requires one token fitting in UB")
+    if args.iters <= 0 or (args.cores is not None and args.cores <= 0):
+        parser.error("iterations and cores must be positive")
+    limit = tile_limit()
     if args.tile_tokens is not None and not 1 <= args.tile_tokens <= limit:
         parser.error(f"tile-tokens must be between 1 and {limit}")
     if not hasattr(torch, "npu") or not torch.npu.is_available():
@@ -454,16 +276,16 @@ def main():
     device = torch.device(args.device)
     torch.npu.set_device(device)
     torch.manual_seed(args.seed)
-    positions = torch.arange(args.total_k, dtype=torch.int64) % args.max_seq
-    positions[-1] = args.max_seq  # Exercise the upper clamp.
-    freq = 10000.0 ** (-torch.arange(0, args.head_dim, 2, dtype=torch.float32) / args.head_dim)
-    angles = torch.outer(torch.arange(args.max_seq, dtype=torch.float32), freq).repeat(1, 2)
-    cos, sin = angles.cos().to(cache_dtype), angles.sin().to(cache_dtype)
+    positions = torch.arange(TOTAL_K, dtype=torch.int64) % MAX_SEQ
+    positions[-1] = MAX_SEQ  # Exercise the upper clamp.
+    freq = 10000.0 ** (-torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+    angles = torch.outer(torch.arange(MAX_SEQ, dtype=torch.float32), freq).repeat(1, 2)
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
     tables = tuple(t.to(device) for t in (positions, cos, sin))
-    shape = (args.total_k, args.heads, args.head_dim)
-    output = torch.empty(shape, device=device, dtype=dtype)
+    shape = (TOTAL_K, HEADS, HEAD_DIM)
+    output = torch.empty(shape, device=device, dtype=torch.bfloat16)
     num_cores = args.cores if args.cores is not None else get_num_vector_cores(device.index or 0)
-    tokens_per_core = tilelang.cdiv(args.total_k, num_cores)
+    tokens_per_core = tilelang.cdiv(TOTAL_K, num_cores)
     default_tile = min(tokens_per_core, (limit + 1) // 2)
     if args.tune and args.tile_tokens is None:
         tiles = sorted({min(tokens_per_core, max(1, tile)) for tile in (limit // 4, default_tile, 3 * limit // 4, limit)})
@@ -473,15 +295,15 @@ def main():
         do_bench, backend="event", device=device, return_mode="median", _n_warmup=10, _n_repeat=args.iters
     )
     io_bytes = 2 * output.numel() * output.element_size()
-    read_bytes = io_bytes // 2 + args.total_k * (
-        positions.element_size() + args.head_dim * (cos.element_size() + sin.element_size())
+    read_bytes = io_bytes // 2 + TOTAL_K * (
+        positions.element_size() + HEAD_DIM * (cos.element_size() + sin.element_size())
     )
     read_baselines = {}
     dma_copy_times = {}
 
     for backward in (False, True):
         label = "backward" if backward else "forward"
-        x = torch.randn(shape, device=device, dtype=dtype)
+        x = torch.randn(shape, device=device, dtype=torch.bfloat16)
         if not backward:
             # Reuse the preallocated RoPE buffers for the same-device copy.
             copy_ms = bench(lambda: output.copy_(x))
