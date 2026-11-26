@@ -104,9 +104,11 @@ def fused_rope(
     def rotate_dim32(x, y, cos, sin, valid):
         full = S.pset(32)
         one_head = S.update_mask(dim)
-        lane = S.vci(0, "uint32")
-        coeff_index = S.vand(lane, S.vdup(dim - 1, "uint32"), full)
-        partner = S.vxor(lane, S.vdup(half, "uint32"), full)
+        # CANN's arange provides signed integer registers. vselr reinterprets
+        # these nonnegative indices as unsigned before selecting lanes.
+        lane = S.vci(0, "int32")
+        coeff_index = S.vand(lane, S.vdup(dim - 1, "int32"), full)
+        partner = S.vxor(lane, S.vdup(half, "int32"), full)
         low_half = S.vcmps(coeff_index, half, full, op="lt")
         for token in range(valid):
             c_raw = T.alloc_local((1,), "float32x64")
