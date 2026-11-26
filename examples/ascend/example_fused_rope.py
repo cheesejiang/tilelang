@@ -38,6 +38,55 @@ def aligned_half(dim, element_size):
     return tilelang.cdiv(dim // 2, alignment) * alignment
 
 
+def mte2_read_baseline(total_k, heads, dim, dtype, num_cores, tile_tokens):
+    """Stream the same input DMA tiles and write one 32-byte sink per core."""
+    element_size = torch.empty((), dtype=dtype).element_size()
+    sink_width = 32 // element_size
+    dtype = str(dtype).removeprefix("torch.")
+    half = dim // 2
+    padded_half = aligned_half(dim, element_size)
+    tile_rows = tile_tokens * heads * 2
+    tile_elems = tile_rows * half
+    num_tiles = tilelang.cdiv(total_k, tile_tokens)
+    blocks = min(num_cores, num_tiles)
+    groups, tail_tiles = divmod(num_tiles, blocks)
+
+    @T.prim_func
+    def main(X: T.Tensor((total_k, heads, dim), dtype), Sink: T.Tensor((blocks, sink_width), dtype)):
+        with T.Kernel(blocks) as core:
+            iterations = groups + T.Cast("int32", core < tail_tiles)
+            ub = T.alloc_shared((tile_rows * padded_half,), dtype)
+            if padded_half == half:
+                flat = T.Tensor((total_k * heads * dim,), dtype, X.data)
+                for step in T.serial(iterations):
+                    start = (step * blocks + core) * tile_elems
+                    T.copy(flat[start : start + tile_elems], ub)
+            else:
+                rows = T.Tensor((total_k * heads * 2, half), dtype, X.data)
+                ub_rows = T.Tensor((tile_rows, padded_half), dtype, ub.data)
+                for step in T.serial(iterations):
+                    first_row = (step * blocks + core) * tile_rows
+                    T.copy(rows[first_row : first_row + tile_rows, :], ub_rows[:, :half], pad_value=0)
+            T.copy(ub[:sink_width], Sink[core, :])
+
+    return main
+
+
+def bench_mte2_read(x, num_cores, tile_tokens, bench):
+    total_k, heads, dim = x.shape
+    blocks = min(num_cores, tilelang.cdiv(total_k, tile_tokens))
+    sink = x.new_empty((blocks, 32 // x.element_size()))
+    kernel = tilelang.compile(mte2_read_baseline(total_k, heads, dim, x.dtype, num_cores, tile_tokens), target="ascend")
+    kernel(x, sink)
+    core = torch.arange(blocks, device=x.device)
+    last_tile = core + ((tilelang.cdiv(total_k, tile_tokens) - 1 - core) // blocks) * blocks
+    torch.testing.assert_close(sink[:, 0], x[last_tile * tile_tokens, 0, 0], rtol=0, atol=0)
+    latency = bench(lambda: kernel(x, sink))
+    if latency <= 0:
+        raise RuntimeError("Device timer did not resolve the GM-to-UB baseline")
+    return latency, x.numel() * x.element_size() / (latency * 1e6)
+
+
 def fused_rope(
     total_k,
     max_seq,
@@ -329,6 +378,7 @@ def main():
     parser.add_argument("--cores", type=int, help="override the device vector core count")
     parser.add_argument("--tile-tokens", type=int)
     parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--mte2-baseline", action="store_true", help="measure a matched GM-to-UB read baseline per tile")
     args = parser.parse_args()
     if min(args.total_k, args.max_seq, args.iters, args.heads, args.head_dim) <= 0 or args.head_dim % 2:
         parser.error("sizes and iterations must be positive, and head-dim must be even")
@@ -366,6 +416,10 @@ def main():
         do_bench, backend="event", device=device, return_mode="median", _n_warmup=10, _n_repeat=args.iters
     )
     io_bytes = 2 * output.numel() * output.element_size()
+    read_bytes = io_bytes // 2 + args.total_k * (
+        positions.element_size() + args.head_dim * (cos.element_size() + sin.element_size())
+    )
+    read_baselines = {}
 
     for backward in (False, True):
         label = "backward" if backward else "forward"
@@ -376,6 +430,11 @@ def main():
             if copy_ms <= 0:
                 raise RuntimeError("Device timer did not resolve the copy baseline")
             print(f"copy baseline (torch.Tensor.copy_)  {copy_ms:.4f} ms  {io_bytes / (copy_ms * 1e6):.1f} GB/s")
+            if args.mte2_baseline:
+                for tile_tokens in tiles:
+                    read_ms, read_gbps = bench_mte2_read(x, num_cores, tile_tokens, bench)
+                    read_baselines[tile_tokens] = read_gbps
+                    print(f"GM-to-UB baseline tile={tile_tokens:2}  {read_ms:.4f} ms  {read_gbps:.1f} GB/s")
         timings = []
         for tile_tokens in tiles:
             kernel = compile_rope(x, *tables, num_cores=num_cores, tile_tokens=tile_tokens, backward=backward)
@@ -383,10 +442,14 @@ def main():
             max_error, rel_l2 = check_accuracy(output, x, positions, cos, sin, backward)
             latency = bench(lambda: kernel(x, *tables, output))
             gbps = io_bytes / (latency * 1e6)
+            mte2 = ""
+            if args.mte2_baseline:
+                read_gbps = read_bytes / (latency * 1e6)
+                mte2 = f" mte2_read={read_gbps:.1f} GB/s mte2_bw={read_gbps / read_baselines[tile_tokens]:.1%}"
             timings.append((latency, tile_tokens))
             print(
                 f"{label:8} simd tile={tile_tokens:2}  {latency:.4f} ms  {gbps:.1f} GB/s (input/output)  "
-                f"copy_bw={copy_ms / latency:.1%}  max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}"
+                f"copy_bw={copy_ms / latency:.1%}{mte2}  max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}"
             )
         if args.tune:
             latency, tile_tokens = min(timings)
