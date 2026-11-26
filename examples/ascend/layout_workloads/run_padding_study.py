@@ -126,6 +126,8 @@ def collect(args, jobs):
                      "speedup_vs_native_baseline": speedup,
                      "input_ir_matches_baseline": (matched if job.transpose_layout == "native" else "manual_reference"),
                      "estimated_latency_cycles": diagnostic.get("estimated_latency_cycles", "unknown"),
+                     "instructions": diagnostic.get("instructions", "unknown"),
+                     "requests": diagnostic.get("requests", "unknown"),
                      "entries": diagnostic.get("entries", "unknown"),
                      "cost_scope": diagnostic.get("cost_scope", "unknown"),
                      "final_ir_ub_allocation_bytes": final.get("final_ir_ub_allocation_bytes", "unknown"),
@@ -161,6 +163,46 @@ def save(args, rows):
               "Equal-elements scans keep useful tile elements fixed; fixed-rows scans change useful traffic.",
               "Inspect each report's diagnostics, DMA descriptors and saved TIR/C++ before attributing timing to bank conflicts."]
     (args.output / "summary.md").write_text("\n".join(lines) + "\n")
+    save_cost_table(args.output, rows)
+
+
+def save_cost_table(output, rows):
+    columns = {
+        "case": "case", "iterations": "iterations", "mode": "mode",
+        "padding_scheme": "padding scheme",
+        "final_ir_ub_allocation_bytes": "final IR UB allocation (B)",
+        "final_ir_ub_extra_vs_baseline_bytes": "final IR extra vs baseline (B)",
+        "estimated_latency_cycles": "UB latency (cycles)",
+        "instructions": "instructions", "requests": "requests", "entries": "entries",
+        "latency_us": "kernel time (us)",
+        "speedup_vs_native_baseline": "speedup vs native baseline",
+    }
+    context = ("study", "scan", "rows", "columns", "threads", "blocks", "transpose_layout", "cost_scope")
+    with (output / "cost_summary.csv").open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=[*context, *columns], extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    lines = ["# Padding study costs and measured time", "",
+             "UB latency and instruction/request/entry counts are model estimates; kernel time is measured end to end.",
+             "Missing measurements remain unknown. Speedups require matching, correctness-passing reports.", ""]
+    groups = {}
+    for row in rows:
+        groups.setdefault(tuple(row.get(key, "unknown") for key in context), []).append(row)
+    for group, members in groups.items():
+        study, scan, height, width, threads, blocks, layout, scope = group
+        lines += [f"## {study} / {scan} / {height}x{width} / {layout}", "",
+                  f"threads={threads}, blocks={blocks}; cost scope: {scope}", "",
+                  "| " + " | ".join(columns.values()) + " |",
+                  "| " + " | ".join("---" for _ in columns) + " |"]
+        for row in members:
+            values = []
+            for key in columns:
+                value = row.get(key, "unknown")
+                values.append("unknown" if value == "" or value is None else
+                              f"{value:.4f}" if isinstance(value, float) else str(value))
+            lines.append("| " + " | ".join(values) + " |")
+        lines.append("")
+    (output / "cost_summary.md").write_text("\n".join(lines) + "\n")
 
 
 def main():

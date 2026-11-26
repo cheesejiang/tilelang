@@ -73,6 +73,17 @@ class PaddingStudyTests(unittest.TestCase):
             study.save(args, rows)
             with (args.output / "summary.csv").open() as stream:
                 self.assertEqual(len(list(csv.DictReader(stream))), 4)
+            with (args.output / "cost_summary.csv").open() as stream:
+                costs = list(csv.DictReader(stream))
+            self.assertEqual(len(costs), 4)
+            self.assertEqual(costs[1]["latency_us"], "8")
+            self.assertEqual(costs[1]["instructions"], "unknown")
+            self.assertEqual(costs[1]["requests"], "unknown")
+            self.assertEqual(costs[2]["speedup_vs_native_baseline"], "")
+            markdown = (args.output / "cost_summary.md").read_text()
+            self.assertIn("UB latency (cycles)", markdown)
+            self.assertIn("kernel time (us)", markdown)
+            self.assertIn("64x128 / source4_repack", markdown)
             bad = args.output / jobs[0].directory / "transpose/baseline.json"
             report = json.loads(bad.read_text())
             report["columns"] = 32

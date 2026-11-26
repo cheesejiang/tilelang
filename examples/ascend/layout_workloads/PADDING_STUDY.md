@@ -104,6 +104,11 @@ python examples/ascend/layout_workloads/run_padding_study.py --study short-axis 
 ## 结果怎么看
 
 顶层 `summary.md / summary.csv` 汇总两个方向；`study_plan.json` 保存完整实验参数。
+同时生成 `cost_summary.md / cost_summary.csv`：Markdown 按扫描、形状和手工布局分表，
+列出 case、iterations、mode、padding scheme、最终 IR UB 占用及相对 baseline 的增量、
+模型 UB latency、instructions、requests、entries，以及实测 kernel time（us）和加速比。
+模型成本与端到端实测时间分别列出；没有计时的数据保留 unknown。
+已有逐模式 JSON 可用上面的 `--summarize-only` 命令补生成，无需重跑设备实验。
 每个子配置还保留原 runner 的 `summary.md / summary.csv / candidates.csv` 和逐模式 JSON。
 
 重点顺序：
