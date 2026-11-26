@@ -9,7 +9,8 @@ else:
 
 
 def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4,
-                transpose_layout="native"):
+                transpose_layout="native", scale_padding_period=0):
+    from tilelang.layout import Layout
     if case == "transpose":
         return _make_transpose_kernel(rows, columns, threads, blocks, updates, transpose_layout)
     if case == "flash_decode_qk_column_store":
@@ -33,6 +34,10 @@ def make_kernel(case, rows=32, columns=32, threads=32, blocks=32, updates=4,
     ):
         with T.Kernel(blocks) as block:
             work = T.alloc_shared(shape, "float32")
+            if scale_padding_period > 0:
+                T.annotate_layout({work: Layout(
+                    (rows, columns), lambda r, c:
+                    r * columns + c + (r // scale_padding_period) * 8)})
             T.copy(A[block, :, :], work)
             if case == "vecadd":
                 incoming = T.alloc_shared((n,), "float32")

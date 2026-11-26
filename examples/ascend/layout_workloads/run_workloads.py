@@ -44,6 +44,15 @@ def run_worker(args):
     report["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
     report["experiment_protocol"] = "identical-ir-pass-switches-v1"
     report["pass_configs"] = mode_configs(args.mode)
+    report["vectorize"] = args.vectorize
+    report["scale_padding_period"] = args.scale_padding_period
+    if args.vectorize == "disable":
+        report["pass_configs"]["tirx.disable_vectorize"] = True
+    if args.vectorize != "default" or args.scale_padding_period:
+        report["experiment_protocol"] = f"scale-control-{args.vectorize}-p{args.scale_padding_period}-v1"
+        report["model_width_caveat"] = "Model estimates do not establish final ISA widths; inspect device binary."
+    if args.scale_padding_period:
+        report["manual_padding_scheme"] = f"work: every {args.scale_padding_period} rows +32B (manual)"
     report["baseline_partition"] = "common native layout inference; no mode-specific annotations"
     report["scope"] = "SIMT stage extract, not an end-to-end benchmark of the source kernel"
     report["kernel_factory_sha256"] = hashlib.sha256(Path(__file__).with_name("kernels.py").read_bytes()).hexdigest()
@@ -112,7 +121,8 @@ def run_worker(args):
         register_pass_instrumentation_tool(name, CaptureTool)
         try:
             func = make_kernel(args.case, args.rows, args.columns, args.threads, args.blocks, tiles,
-                               transpose_layout=args.transpose_layout)
+                               transpose_layout=args.transpose_layout,
+                               scale_padding_period=args.scale_padding_period)
             report["input_ir_structural_hash"] = str(tvm.ir.structural_hash(func, map_free_vars=True))
             (directory / f"{args.mode}.input.tir").write_text(str(func))
             compiled = tilelang.compile(func, target="ascend", out_idx=-1,
@@ -170,10 +180,10 @@ def run_worker(args):
             if lowered is not None:
                 (directory / f"{args.mode}.lowered.tir").write_text(str(lowered))
         report.update(summary_fields(records))
-        report["padding_applied"] = (args.transpose_layout != "native" or
+        report["padding_applied"] = (args.transpose_layout != "native" or bool(args.scale_padding_period) or
                                      any("padding_bytes" in b for r in records if r.get("stage") == "final"
                                          for b in r.get("buffers", [])))
-        report["padding_policy"] = ("manual_reference" if args.transpose_layout != "native" else
+        report["padding_policy"] = ("manual_reference" if args.transpose_layout != "native" or args.scale_padding_period else
                                     "rule_based_search" if report["pass_configs"]["tl.ascend_enable_ub_padding"]
                                     else "disabled")
         allocated = snapshots.get("tl.MergeUBAllocations")
@@ -184,6 +194,7 @@ def run_worker(args):
         report["status"] = "compiled"
         save()
         if (args.transpose_layout == "native" and
+                not args.scale_padding_period and
                 not report["pass_configs"]["tl.ascend_enable_ub_padding"] and report["padding_applied"]):
             raise RuntimeError("Padding was applied despite its optimization switch being disabled")
         actual = compiled(*inputs)
@@ -200,6 +211,11 @@ def run_worker(args):
             samples = [do_bench(lambda: compiled(*inputs), backend="msprof", _n_warmup=10, _n_repeat=30) * 1000
                        for _ in range(args.rounds)]
             report.update(latency_us=statistics.median(samples), latency_samples_us=samples, status="measured")
+            save()
+        if args.profile:
+            from profile_workload import capture
+            report["profile"] = capture(lambda: compiled(*inputs), directory / f"{args.mode}.profile",
+                                        args.profile_repeats)
             save()
         print(f"{args.case}/{args.mode}: {report['status']}; padding={report['padding_applied']}; "
               f"latency_us={report.get('latency_us', 'not_measured')}", flush=True)
@@ -270,6 +286,12 @@ def main():
     parser.add_argument("--transpose-layout", choices=["native", "row32", "source4_repack"], default="native",
                         help="manual references require --case transpose --mode baseline; use a separate output directory")
     parser.add_argument("--bench", action="store_true")
+    parser.add_argument("--profile", action="store_true", help="capture raw NPU PipeUtilization metrics separately from timing")
+    parser.add_argument("--profile-repeats", type=int, default=10)
+    parser.add_argument("--vectorize", choices=["default", "disable"], default="default",
+                        help="backend vectorization control; actual b32/b64 requires ISA verification")
+    parser.add_argument("--scale-padding-period", type=int, default=0,
+                        help="manual +32B every N rows for baseline gemm_scale; 0 keeps native storage")
     parser.add_argument("--summarize-only", action="store_true", help="rebuild tables from existing JSON without compiling or running kernels")
     parser.add_argument("--output", type=Path, default=Path("layout-workload-results"))
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -284,6 +306,14 @@ def main():
             raise ValueError("manual transpose references require --case transpose --mode baseline")
         if args.rounds <= 0:
             raise ValueError("rounds must be positive")
+        if args.profile_repeats <= 0 or args.scale_padding_period < 0:
+            raise ValueError("profile repeats must be positive; padding period must be nonnegative")
+        if args.scale_padding_period and (args.case != "gemm_scale" or args.mode != "baseline" or
+                                          args.scale_padding_period >= args.rows):
+            raise ValueError("manual scale padding requires gemm_scale baseline and period < rows")
+        if args.scale_padding_period and (args.rows * args.columns * 4 +
+                                         ((args.rows - 1) // args.scale_padding_period) * 32 > 208 * 1024):
+            raise ValueError("manual scale padding exceeds UB budget")
     except ValueError as error:
         parser.error(str(error))
     if args.worker:
@@ -316,6 +346,10 @@ def main():
                        "--blocks", str(args.blocks), "--updates", str(args.updates), "--rounds", str(args.rounds),
                        "--seed", str(args.seed), "--output", str(args.output)]
                 cmd += ["--transpose-layout", args.transpose_layout]
+                cmd += ["--vectorize", args.vectorize, "--scale-padding-period", str(args.scale_padding_period),
+                        "--profile-repeats", str(args.profile_repeats)]
+                if args.profile:
+                    cmd.append("--profile")
                 if args.bench:
                     cmd.append("--bench")
                 result = subprocess.run(cmd, check=False)

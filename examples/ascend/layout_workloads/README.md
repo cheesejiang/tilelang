@@ -570,3 +570,8 @@ reducer 可留在同一组件，但它直接访问的 UB 仍不能被 padding；
 已有 JSON 记录该字段时，可用 `--summarize-only` 为 MD 补出精度列，无需重新跑设备。
 主机测试通过不代表新协议的 C++ 开关、DSL 完整编译和设备精度已验证；
 仍需在对应 Ascend 环境运行前述实验。
+
+## UB 请求与指令组织对照
+
+真实 `gemm_scale` 的 profiling、固定 padding 周期和标量/向量对照见
+[BOTTLENECK_STUDY.md](BOTTLENECK_STUDY.md)。
