@@ -152,24 +152,9 @@ def torch_ref(
     rotate_half = torch.cat([-x2, x1], dim=-1)
     return x * cos.to(x.dtype) + rotate_half * sin.to(x.dtype)
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--device", default="npu:0")
-    parser.add_argument("--cores", type=int, help="override the selected device's AIV core count")
-    parser.add_argument("--tile-tokens", type=int, default=16)
-    parser.add_argument("--backward", action="store_true")
-    parser.add_argument("--bench", action="store_true", help="benchmark after correctness checks")
-    args = parser.parse_args()
-    if args.cores is not None and args.cores <= 0:
-        parser.error("cores must be positive")
-    if not 1 <= args.tile_tokens <= tile_limit():
-        parser.error(f"tile-tokens must be between 1 and {tile_limit()}")
 
-    torch.npu.set_device(args.device)
-    device = torch.device(args.device)
-    device_index = device.index if device.index is not None else torch.npu.current_device()
-    num_cores = args.cores if args.cores is not None else get_num_vector_cores(device_index)
-    print(f"RoPE device={device} AIV cores={num_cores} tile={args.tile_tokens}", flush=True)
+def prepare_inputs(backward=False):
+    """Create fixed-seed CPU inputs and the original CPU golden."""
     generator = torch.Generator().manual_seed(7)
 
     x_cpu = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator).bfloat16()
@@ -179,7 +164,7 @@ def main():
     cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
     x_req = x_cpu.detach().clone().requires_grad_(True)
     golden_out = torch_ref(x_req, positions, cos, sin)
-    if args.backward:
+    if backward:
         grad_output = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator).bfloat16()
         (golden,) = torch.autograd.grad(golden_out, x_req, grad_output)
         input_cpu = grad_output
@@ -187,9 +172,48 @@ def main():
         golden = golden_out.detach()
         input_cpu = x_cpu
     del golden_out, x_req
-    x = input_cpu.to(args.device)
-    positions = positions.to(args.device)
-    cos_device, sin_device = cos.to(args.device), sin.to(args.device)
+    return input_cpu, positions, cos, sin, golden
+
+
+def check_accuracy(output, golden):
+    actual = output.cpu()
+    torch.testing.assert_close(actual, golden, rtol=1e-2, atol=1e-2)
+    max_error = (actual - golden).abs().max().item()
+    rel_l2 = ((actual.float() - golden.float()).norm() / (golden.float().norm() + 1e-12)).item()
+    print(f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}")
+    print("ACCURACY: PASS")
+
+
+def run_regression_perf(kernel, x, positions, cos_device, sin_device, output, tile_tokens=16, backward=False):
+    latency = do_bench(
+        lambda: kernel(x, positions, cos_device, sin_device, output),
+        backend="msprof",
+        _n_warmup=30,
+        _n_repeat=50,
+    )
+    bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
+    direction = "backward" if backward else "forward"
+    print(f"{direction} BF16 tile={tile_tokens}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s")
+
+    return latency
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cores", type=int, help="override the current device's AIV core count")
+    parser.add_argument("--tile-tokens", type=int, default=16)
+    parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--bench", action="store_true", help="benchmark after correctness checks")
+    args = parser.parse_args()
+    if args.cores is not None and args.cores <= 0:
+        parser.error("cores must be positive")
+    if not 1 <= args.tile_tokens <= tile_limit():
+        parser.error(f"tile-tokens must be between 1 and {tile_limit()}")
+
+    num_cores = args.cores if args.cores is not None else get_num_vector_cores(torch.npu.current_device())
+    input_cpu, positions_cpu, cos_cpu, sin_cpu, golden = prepare_inputs(args.backward)
+    x, positions = input_cpu.npu(), positions_cpu.npu()
+    cos_device, sin_device = cos_cpu.npu(), sin_cpu.npu()
     output = torch.empty_like(x)
     torch.npu.synchronize()
 
@@ -199,25 +223,13 @@ def main():
     )
     kernel(x, positions, cos_device, sin_device, output)
     torch.npu.synchronize()
-    actual = output.cpu()
-    torch.testing.assert_close(actual, golden, rtol=1e-2, atol=1e-2)
-    max_error = (actual - golden).abs().max().item()
-    rel_l2 = ((actual.float() - golden.float()).norm() / (golden.float().norm() + 1e-12)).item()
-    print(f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}")
-    del actual, golden, input_cpu, x_cpu
-    if args.backward:
-        del grad_output
-    print("ACCURACY: PASS")
+    check_accuracy(output, golden)
+    del input_cpu, positions_cpu, cos_cpu, sin_cpu, golden
     if args.bench:
-        latency = do_bench(
-            lambda: kernel(x, positions, cos_device, sin_device, output),
-            backend="msprof",
-            _n_warmup=30,
-            _n_repeat=50,
+        run_regression_perf(
+            kernel, x, positions, cos_device, sin_device, output,
+            tile_tokens=args.tile_tokens, backward=args.backward,
         )
-        bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
-        direction = "backward" if args.backward else "forward"
-        print(f"{direction} BF16 tile={args.tile_tokens}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s")
 
 
 if __name__ == "__main__":
