@@ -132,6 +132,22 @@ def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=True
     return main
 
 
+def torch_ref(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cached: torch.Tensor,
+    sin_cached: torch.Tensor,
+) -> torch.Tensor:
+    max_seq = cos_cached.shape[0]
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    positions = torch.clamp(positions, max=max_seq - 1)
+    cos = cos_cached[positions].unsqueeze(1)
+    sin = sin_cached[positions].unsqueeze(1)
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    rotate_half = torch.cat([-x2, x1], dim=-1)
+    return x * cos.to(x.dtype) + rotate_half * sin.to(x.dtype)
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -152,14 +168,25 @@ def main():
     num_cores = args.cores if args.cores is not None else get_num_vector_cores(device_index)
     print(f"RoPE device={device} AIV cores={num_cores} tile={args.tile_tokens}", flush=True)
     generator = torch.Generator().manual_seed(7)
-    # Initialize on CPU so profiling sees no NPU initialization kernels.
-    x = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator, dtype=torch.bfloat16).to(args.device)
+
+    x_cpu = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator).bfloat16()
     positions = torch.arange(TOTAL_K, dtype=torch.int64) % MAX_SEQ
-    positions[-1] = MAX_SEQ
-    positions = positions.to(args.device)
     frequencies = 10000.0 ** (-torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
     angles = torch.outer(torch.arange(MAX_SEQ, dtype=torch.float32), frequencies).repeat(1, 2)
-    cache = torch.cat((angles.cos().bfloat16(), angles.sin().bfloat16()), dim=-1).to(args.device)
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    x_req = x_cpu.detach().clone().requires_grad_(True)
+    golden_out = torch_ref(x_req, positions, cos, sin)
+    if args.backward:
+        grad_output = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator).bfloat16()
+        (golden,) = torch.autograd.grad(golden_out, x_req, grad_output)
+        input_cpu = grad_output
+    else:
+        golden = golden_out.detach()
+        input_cpu = x_cpu
+    del golden_out, x_req
+    x = input_cpu.to(args.device)
+    positions = positions.to(args.device)
+    cache = torch.cat((cos, sin), dim=-1).to(args.device)
     output = torch.empty_like(x)
     torch.npu.synchronize()
 
@@ -169,17 +196,14 @@ def main():
     )
     kernel(x, positions, cache, output)
     torch.npu.synchronize()
-    from example_fused_rope import check_accuracy
-
-    max_error, rel_l2 = check_accuracy(
-        output,
-        x,
-        positions.cpu(),
-        angles.cos().bfloat16(),
-        angles.sin().bfloat16(),
-        args.backward,
-    )
+    actual = output.cpu()
+    torch.testing.assert_close(actual, golden, rtol=1e-2, atol=1e-2)
+    max_error = (actual - golden).abs().max().item()
+    rel_l2 = ((actual.float() - golden.float()).norm() / (golden.float().norm() + 1e-12)).item()
     print(f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}")
+    del actual, golden, input_cpu, x_cpu
+    if args.backward:
+        del grad_output
     print("ACCURACY: PASS")
     if args.bench:
         latency = do_bench(
