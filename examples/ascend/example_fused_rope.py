@@ -294,8 +294,8 @@ def reference(x, positions, cos, sin, backward=False):
 def check_accuracy(output, x, positions, cos, sin, backward):
     # Keep peak CPU memory bounded even at 600,000 tokens.
     squared_error = squared_reference = max_error = 0.0
-    for begin in range(0, x.shape[0], 4096):
-        chunk = slice(begin, begin + 4096)
+    for begin in range(0, x.shape[0], 256):
+        chunk = slice(begin, begin + 256)
         expected = reference(x[chunk].cpu(), positions[chunk], cos, sin, backward)
         actual = output[chunk].cpu()
         torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)

@@ -1,4 +1,4 @@
-"""Single-launch BF16 RoPE with position prefetch for msprof profiling."""
+"""Fixed-shape BF16 SIMD RoPE with CPU golden and optional device benchmarking."""
 
 import argparse
 
@@ -133,13 +133,72 @@ def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=True
 
 
 
+
+def torch_ref(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cached: torch.Tensor,
+    sin_cached: torch.Tensor,
+) -> torch.Tensor:
+    max_seq = cos_cached.shape[0]
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    positions = torch.clamp(positions, max=max_seq - 1)
+    cos = cos_cached[positions].unsqueeze(1)
+    sin = sin_cached[positions].unsqueeze(1)
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    rotate_half = torch.cat([-x2, x1], dim=-1)
+    return x * cos.to(x.dtype) + rotate_half * sin.to(x.dtype)
+
+
+def reference(x, positions, cos, sin, backward=False):
+    if not backward:
+        return torch_ref(x, positions, cos, sin)
+    with torch.enable_grad():
+        # RoPE is linear in x, so the input gradient is independent of the forward input.
+        x_req = x.detach().clone().requires_grad_(True)
+        golden_out = torch_ref(x_req, positions, cos, sin)
+        (golden_dx,) = torch.autograd.grad(golden_out, x_req, x)
+    return golden_dx
+
+
+def check_accuracy(output, x, positions, cos, sin, backward):
+    # Keep peak CPU memory bounded even at 600,000 tokens.
+    squared_error = squared_reference = max_error = 0.0
+    for begin in range(0, x.shape[0], 256):
+        chunk = slice(begin, begin + 256)
+        expected = reference(x[chunk].cpu(), positions[chunk], cos, sin, backward)
+        actual = output[chunk].cpu()
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
+        error = actual.to(torch.float64) - expected.to(torch.float64)
+        max_error = max(max_error, error.abs().max().item())
+        squared_error += error.square().sum().item()
+        squared_reference += expected.to(torch.float64).square().sum().item()
+    return max_error, (squared_error / max(squared_reference, 1e-12)) ** 0.5
+
+
+def run_regression_perf(kernel, x, positions, cache, output, device, iters=50, backward=False):
+    latency = do_bench(
+        lambda: kernel(x, positions, cache, output),
+        backend="event",
+        device=device,
+        return_mode="median",
+        _n_warmup=10,
+        _n_repeat=iters,
+    )
+    bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
+    direction = "backward" if backward else "forward"
+    print(f"{direction} BF16  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s (input/output)")
+    return latency
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--cores", type=int, help="override the selected device's AIV core count")
     parser.add_argument("--tile-tokens", type=int, default=16)
     parser.add_argument("--backward", action="store_true")
-    parser.add_argument("--bench", action="store_true", help="measure device latency after the first launch")
+    parser.add_argument("--bench", action="store_true", help="benchmark after correctness checks")
     parser.add_argument("--iters", type=int, default=50)
     args = parser.parse_args()
     if args.cores is not None and args.cores <= 0:
@@ -172,22 +231,6 @@ def main():
     )
     kernel(x, positions, cache, output)
     torch.npu.synchronize()
-    if args.bench:
-        latency = do_bench(
-            lambda: kernel(x, positions, cache, output),
-            backend="event",
-            device=device,
-            return_mode="median",
-            _n_warmup=10,
-            _n_repeat=args.iters,
-        )
-        bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
-        direction = "backward" if args.backward else "forward"
-        print(f"{direction} BF16 tile={args.tile_tokens}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s")
-    else:
-        print("RoPE launch completed")
-    from example_fused_rope import check_accuracy
-
     max_error, rel_l2 = check_accuracy(
         output,
         x,
@@ -198,6 +241,9 @@ def main():
     )
     print(f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}")
     print("ACCURACY: PASS")
+    if args.bench:
+        run_regression_perf(kernel, x, positions, cache, output, device, args.iters, args.backward)
+
 
 
 if __name__ == "__main__":
