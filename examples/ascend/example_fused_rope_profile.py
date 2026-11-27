@@ -186,6 +186,18 @@ def main():
         print(f"{direction} BF16 tile={args.tile_tokens}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s")
     else:
         print("RoPE launch completed")
+    from example_fused_rope import check_accuracy
+
+    max_error, rel_l2 = check_accuracy(
+        output,
+        x,
+        positions.cpu(),
+        angles.cos().bfloat16(),
+        angles.sin().bfloat16(),
+        args.backward,
+    )
+    print(f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}")
+    print("ACCURACY: PASS")
 
 
 if __name__ == "__main__":
