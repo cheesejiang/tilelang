@@ -90,7 +90,7 @@ def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=True
                     S.vsts(y[index], result, mask, "NORM_B16")
 
     @T.prim_func
-    def fused_rope_fp16(
+    def main(
         X: T.Tensor((total_k, HEADS, HEAD_DIM), FP16),
         Pos: T.Tensor((total_k,), "int64"),
         Cache: T.Tensor((MAX_SEQ, CACHE_ROW), FP16),
@@ -128,7 +128,7 @@ def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=True
                     rotate(x, y, coeff_ub, valid)
                     T.copy(y, dst[base : base + tile_elems])
 
-    return fused_rope_fp16
+    return main
 
 
 
