@@ -23,8 +23,7 @@ quantization report latency and effective bandwidth in GB/s.
 Bandwidth counts each logical input and output tensor's bytes once, including
 auxiliary outputs such as FP8 scales and RMSNorm RSTD.
 GEMM throughput uses `2 * M * N * K` operations, including for Split-K.
-RoPE reports input/output bandwidth and selects the fastest measured configuration
-for each direction with `--tune`. Use `--no-bench` where supported to run only correctness checks.
+RoPE reports input/output bandwidth using a 16-token tile by default. Use `--no-bench` where supported to run only correctness checks.
 RoPE's `copy_bw` is its input/output bandwidth divided by the measured bandwidth
 of a same-device `torch.Tensor.copy_` between contiguous tensors of the same shape
 and dtype. Both measurements count one input read and one output write.
@@ -63,7 +62,7 @@ python examples/ascend/example_vecadd.py
 python examples/ascend/example_per_token_cast_to_fp8.py
 python examples/ascend/example_per_token_cast_to_fp8.py --mode simd
 python examples/ascend/example_rmsnorm.py --no-bench
-python examples/ascend/example_fused_rope.py --tune
+python examples/ascend/example_fused_rope.py
 python examples/ascend/example_fused_rope.py --tile-tokens 7 --mte2-baseline
 python examples/ascend/example_fused_rope.py --tile-tokens 7 --dma-baseline
 python -m pytest examples/ascend/test_rmsnorm.py -q

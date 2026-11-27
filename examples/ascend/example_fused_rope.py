@@ -1,7 +1,6 @@
 """Fused rotate-half RoPE forward and input gradient on Ascend.
 
-Run the original workload with `python example_fused_rope.py`, or search
-SIMD tile sizes with `--tune`.
+Run the original workload with `python example_fused_rope.py`, using a 16-token tile.
 """
 
 import argparse
@@ -134,13 +133,11 @@ def bench_dma_copy(x, output, num_cores, tile_tokens, bench, *, offset=False, l2
     return latency
 
 
-def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=False, position_prefetch=False):
+def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=False, position_prefetch=False):
     """Build the 56-head, 32-element FP16 kernel."""
     limit = tile_limit()
     if min(total_k, num_cores) <= 0:
         raise ValueError("Expected positive token and core counts")
-    if tile_tokens is None:
-        tile_tokens = min(tilelang.cdiv(total_k, num_cores), (limit + 1) // 2)
     if not 1 <= tile_tokens <= limit:
         raise ValueError(f"tile_tokens must be between 1 and {limit}")
     blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
@@ -233,7 +230,7 @@ def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=Fa
 
 
 def compile_rope(
-    x, positions, cache, *, backward=False, num_cores=None, tile_tokens=None, prefetch=False, position_prefetch=False
+    x, positions, cache, *, backward=False, num_cores=None, tile_tokens=16, prefetch=False, position_prefetch=False
 ):
     """Compile FP16 RoPE with each cache row laid out as [cos, sin]."""
     if x.ndim != 3 or x.shape[1:] != (HEADS, HEAD_DIM) or x.dtype != torch.float16:
@@ -315,8 +312,7 @@ def main():
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--cores", type=int, help="override the device vector core count")
-    parser.add_argument("--tile-tokens", type=int)
-    parser.add_argument("--tune", action="store_true")
+    parser.add_argument("--tile-tokens", type=int, default=16)
     parser.add_argument(
         "--prefetch", action=argparse.BooleanOptionalAction, default=False, help="try an offset DMA/SIMD pipeline"
     )
@@ -353,12 +349,7 @@ def main():
     shape = (TOTAL_K, HEADS, HEAD_DIM)
     output = torch.empty(shape, device=device, dtype=torch.float16)
     num_cores = args.cores if args.cores is not None else get_num_vector_cores(device.index or 0)
-    tokens_per_core = tilelang.cdiv(TOTAL_K, num_cores)
-    default_tile = min(tokens_per_core, (limit + 1) // 2)
-    if args.tune and args.tile_tokens is None:
-        tiles = sorted({min(tokens_per_core, max(1, tile)) for tile in (limit // 4, default_tile, 3 * limit // 4, limit)})
-    else:
-        tiles = [args.tile_tokens or default_tile]
+    tiles = (args.tile_tokens,)
     bench = partial(
         do_bench, backend="event", device=device, return_mode="median", _n_warmup=10, _n_repeat=args.iters
     )
@@ -394,7 +385,6 @@ def main():
                             f"TileLang DMA copy offset l2={args.dma_l2_read} tile={tile_tokens:2}  {offset_ms:.4f} ms  "
                             f"{io_bytes / (offset_ms * 1e6):.1f} GB/s  speedup={dma_ms / offset_ms:.3f}x"
                         )
-        timings = []
         for tile_tokens in tiles:
             kernel = compile_rope(
                 x, *tables, num_cores=num_cores, tile_tokens=tile_tokens, backward=backward,
@@ -409,14 +399,10 @@ def main():
                 read_gbps = read_bytes / (latency * 1e6)
                 mte2 = f" mte2_read={read_gbps:.1f} GB/s mte2_bw={read_gbps / read_baselines[tile_tokens]:.1%}"
             dma = f" dma_bw={dma_copy_times[tile_tokens] / latency:.1%}" if tile_tokens in dma_copy_times else ""
-            timings.append((latency, tile_tokens))
             print(
                 f"{label:8} simd tile={tile_tokens:2}  {latency:.4f} ms  {gbps:.1f} GB/s (input/output)  "
                 f"copy_bw={copy_ms / latency:.1%}{dma}{mte2}  max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}"
             )
-        if args.tune:
-            latency, tile_tokens = min(timings)
-            print(f"{label:8} simd best tile={tile_tokens:2}  {latency:.4f} ms  copy_bw={copy_ms / latency:.1%}")
         del x
     print("ACCURACY: PASS")
 

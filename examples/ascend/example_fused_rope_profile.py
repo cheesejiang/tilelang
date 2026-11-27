@@ -6,7 +6,6 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 from tilelang.carver.arch.driver.ascend_driver import get_num_vector_cores
-from tilelang.profiler import do_bench
 
 TOTAL_K = 600_000
 HEADS = 56
@@ -36,13 +35,11 @@ def tile_grid(total_k, num_cores, tile_tokens):
     return blocks, groups, tail_tiles
 
 
-def fused_rope(total_k, num_cores, tile_tokens=None, backward=False, prefetch=True, position_prefetch=True):
+def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=True, position_prefetch=True):
     """Build the 56-head, 32-element FP16 kernel."""
     limit = tile_limit()
     if min(total_k, num_cores) <= 0:
         raise ValueError("Expected positive token and core counts")
-    if tile_tokens is None:
-        tile_tokens = min(tilelang.cdiv(total_k, num_cores), (limit + 1) // 2)
     if not 1 <= tile_tokens <= limit:
         raise ValueError(f"tile_tokens must be between 1 and {limit}")
     blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
@@ -139,17 +136,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", default="npu:0")
     parser.add_argument("--cores", type=int, help="override the selected device's AIV core count")
-    parser.add_argument("--tile-tokens", type=int, default=10)
+    parser.add_argument("--tile-tokens", type=int, default=16)
     parser.add_argument("--backward", action="store_true")
-    parser.add_argument("--tune", action="store_true", help="benchmark all tile sizes that fit in UB")
-    parser.add_argument("--iters", type=int, default=50)
     args = parser.parse_args()
     if args.cores is not None and args.cores <= 0:
         parser.error("cores must be positive")
     if not 1 <= args.tile_tokens <= tile_limit():
         parser.error(f"tile-tokens must be between 1 and {tile_limit()}")
-    if args.iters <= 0:
-        parser.error("iters must be positive")
 
     torch.npu.set_device(args.device)
     device = torch.device(args.device)
@@ -168,33 +161,13 @@ def main():
     output = torch.empty_like(x)
     torch.npu.synchronize()
 
-    tiles = range(1, tile_limit() + 1) if args.tune else (args.tile_tokens,)
-    timings = []
-    for tile in tiles:
-        kernel = tilelang.compile(
-            fused_rope(TOTAL_K, num_cores, tile, backward=args.backward),
-            target="ascend",
-        )
-        kernel(x, positions, cache, output)
-        torch.npu.synchronize()
-        if args.tune:
-            latency = do_bench(
-                lambda: kernel(x, positions, cache, output),
-                backend="event",
-                device=device,
-                return_mode="median",
-                _n_warmup=10,
-                _n_repeat=args.iters,
-            )
-            timings.append((latency, tile))
-            bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
-            print(f"tile={tile:2}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s", flush=True)
-    if args.tune:
-        latency, tile = min(timings)
-        direction = "backward" if args.backward else "forward"
-        print(f"{direction} best tile={tile}  {latency * 1000:.2f} us  AIV cores={num_cores}")
-    else:
-        print("RoPE launch completed")
+    kernel = tilelang.compile(
+        fused_rope(TOTAL_K, num_cores, args.tile_tokens, backward=args.backward),
+        target="ascend",
+    )
+    kernel(x, positions, cache, output)
+    torch.npu.synchronize()
+    print("RoPE launch completed")
 
 
 if __name__ == "__main__":
