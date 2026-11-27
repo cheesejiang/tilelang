@@ -1,0 +1,224 @@
+"""Fixed BF16 RoPE with independent cosine/sine inputs and optional benchmarking."""
+
+import argparse
+
+import torch
+import tilelang
+import tilelang.ascend.language as T
+from tilelang.carver.arch.driver.ascend_driver import get_num_vector_cores
+from tilelang.profiler import do_bench
+
+TOTAL_K = 600_000
+HEADS = 56
+HEAD_DIM = 32
+MAX_SEQ = 4096
+BF16 = "bfloat16"
+BF16_BYTES = 2
+BF16_LANES = 128
+UB_BYTES = 248 * 1024
+TOKEN_ELEMS = HEADS * HEAD_DIM
+S = T.simd
+
+
+def tile_limit():
+    # Two versions of input, output, separate cosine/sine coefficients, and positions.
+    coeff_guard = BF16_LANES - HEAD_DIM
+    reserve = 12 * 32 + 4 * coeff_guard * BF16_BYTES
+    bytes_per_token = 4 * (TOKEN_ELEMS + HEAD_DIM) * BF16_BYTES + 2 * 8
+    return (UB_BYTES - reserve) // bytes_per_token
+
+
+def tile_grid(total_k, num_cores, tile_tokens):
+    num_tiles = tilelang.cdiv(total_k, tile_tokens)
+    blocks = min(num_cores, num_tiles)
+    groups, tail_tiles = divmod(num_tiles, blocks)
+    return blocks, groups, tail_tiles
+
+
+def fused_rope(total_k, num_cores, tile_tokens=16, backward=False, prefetch=True, position_prefetch=True):
+    """Build the 56-head, 32-element BF16 kernel."""
+    limit = tile_limit()
+    if min(total_k, num_cores) <= 0:
+        raise ValueError("Expected positive token and core counts")
+    if not 1 <= tile_tokens <= limit:
+        raise ValueError(f"tile_tokens must be between 1 and {limit}")
+    blocks, groups, tail_tiles = tile_grid(total_k, num_cores, tile_tokens)
+    total_elems = total_k * TOKEN_ELEMS
+    tile_elems = tile_tokens * TOKEN_ELEMS
+    coeff_elems = tile_tokens * HEAD_DIM
+    coeff_guard = BF16_LANES - HEAD_DIM
+    prefetch = prefetch or position_prefetch
+    schedule = {"enable_offset": True} if prefetch else {}
+
+    @T.macro
+    def load_coefficients(Cos, Sin, pos_ub, cos_ub, sin_ub, valid):
+        for i in T.serial(valid):
+            pos = T.Cast("int32", T.min(pos_ub[i], T.int64(MAX_SEQ - 1)))
+            T.copy(Cos[pos, :], cos_ub[i * HEAD_DIM : (i + 1) * HEAD_DIM])
+            T.copy(Sin[pos, :], sin_ub[i * HEAD_DIM : (i + 1) * HEAD_DIM])
+
+    @T.macro
+    def rotate(x, y, cos_ub, sin_ub, valid):
+        with T.SimdVF():
+            mask = S.pset(16)
+            lane = S.vci(0, "int16")
+            coeff_index = S.vand(lane, S.vdup(HEAD_DIM - 1, "int16"), mask)
+            partner = S.vxor(lane, S.vdup(HEAD_DIM // 2, "int16"), mask)
+            low_half = S.vcmps(coeff_index, HEAD_DIM // 2, mask, op="lt")
+            # Flip the BF16 sign bit without widening the coefficient.
+            sign_bit = S.vdup(0x8000, "uint16")
+            zero = S.vdup(0, "uint16")
+            if backward:
+                sin_index = S.vxor(coeff_index, S.vdup(HEAD_DIM // 2, "int16"), mask)
+                sign = S.vsel(zero, sign_bit, low_half)
+            else:
+                sin_index = coeff_index
+                sign = S.vsel(sign_bit, zero, low_half)
+            for token in range(valid):
+                cos_bits = T.reinterpret(S.vld(cos_ub[token * HEAD_DIM]), "uint16x128")
+                sin_bits = T.reinterpret(S.vld(sin_ub[token * HEAD_DIM]), "uint16x128")
+                c_bits = S.vselr(cos_bits, coeff_index)
+                s_bits = S.vselr(sin_bits, sin_index)
+                c = T.reinterpret(c_bits, "bfloat16x128")
+                signed_s = T.reinterpret(S.vxor(s_bits, sign, mask), "bfloat16x128")
+                for group in range(TOKEN_ELEMS // BF16_LANES):
+                    index = token * TOKEN_ELEMS + group * BF16_LANES
+                    values = S.vld(x[index])
+                    rotated_bits = S.vselr(T.reinterpret(values, "uint16x128"), partner)
+                    rotated = T.reinterpret(rotated_bits, "bfloat16x128")
+                    diag = S.vmul(values, c, mask)
+                    cross = S.vmul(rotated, signed_s, mask)
+                    result = S.vadd(diag, cross, mask)
+                    S.vsts(y[index], result, mask, "NORM_B16")
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((total_k, HEADS, HEAD_DIM), BF16),
+        Pos: T.Tensor((total_k,), "int64"),
+        Cos: T.Tensor((MAX_SEQ, HEAD_DIM), BF16),
+        Sin: T.Tensor((MAX_SEQ, HEAD_DIM), BF16),
+        Y: T.Tensor((total_k, HEADS, HEAD_DIM), BF16),
+    ):
+        with T.Kernel(blocks) as core:
+            src = T.Tensor((total_elems,), BF16, X.data)
+            dst = T.Tensor((total_elems,), BF16, Y.data)
+            x = T.alloc_shared((tile_elems,), BF16)
+            y = T.alloc_shared((tile_elems,), BF16)
+            cos_ub = T.alloc_shared((coeff_elems + coeff_guard,), BF16)
+            sin_ub = T.alloc_shared((coeff_elems + coeff_guard,), BF16)
+            pos_ub = T.alloc_shared((tile_tokens,), "int64")
+            if prefetch:
+                T.annotate_buffer_versions({x: 2, y: 2, cos_ub: 2, sin_ub: 2, pos_ub: 2})
+            iterations = groups + T.Cast("int32", core < tail_tiles)
+            for step in T.Pipelined(iterations, num_stages=2, annotations=schedule):
+                begin = (step * blocks + core) * tile_tokens
+                valid = T.min(tile_tokens, total_k - begin)
+                base = begin * TOKEN_ELEMS
+                if position_prefetch:
+                    # Fetch positions one tile ahead of the scalar coefficient lookup.
+                    with T.Stage(0):
+                        T.copy(Pos[begin : begin + tile_tokens], pos_ub)
+                    with T.Stage(1):
+                        T.copy(src[base : base + tile_elems], x)
+                        load_coefficients(Cos, Sin, pos_ub, cos_ub, sin_ub, valid)
+                    with T.Stage(2):
+                        rotate(x, y, cos_ub, sin_ub, valid)
+                    with T.Stage(3):
+                        T.copy(y, dst[base : base + tile_elems])
+                else:
+                    T.copy(src[base : base + tile_elems], x)
+                    T.copy(Pos[begin : begin + tile_tokens], pos_ub)
+                    load_coefficients(Cos, Sin, pos_ub, cos_ub, sin_ub, valid)
+                    rotate(x, y, cos_ub, sin_ub, valid)
+                    T.copy(y, dst[base : base + tile_elems])
+
+    return main
+
+
+def torch_ref(
+    x: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cached: torch.Tensor,
+    sin_cached: torch.Tensor,
+) -> torch.Tensor:
+    max_seq = cos_cached.shape[0]
+    head_dim = x.shape[-1]
+    half = head_dim // 2
+    positions = torch.clamp(positions, max=max_seq - 1)
+    cos = cos_cached[positions].unsqueeze(1)
+    sin = sin_cached[positions].unsqueeze(1)
+    x1 = x[..., :half]
+    x2 = x[..., half:]
+    rotate_half = torch.cat([-x2, x1], dim=-1)
+    return x * cos.to(x.dtype) + rotate_half * sin.to(x.dtype)
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--cores", type=int, help="override the selected device's AIV core count")
+    parser.add_argument("--tile-tokens", type=int, default=16)
+    parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--bench", action="store_true", help="benchmark after correctness checks")
+    args = parser.parse_args()
+    if args.cores is not None and args.cores <= 0:
+        parser.error("cores must be positive")
+    if not 1 <= args.tile_tokens <= tile_limit():
+        parser.error(f"tile-tokens must be between 1 and {tile_limit()}")
+
+    torch.npu.set_device(args.device)
+    device = torch.device(args.device)
+    device_index = device.index if device.index is not None else torch.npu.current_device()
+    num_cores = args.cores if args.cores is not None else get_num_vector_cores(device_index)
+    print(f"RoPE device={device} AIV cores={num_cores} tile={args.tile_tokens}", flush=True)
+    generator = torch.Generator().manual_seed(7)
+
+    x_cpu = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator).bfloat16()
+    positions = torch.arange(TOTAL_K, dtype=torch.int64) % MAX_SEQ
+    frequencies = 10000.0 ** (-torch.arange(0, HEAD_DIM, 2, dtype=torch.float32) / HEAD_DIM)
+    angles = torch.outer(torch.arange(MAX_SEQ, dtype=torch.float32), frequencies).repeat(1, 2)
+    cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+    x_req = x_cpu.detach().clone().requires_grad_(True)
+    golden_out = torch_ref(x_req, positions, cos, sin)
+    if args.backward:
+        grad_output = torch.randn((TOTAL_K, HEADS, HEAD_DIM), generator=generator).bfloat16()
+        (golden,) = torch.autograd.grad(golden_out, x_req, grad_output)
+        input_cpu = grad_output
+    else:
+        golden = golden_out.detach()
+        input_cpu = x_cpu
+    del golden_out, x_req
+    x = input_cpu.to(args.device)
+    positions = positions.to(args.device)
+    cos_device, sin_device = cos.to(args.device), sin.to(args.device)
+    output = torch.empty_like(x)
+    torch.npu.synchronize()
+
+    kernel = tilelang.compile(
+        fused_rope(TOTAL_K, num_cores, args.tile_tokens, backward=args.backward),
+        target="ascend",
+    )
+    kernel(x, positions, cos_device, sin_device, output)
+    torch.npu.synchronize()
+    actual = output.cpu()
+    torch.testing.assert_close(actual, golden, rtol=1e-2, atol=1e-2)
+    max_error = (actual - golden).abs().max().item()
+    rel_l2 = ((actual.float() - golden.float()).norm() / (golden.float().norm() + 1e-12)).item()
+    print(f"max_abs={max_error:.3e}  rel_l2={rel_l2:.3e}")
+    del actual, golden, input_cpu, x_cpu
+    if args.backward:
+        del grad_output
+    print("ACCURACY: PASS")
+    if args.bench:
+        latency = do_bench(
+            lambda: kernel(x, positions, cos_device, sin_device, output),
+            backend="msprof",
+            _n_warmup=30,
+            _n_repeat=50,
+        )
+        bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
+        direction = "backward" if args.backward else "forward"
+        print(f"{direction} BF16 tile={args.tile_tokens}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s")
+
+
+if __name__ == "__main__":
+    main()
