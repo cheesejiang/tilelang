@@ -6,6 +6,7 @@ import torch
 import tilelang
 import tilelang.ascend.language as T
 from tilelang.carver.arch.driver.ascend_driver import get_num_vector_cores
+from tilelang.profiler import do_bench
 
 TOTAL_K = 600_000
 HEADS = 56
@@ -138,11 +139,15 @@ def main():
     parser.add_argument("--cores", type=int, help="override the selected device's AIV core count")
     parser.add_argument("--tile-tokens", type=int, default=16)
     parser.add_argument("--backward", action="store_true")
+    parser.add_argument("--bench", action="store_true", help="measure device latency after the first launch")
+    parser.add_argument("--iters", type=int, default=50)
     args = parser.parse_args()
     if args.cores is not None and args.cores <= 0:
         parser.error("cores must be positive")
     if not 1 <= args.tile_tokens <= tile_limit():
         parser.error(f"tile-tokens must be between 1 and {tile_limit()}")
+    if args.iters <= 0:
+        parser.error("iters must be positive")
 
     torch.npu.set_device(args.device)
     device = torch.device(args.device)
@@ -167,7 +172,20 @@ def main():
     )
     kernel(x, positions, cache, output)
     torch.npu.synchronize()
-    print("RoPE launch completed")
+    if args.bench:
+        latency = do_bench(
+            lambda: kernel(x, positions, cache, output),
+            backend="event",
+            device=device,
+            return_mode="median",
+            _n_warmup=10,
+            _n_repeat=args.iters,
+        )
+        bandwidth = 2 * x.numel() * x.element_size() / (latency * 1e6)
+        direction = "backward" if args.backward else "forward"
+        print(f"{direction} BF16 tile={args.tile_tokens}  {latency * 1000:.2f} us  {bandwidth:.1f} GB/s")
+    else:
+        print("RoPE launch completed")
 
 
 if __name__ == "__main__":
